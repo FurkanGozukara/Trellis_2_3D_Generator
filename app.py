@@ -603,8 +603,8 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
         inputs=[
             image_prompt, seed, resolution,
             ss_guidance_strength, ss_guidance_rescale, ss_sampling_steps, ss_rescale_t,
-            shape_slat_guidance_strength, shape_slat_guidance_rescale, shape_slat_sampling_steps, shape_slat_rescale_t, max_num_tokens,
-            tex_slat_guidance_strength, tex_slat_guidance_rescale, tex_slat_sampling_steps, tex_slat_rescale_t,
+            shape_slat_guidance_strength, shape_slat_guidance_rescale, shape_slat_sampling_steps, shape_slat_rescale_t,
+            tex_slat_guidance_strength, tex_slat_guidance_rescale, tex_slat_sampling_steps, tex_slat_rescale_t, max_num_tokens,
         ],
         outputs=[output_buf, preview_output],
     )
