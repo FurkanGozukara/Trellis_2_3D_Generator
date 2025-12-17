@@ -480,6 +480,7 @@ def extract_glb(
     decimation_target: int,
     texture_size: int,
     simplify_method: str,
+    texture_extraction: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
 ) -> Tuple[str, str]:
@@ -507,6 +508,7 @@ def extract_glb(
         aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         decimation_target=decimation_target,
         simplify_method=simplify_method,
+        texture_extraction=texture_extraction,
         texture_size=texture_size,
         remesh=True,
         remesh_band=1,
@@ -538,6 +540,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
             decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000)
             simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method", value="cumesh")
+            texture_extraction = gr.Checkbox(label="Texture Extraction", value=True)
             texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
 
             generate_btn = gr.Button("Generate")
@@ -621,7 +624,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
         lambda: gr.Walkthrough(selected=1), outputs=walkthrough
     ).then(
         extract_glb,
-        inputs=[output_buf, decimation_target, texture_size, simplify_method],
+        inputs=[output_buf, decimation_target, texture_size, simplify_method, texture_extraction],
         outputs=[glb_output, download_btn],
     )
 

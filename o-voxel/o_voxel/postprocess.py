@@ -54,6 +54,7 @@ def to_glb(
     grid_size: Union[int, list, tuple, np.ndarray, torch.Tensor] = None,
     decimation_target: int = 1000000,
     simplify_method: str = 'cumesh',
+    texture_extraction: bool = True,
     texture_size: int = 2048,
     remesh: bool = False,
     remesh_band: float = 1,
@@ -250,6 +251,28 @@ def to_glb(
         
     
     # --- UV Parameterization ---
+    if not texture_extraction:
+        # Skip UV unwrapping and texture baking
+        if use_tqdm:
+            pbar.update(3) # Skip remaining steps
+            pbar.close()
+        
+        # Coordinate System Conversion
+        vertices_np = mesh.read()[0].cpu().numpy()
+        faces_np = mesh.read()[1].cpu().numpy()
+        normals_np = mesh.read_vertex_normals().cpu().numpy()
+        
+        # Swap Y and Z axes, invert Y
+        vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2], -vertices_np[:, 1]
+        normals_np[:, 1], normals_np[:, 2] = normals_np[:, 2], -normals_np[:, 1]
+        
+        return trimesh.Trimesh(
+            vertices=vertices_np,
+            faces=faces_np,
+            vertex_normals=normals_np,
+            process=False,
+        )
+
     if use_tqdm:
         pbar.set_description("Parameterizing new mesh")
     if verbose:
