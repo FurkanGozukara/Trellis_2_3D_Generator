@@ -364,6 +364,7 @@ def image_to_3d(
     tex_slat_guidance_rescale: float,
     tex_slat_sampling_steps: int,
     tex_slat_rescale_t: float,
+    force_high_res_conditional: bool,
 
     max_num_tokens: int,
     req: gr.Request,
@@ -400,6 +401,7 @@ def image_to_3d(
         }[resolution],
         return_latent=True,
         max_num_tokens=max_num_tokens,
+        force_high_res_conditional=force_high_res_conditional,
     )
     mesh = outputs[0]
     mesh.simplify(16777216) # nvdiffrast limit
@@ -547,6 +549,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
                     ss_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.7, step=0.01)
                     ss_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
                     ss_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=5.0, step=0.1)
+                    force_high_res_conditional = gr.Checkbox(label="Force High-Res Conditioning", value=True)
                 gr.Markdown("Stage 2: Shape Generation")
                 with gr.Row():
                     shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1)
@@ -608,7 +611,8 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             image_prompt, seed, resolution,
             ss_guidance_strength, ss_guidance_rescale, ss_sampling_steps, ss_rescale_t,
             shape_slat_guidance_strength, shape_slat_guidance_rescale, shape_slat_sampling_steps, shape_slat_rescale_t,
-            tex_slat_guidance_strength, tex_slat_guidance_rescale, tex_slat_sampling_steps, tex_slat_rescale_t, max_num_tokens,
+            shape_slat_guidance_strength, shape_slat_guidance_rescale, shape_slat_sampling_steps, shape_slat_rescale_t,
+            tex_slat_guidance_strength, tex_slat_guidance_rescale, tex_slat_sampling_steps, tex_slat_rescale_t, force_high_res_conditional, max_num_tokens,
         ],
         outputs=[output_buf, preview_output],
     )
