@@ -14,7 +14,7 @@ import o_voxel
 
 def parse_args():
     parser = argparse.ArgumentParser(description="TRELLIS.2 Inference CLI")
-    parser.add_argument("--image", type=str, required=True, help="Path to input image")
+    parser.add_argument("--images", type=str, nargs='+', required=True, help="Path(s) to input image(s)")
     parser.add_argument("--output", type=str, required=True, help="Path to output GLB file")
     
     # Model and Generation Settings
@@ -67,15 +67,18 @@ def main():
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained('microsoft/TRELLIS.2-4B', load_texture_models=not args.no_texture_gen)
     pipeline.cuda()
 
-    # Load and Preprocess Image
-    print(f"Processing image: {args.image}")
-    image = Image.open(args.image)
-    image = pipeline.preprocess_image(image)
+    # Load and Preprocess Images
+    images = []
+    for img_path in args.images:
+        print(f"Processing image: {img_path}")
+        img = Image.open(img_path)
+        img = pipeline.preprocess_image(img)
+        images.append(img)
 
     # Run Pipeline
     print("Running generation...")
     outputs, latents = pipeline.run(
-        image,
+        images,
         seed=seed,
         preprocess_image=False, # Already done
         sparse_structure_sampler_params={

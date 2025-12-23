@@ -190,6 +190,12 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         cond = self.image_cond_model(image)
         if self.low_vram:
             self.image_cond_model.cpu()
+        
+        # For multiple images, concatenate along the sequence dimension
+        # Shape goes from (B, N, D) to (1, B*N, D)
+        if cond.shape[0] > 1:
+            cond = cond.reshape(1, -1, cond.shape[-1])
+        
         if not include_neg_cond:
             return {'cond': cond}
         neg_cond = torch.zeros_like(cond)
@@ -517,7 +523,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
     @torch.no_grad()
     def run(
         self,
-        image: Image.Image,
+        image: Union[Image.Image, List[Image.Image]],
         num_samples: int = 1,
         seed: int = 42,
         sparse_structure_sampler_params: dict = {},
@@ -533,7 +539,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         Run the pipeline.
 
         Args:
-            image (Image.Image): The image prompt.
+            image (Union[Image.Image, List[Image.Image]]): The image prompt(s). Can be a single image or a list of images.
             num_samples (int): The number of samples to generate.
             seed (int): The random seed.
             sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
@@ -572,11 +578,14 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         else:
             raise ValueError(f"Invalid pipeline type: {pipeline_type}")
         
+        # Normalize to list of images
+        images = image if isinstance(image, list) else [image]
+        
         if preprocess_image:
-            image = self.preprocess_image(image)
+            images = [self.preprocess_image(img) for img in images]
         torch.manual_seed(seed)
-        cond_512 = self.get_cond([image], 512)
-        cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
+        cond_512 = self.get_cond(images, 512)
+        cond_1024 = self.get_cond(images, 1024) if pipeline_type != '512' else None
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32, '2048_cascade': 32}[pipeline_type]
         coords = self.sample_sparse_structure(
             cond_512, ss_res,
