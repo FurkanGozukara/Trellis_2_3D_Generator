@@ -47,12 +47,7 @@ def parse_args():
     parser.add_argument("--texture_size", type=int, default=2048, choices=[1024, 2048, 4096], help="Texture size")
     parser.add_argument("--remesh_method", type=str, default="dual_contouring", choices=["dual_contouring", "faithful_contouring", "none"], help="Remesh method")
     parser.add_argument("--simplify_method", type=str, default="cumesh", choices=["cumesh", "meshlib"], help="Simplify method")
-    parser.add_argument("--prune_invisible_faces", type=bool, default=True, help="Prune invisible faces") # Note: argparse handles bool weirdly, better verify logic below
-
-    # Handle bool flag explicitly if needed or rely on store_true/false if intent is different. 
-    # But here app.py uses Checkbox which is bool. For CLI usually --prune or --no-prune is better.
-    # I'll stick to default=True and maybe add --no-prune-invisible-faces
-    parser.add_argument("--no_prune", action="store_true", help="Disable pruning invisible faces")
+    parser.add_argument("--prune_invisible_faces", type=bool, default=True, help="Prune invisible faces")
 
     return parser.parse_args()
 
