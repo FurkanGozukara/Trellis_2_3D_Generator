@@ -19,7 +19,7 @@ class Pipeline:
             model.eval()
 
     @staticmethod
-    def from_pretrained(path: str) -> "Pipeline":
+    def from_pretrained(path: str, ignore_models: List[str] = None) -> "Pipeline":
         """
         Load a pretrained model.
         """
@@ -37,7 +37,13 @@ class Pipeline:
             args = json.load(f)['args']
 
         _models = {}
+        if ignore_models is None:
+            ignore_models = []
+
+        _models = {}
         for k, v in args['models'].items():
+            if k in ignore_models:
+                continue
             try:
                 _models[k] = models.from_pretrained(f"{path}/{v}")
             except Exception as e:

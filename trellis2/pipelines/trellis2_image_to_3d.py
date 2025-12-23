@@ -68,14 +68,32 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         self._device = 'cpu'
 
     @staticmethod
-    def from_pretrained(path: str) -> "Trellis2ImageTo3DPipeline":
+    def from_pretrained(path: str, load_texture_models: bool = True) -> "Trellis2ImageTo3DPipeline":
         """
         Load a pretrained model.
 
         Args:
             path (str): The path to the model. Can be either local path or a Hugging Face repository.
         """
-        pipeline = super(Trellis2ImageTo3DPipeline, Trellis2ImageTo3DPipeline).from_pretrained(path)
+        if load_texture_models:
+            pipeline = super(Trellis2ImageTo3DPipeline, Trellis2ImageTo3DPipeline).from_pretrained(path)
+        else:
+            # Load config to identify texture models
+            import os
+            import json
+            is_local = os.path.exists(f"{path}/pipeline.json")
+            if is_local:
+                config_file = f"{path}/pipeline.json"
+            else:
+                from huggingface_hub import hf_hub_download
+                config_file = hf_hub_download(path, "pipeline.json")
+            
+            with open(config_file, 'r') as f:
+                args = json.load(f)['args']
+            
+            ignore_models = [k for k in args['models'].keys() if 'tex' in k]
+            pipeline = super(Trellis2ImageTo3DPipeline, Trellis2ImageTo3DPipeline).from_pretrained(path, ignore_models=ignore_models)
+
         new_pipeline = Trellis2ImageTo3DPipeline()
         new_pipeline.__dict__ = pipeline.__dict__
         args = pipeline._pretrained_args
@@ -85,12 +103,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
         new_pipeline.shape_slat_sampler = getattr(samplers, args['shape_slat_sampler']['name'])(**args['shape_slat_sampler']['args'])
         new_pipeline.shape_slat_sampler_params = args['shape_slat_sampler']['params']
-
-        new_pipeline.tex_slat_sampler = getattr(samplers, args['tex_slat_sampler']['name'])(**args['tex_slat_sampler']['args'])
-        new_pipeline.tex_slat_sampler_params = args['tex_slat_sampler']['params']
-
         new_pipeline.shape_slat_normalization = args['shape_slat_normalization']
-        new_pipeline.tex_slat_normalization = args['tex_slat_normalization']
+
+        if load_texture_models:
+            new_pipeline.tex_slat_sampler = getattr(samplers, args['tex_slat_sampler']['name'])(**args['tex_slat_sampler']['args'])
+            new_pipeline.tex_slat_sampler_params = args['tex_slat_sampler']['params']
+            new_pipeline.tex_slat_normalization = args['tex_slat_normalization']
+        else:
+            new_pipeline.tex_slat_sampler = None
+            new_pipeline.tex_slat_sampler_params = {}
+            new_pipeline.tex_slat_normalization = None
 
         new_pipeline.image_cond_model = getattr(image_feature_extractor, args['image_cond_model']['name'])(**args['image_cond_model']['args'])
         new_pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
@@ -526,22 +548,27 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type == '512':
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
-            assert 'tex_slat_flow_model_512' in self.models, "No 512 resolution texture SLat flow model found."
+            if not no_texture_gen:
+                assert 'tex_slat_flow_model_512' in self.models, "No 512 resolution texture SLat flow model found."
         elif pipeline_type == '1024':
             assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
-            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+            if not no_texture_gen:
+                assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
         elif pipeline_type == '1024_cascade':
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
             assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
-            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+            if not no_texture_gen:
+                assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
         elif pipeline_type == '1536_cascade':
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
             assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
-            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+            if not no_texture_gen:
+                assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
         elif pipeline_type == '2048_cascade':
             assert 'shape_slat_flow_model_512' in self.models, "No 512 resolution shape SLat flow model found."
             assert 'shape_slat_flow_model_1024' in self.models, "No 1024 resolution shape SLat flow model found."
-            assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
+            if not no_texture_gen:
+                assert 'tex_slat_flow_model_1024' in self.models, "No 1024 resolution texture SLat flow model found."
         else:
             raise ValueError(f"Invalid pipeline type: {pipeline_type}")
         
