@@ -3,12 +3,28 @@ from transformers import AutoModelForImageSegmentation
 import torch
 from torchvision import transforms
 from PIL import Image
+import os
 
 
 class BiRefNet:
     def __init__(self, model_name: str = "ZhengPeng7/BiRefNet"):
+        # Prefer a local copy if it exists under TRELLIS_MODELS_DIR/<org>--<repo>/
+        resolved_name = model_name
+        models_dir = os.environ.get("TRELLIS_MODELS_DIR")
+        if not models_dir:
+            models_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "models"))
+            if not os.path.isdir(models_dir):
+                models_dir = None
+        if models_dir and isinstance(model_name, str) and "/" in model_name and not os.path.exists(model_name):
+            parts = model_name.split("/")
+            if len(parts) >= 2:
+                repo_id = f"{parts[0]}/{parts[1]}"
+                local_repo_dir = os.path.join(models_dir, repo_id.replace("/", "--"))
+                if os.path.isdir(local_repo_dir):
+                    resolved_name = local_repo_dir
+
         self.model = AutoModelForImageSegmentation.from_pretrained(
-            model_name, trust_remote_code=True
+            resolved_name, trust_remote_code=True
         )
         self.model.eval()
         self.transform_image = transforms.Compose(

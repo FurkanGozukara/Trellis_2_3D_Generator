@@ -32,10 +32,25 @@ def from_pretrained(path: str):
     """
     import os
     import json
-    is_local = os.path.exists(f"{path}/pipeline.json")
+
+    # Prefer local copies downloaded into TRELLIS_MODELS_DIR/<org>--<repo>/
+    models_dir = os.environ.get("TRELLIS_MODELS_DIR")
+    if not models_dir:
+        models_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "models"))
+        if not os.path.isdir(models_dir):
+            models_dir = None
+    if models_dir and isinstance(path, str) and "/" in path and not os.path.exists(path):
+        parts = path.split("/")
+        if len(parts) >= 2:
+            repo_id = f"{parts[0]}/{parts[1]}"
+            local_repo_dir = os.path.join(models_dir, repo_id.replace("/", "--"))
+            if os.path.isdir(local_repo_dir):
+                path = local_repo_dir
+
+    is_local = os.path.exists(os.path.join(path, "pipeline.json"))
 
     if is_local:
-        config_file = f"{path}/pipeline.json"
+        config_file = os.path.join(path, "pipeline.json")
     else:
         from huggingface_hub import hf_hub_download
         config_file = hf_hub_download(path, "pipeline.json")

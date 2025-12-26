@@ -35,6 +35,46 @@ def __getattr__(name):
     return globals()[name]
 
 
+def _resolve_local_model_path(path: str) -> str:
+    """
+    Resolve a Hugging Face-style model path (e.g. "org/repo/subpath/to/ckpt")
+    to a local path inside TRELLIS_MODELS_DIR if available.
+
+    This lets the code run fully offline once model repos are downloaded into:
+      TRELLIS_MODELS_DIR/<org>--<repo>/...
+
+    Note: this function is intentionally conservative; it only rewrites when the
+    expected local files exist.
+    """
+    import os
+
+    models_dir = os.environ.get("TRELLIS_MODELS_DIR")
+    if not models_dir:
+        # Default to ../models relative to this repo layout: Trellis_2_3D_Generator/models
+        models_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "models"))
+        if not os.path.isdir(models_dir):
+            return path
+
+    # If the given path already points to local files, keep it.
+    if os.path.exists(f"{path}.json") and os.path.exists(f"{path}.safetensors"):
+        return path
+
+    # Map "org/repo/..." -> "<models_dir>/org--repo/..."
+    parts = path.split("/")
+    if len(parts) < 3:
+        return path  # Not a trellis2-style hf path.
+
+    repo_id = f"{parts[0]}/{parts[1]}"
+    subpath = "/".join(parts[2:])
+    local_repo_dir = os.path.join(models_dir, repo_id.replace("/", "--"))
+    local_path = os.path.join(local_repo_dir, subpath)
+
+    if os.path.exists(f"{local_path}.json") and os.path.exists(f"{local_path}.safetensors"):
+        return local_path
+
+    return path
+
+
 def from_pretrained(path: str, **kwargs):
     """
     Load a model from a pretrained checkpoint.
@@ -47,6 +87,8 @@ def from_pretrained(path: str, **kwargs):
     import os
     import json
     from safetensors.torch import load_file
+
+    path = _resolve_local_model_path(path)
     is_local = os.path.exists(f"{path}.json") and os.path.exists(f"{path}.safetensors")
 
     if is_local:

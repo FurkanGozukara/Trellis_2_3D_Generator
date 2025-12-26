@@ -5,6 +5,42 @@ from torchvision import transforms
 from transformers import DINOv3ViTModel
 import numpy as np
 from PIL import Image
+import os
+
+
+def _resolve_hf_repo_or_path(model_name: str) -> str:
+    """
+    If `model_name` is a HF repo id and a local copy exists under TRELLIS_MODELS_DIR,
+    return that local folder path. Otherwise return the original string.
+    """
+    if not isinstance(model_name, str):
+        return model_name
+
+    models_dir = os.environ.get("TRELLIS_MODELS_DIR")
+    if not models_dir:
+        models_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "models"))
+        if not os.path.isdir(models_dir):
+            models_dir = None
+    if not models_dir:
+        return model_name
+
+    # If the caller already passed a local path, keep it.
+    if os.path.exists(model_name):
+        return model_name
+
+    if "/" not in model_name:
+        return model_name
+
+    parts = model_name.split("/")
+    if len(parts) < 2:
+        return model_name
+
+    repo_id = f"{parts[0]}/{parts[1]}"
+    local_repo_dir = os.path.join(models_dir, repo_id.replace("/", "--"))
+    if os.path.isdir(local_repo_dir):
+        return local_repo_dir
+
+    return model_name
 
 
 class DinoV2FeatureExtractor:
@@ -13,6 +49,17 @@ class DinoV2FeatureExtractor:
     """
     def __init__(self, model_name: str):
         self.model_name = model_name
+        # Keep torch.hub downloads inside our models folder if configured.
+        models_dir = os.environ.get("TRELLIS_MODELS_DIR")
+        if not models_dir:
+            models_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "models"))
+            if not os.path.isdir(models_dir):
+                models_dir = None
+        if models_dir:
+            try:
+                torch.hub.set_dir(os.path.join(models_dir, "torch_hub"))
+            except Exception:
+                pass
         self.model = torch.hub.load('facebookresearch/dinov2', model_name, pretrained=True)
         self.model.eval()
         self.transform = transforms.Compose([
@@ -62,7 +109,8 @@ class DinoV3FeatureExtractor:
     """
     def __init__(self, model_name: str, image_size=512):
         self.model_name = model_name
-        self.model = DINOv3ViTModel.from_pretrained(model_name)
+        resolved_name = _resolve_hf_repo_or_path(model_name)
+        self.model = DINOv3ViTModel.from_pretrained(resolved_name)
         self.model.eval()
         self.image_size = image_size
         self.transform = transforms.Compose([
