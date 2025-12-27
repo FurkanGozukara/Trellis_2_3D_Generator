@@ -66,14 +66,19 @@ class Trellis2TexturingPipeline(Pipeline):
         self._device = 'cpu'
 
     @classmethod
-    def from_pretrained(cls, path: str, config_file: str = "pipeline.json") -> "Trellis2TexturingPipeline":
+    def from_pretrained(
+        cls,
+        path: str,
+        config_file: str = "pipeline.json",
+        ignore_models: Optional[List[str]] = None,
+    ) -> "Trellis2TexturingPipeline":
         """
         Load a pretrained model.
 
         Args:
             path (str): The path to the model. Can be either local path or a Hugging Face repository.
         """
-        pipeline = super().from_pretrained(path, config_file)
+        pipeline = super().from_pretrained(path, ignore_models=ignore_models, config_file=config_file)
         args = pipeline._pretrained_args
 
         pipeline.tex_slat_sampler = getattr(samplers, args['tex_slat_sampler']['name'])(**args['tex_slat_sampler']['args'])

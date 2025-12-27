@@ -7,6 +7,9 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 import subprocess
 import importlib
+import json
+import time
+from pathlib import Path
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _O_VOXEL_SRC_DIR = os.path.join(APP_DIR, "o-voxel")
@@ -90,9 +93,14 @@ def _has_nvdiffrec_render() -> bool:
 
 MODELS_DIR = os.path.join(APP_DIR, "models")
 TMP_DIR = os.path.join(APP_DIR, "tmp")
+OUTPUTS_DIR = os.path.join(APP_DIR, "outputs")
+SUBPROCESS_STAGE_SCRIPT = os.path.join(APP_DIR, "subprocess_stage.py")
 
 # Ensure TRELLIS_MODELS_DIR is set (trellis2 code also falls back to ../models).
 os.environ.setdefault("TRELLIS_MODELS_DIR", MODELS_DIR)
+
+# Local helpers (not the stdlib `subprocess` module)
+from subprocess_utils import allocate_run_dir, next_indexed_path, ensure_dir, safe_relpath  # noqa: E402
 
 MAX_SEED = np.iinfo(np.int32).max
 
@@ -310,6 +318,98 @@ def _image_to_base64(image: Image.Image) -> str:
     return f"data:image/jpeg;base64,{img_str}"
 
 
+def _jpeg_file_to_data_uri(path: str) -> str:
+    """
+    Encode an existing JPEG file to a data URI without re-encoding.
+    """
+    data = Path(path).read_bytes()
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode()
+
+
+def _write_json(path: str, data: dict) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _read_json(path: str) -> dict:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _iter_subprocess_stage(stage: str, payload: dict, work_dir: Path, log_path: Path):
+    """
+    Run one stage in a fresh Python subprocess and stream its stdout.
+    Yields dict events:
+      - {"type":"log","text": "..."}
+      - {"type":"result","result": {...}}
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    payload_path = work_dir / f"{stage}.payload.json"
+    result_path = work_dir / f"{stage}.result.json"
+    payload_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    cmd = [
+        sys.executable,
+        "-u",
+        SUBPROCESS_STAGE_SCRIPT,
+        "--stage",
+        stage,
+        "--payload",
+        str(payload_path),
+        "--result",
+        str(result_path),
+    ]
+
+    env = dict(os.environ)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=APP_DIR,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    try:
+        # Stream output to both UI and a per-run log file.
+        with log_path.open("a", encoding="utf-8") as lf:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                lf.write(line)
+                lf.flush()
+                yield {"type": "log", "text": line.rstrip("\n")}
+    finally:
+        # If the Gradio request is cancelled, this generator can be closed mid-stream.
+        # Ensure we don't leave any worker subprocess running.
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+
+    rc = proc.wait()
+    if not result_path.exists():
+        raise RuntimeError(f"Stage {stage!r} failed (rc={rc}) and produced no result file.")
+
+    data = json.loads(result_path.read_text(encoding="utf-8"))
+    if not data.get("ok", False):
+        tb = data.get("traceback") or ""
+        raise RuntimeError(f"Stage {stage!r} failed: {data.get('error_type')}: {data.get('error')}\n{tb}")
+
+    yield {"type": "result", "result": data.get("result", {})}
+
+
 def _ensure_mode_icons():
     global _mode_icons_ready
     if _mode_icons_ready:
@@ -414,15 +514,71 @@ def get_seed(randomize_seed: bool, seed: int) -> int:
 
 def preprocess_image(
     image: Image.Image,
+    subprocess_mode: bool,
+    req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
 ) -> Image.Image:
-    # Used by Upload and Examples. On first run it may load the full pipeline.
-    progress(0.05, desc="Loading Image→3D pipeline (TRELLIS.2-4B)…")
-    pipe = get_image_pipeline()
-    progress(0.2, desc="Preprocessing image (background removal / crop)…")
-    out = pipe.preprocess_image(image)
+    if image is None:
+        raise gr.Error("Please provide an image.")
+
+    if not subprocess_mode:
+        # Used by Upload and Examples. On first run it may load the full pipeline.
+        progress(0.05, desc="Loading Image→3D pipeline (TRELLIS.2-4B)…")
+        pipe = get_image_pipeline()
+        progress(0.2, desc="Preprocessing image (background removal / crop)…")
+        out = pipe.preprocess_image(image)
+        progress(1.0, desc="Image ready.")
+        return out
+
+    # Subprocess mode: run preprocessing in a short-lived worker process so the UI process keeps 0 VRAM.
+    progress(0.02, desc="Starting subprocess: preprocess…")
+    user_dir = Path(TMP_DIR) / str(req.session_hash) / "preprocess"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = user_dir / "work"
+    log_path = user_dir / "preprocess.log"
+
+    ts = int(time.time() * 1000)
+    in_path = user_dir / f"input_{ts}.png"
+    out_path = user_dir / f"preprocessed_{ts}.png"
+    image.save(str(in_path))
+
+    payload = {
+        "model_repo": "microsoft/TRELLIS.2-4B",
+        "input_image_path": str(in_path),
+        "output_image_path": str(out_path),
+    }
+
+    last = ""
+    for ev in _iter_subprocess_stage("preprocess_image", payload, work_dir, log_path):
+        if ev["type"] == "log":
+            last = ev["text"]
+            # Keep UI responsive without spamming.
+            progress(0.5, desc=(last[:120] + "…") if len(last) > 120 else last)
+        else:
+            result = ev["result"]
+            out_path = Path(result["output_image_path"])
+
+    progress(0.95, desc="Loading preprocessed image…")
+    out_img = Image.open(str(out_path))
     progress(1.0, desc="Image ready.")
-    return out
+    return out_img
+
+
+def preprocess_image_capture_raw(
+    image: Image.Image,
+    subprocess_mode: bool,
+    req: gr.Request,
+    progress=gr.Progress(track_tqdm=True),
+) -> Tuple[Image.Image, Image.Image]:
+    """
+    Returns (preprocessed_image, raw_original_image).
+    Used so we can save both into outputs/<run_id>/ when generating.
+    """
+    if image is None:
+        raise gr.Error("Please provide an image.")
+    raw = image.copy()
+    processed = preprocess_image(image, subprocess_mode, req, progress)
+    return processed, raw
 
 
 # ------------------------------- Preview Rendering ---------------------------
@@ -584,6 +740,7 @@ def image_to_3d(
     tex_slat_rescale_t: float,
     no_texture_gen: bool,
     max_num_tokens: int,
+    subprocess_mode: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
 ) -> Tuple[Optional[dict], str, str]:
@@ -603,8 +760,264 @@ def image_to_3d(
     if image is None:
         raise gr.Error("Please provide an image (upload or pick an example).")
 
+    # Allocate an outputs run folder (never overwrites).
+    run = allocate_run_dir(OUTPUTS_DIR, digits=4)
+    run_dir = run.run_dir
+    run_id = run.run_id
+    logs_dir = ensure_dir(run_dir / "logs")
+
+    # Persist the raw/preprocessed inputs so every run is inspectable.
+    input_path = run_dir / "00_input.png"
+    preprocessed_path = run_dir / "01_preprocessed.png"
+    try:
+        image.save(str(input_path))
+    except Exception:
+        # Don't fail the run just because saving failed; continue.
+        pass
+
     _log("Starting Image → 3D generation…", 0.0)
     yield None, empty_html, status
+
+    if subprocess_mode:
+        # Subprocess stage pipeline (zero VRAM kept by the UI process).
+        _log(f"Subprocess mode ON. Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.01)
+        yield None, empty_html, status
+
+        work_dir = Path(TMP_DIR) / str(req.session_hash) / "subprocess" / run_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        pipeline_type = {
+            "512": "512",
+            "1024": "1024_cascade",
+            "1536": "1536_cascade",
+            "2048": "2048_cascade",
+        }[resolution]
+
+        # Artifact paths (saved under outputs/<run_id>/)
+        cond_512_path = run_dir / "02_cond_512.pt"
+        cond_1024_path = (run_dir / "03_cond_1024.pt") if pipeline_type != "512" else None
+        coords_path = run_dir / "04_coords.pt"
+        shape_slat_path = run_dir / "05_shape_slat.npz"
+        shape_res_path = run_dir / "05_shape_res.json"
+        tex_slat_path = None if no_texture_gen else (run_dir / "06_tex_slat.npz")
+        preview_dir = run_dir / "07_preview"
+        preview_manifest_path = run_dir / "07_preview_manifest.json"
+        preview_html_path = run_dir / "07_preview.html"
+
+        # Record parameters for reproducibility.
+        _write_json(
+            str(run_dir / "run.json"),
+            {
+                "run_id": run_id,
+                "type": "image_to_3d",
+                "subprocess_mode": True,
+                "seed": int(seed),
+                "resolution": resolution,
+                "pipeline_type": pipeline_type,
+                "no_texture_gen": bool(no_texture_gen),
+                "max_num_tokens": int(max_num_tokens),
+                "ss_params": {
+                    "steps": int(ss_sampling_steps),
+                    "guidance_strength": float(ss_guidance_strength),
+                    "guidance_rescale": float(ss_guidance_rescale),
+                    "rescale_t": float(ss_rescale_t),
+                },
+                "shape_params": {
+                    "steps": int(shape_slat_sampling_steps),
+                    "guidance_strength": float(shape_slat_guidance_strength),
+                    "guidance_rescale": float(shape_slat_guidance_rescale),
+                    "rescale_t": float(shape_slat_rescale_t),
+                },
+                "tex_params": {
+                    "steps": int(tex_slat_sampling_steps),
+                    "guidance_strength": float(tex_slat_guidance_strength),
+                    "guidance_rescale": float(tex_slat_guidance_rescale),
+                    "rescale_t": float(tex_slat_rescale_t),
+                },
+            },
+        )
+
+        # Helper: run a subprocess stage with light streaming updates.
+        last_ui_update = 0.0
+
+        def _stage(stage_name: str, payload: dict, p: float) -> dict:
+            nonlocal status, last_ui_update
+            _log(f"Starting stage: {stage_name}", p)
+            yield None, empty_html, status
+
+            log_path = Path(logs_dir) / f"{stage_name}.log"
+            result = None
+            for ev in _iter_subprocess_stage(stage_name, payload, work_dir, log_path):
+                if ev["type"] == "log":
+                    # Append a small subset of logs to the UI box (keeps it readable).
+                    line = ev["text"]
+                    if line:
+                        status = status + "\n" + line
+                    now = time.time()
+                    if now - last_ui_update > 0.6:
+                        last_ui_update = now
+                        yield None, empty_html, status
+                else:
+                    result = ev["result"]
+            if result is None:
+                raise gr.Error(f"Stage {stage_name} produced no result.")
+            return result
+
+        # Stage: preprocess image (writes 01_preprocessed.png)
+        preprocess_payload = {
+            "model_repo": "microsoft/TRELLIS.2-4B",
+            "input_image_path": str(input_path),
+            "output_image_path": str(preprocessed_path),
+        }
+        _ = yield from _stage("preprocess_image", preprocess_payload, 0.05)
+
+        # Stage: encode conditioning
+        cond_payload = {
+            "model_repo": "microsoft/TRELLIS.2-4B",
+            "image_path": str(preprocessed_path),
+            "resolution": resolution,
+            "cond_512_path": str(cond_512_path),
+            "cond_1024_path": str(cond_1024_path) if cond_1024_path is not None else None,
+        }
+        cond_result = yield from _stage("encode_cond", cond_payload, 0.08)
+
+        # Stage: sparse structure
+        sparse_payload = {
+            "model_repo": "microsoft/TRELLIS.2-4B",
+            "resolution": resolution,
+            "cond_512_path": str(cond_512_path),
+            "coords_path": str(coords_path),
+            "ss_params": {
+                "steps": int(ss_sampling_steps),
+                "guidance_strength": float(ss_guidance_strength),
+                "guidance_rescale": float(ss_guidance_rescale),
+                "rescale_t": float(ss_rescale_t),
+            },
+        }
+        _ = yield from _stage("sample_sparse_structure", sparse_payload, 0.18)
+
+        # Stage: shape latent
+        shape_payload = {
+            "model_repo": "microsoft/TRELLIS.2-4B",
+            "resolution": resolution,
+            "cond_512_path": str(cond_512_path),
+            "cond_1024_path": str(cond_1024_path) if cond_1024_path is not None else None,
+            "coords_path": str(coords_path),
+            "shape_slat_path": str(shape_slat_path),
+            "out_res_path": str(shape_res_path),
+            "shape_params": {
+                "steps": int(shape_slat_sampling_steps),
+                "guidance_strength": float(shape_slat_guidance_strength),
+                "guidance_rescale": float(shape_slat_guidance_rescale),
+                "rescale_t": float(shape_slat_rescale_t),
+            },
+            "max_num_tokens": int(max_num_tokens),
+        }
+        shape_result = yield from _stage("sample_shape_slat", shape_payload, 0.40)
+        res = int(shape_result["res"])
+
+        # Stage: texture latent (optional)
+        if not no_texture_gen:
+            tex_cond_path = str(cond_512_path if pipeline_type == "512" else cond_1024_path)
+            tex_payload = {
+                "model_repo": "microsoft/TRELLIS.2-4B",
+                "resolution": resolution,
+                "cond_path": tex_cond_path,
+                "shape_slat_path": str(shape_slat_path),
+                "tex_slat_path": str(tex_slat_path),
+                "tex_params": {
+                    "steps": int(tex_slat_sampling_steps),
+                    "guidance_strength": float(tex_slat_guidance_strength),
+                    "guidance_rescale": float(tex_slat_guidance_rescale),
+                    "rescale_t": float(tex_slat_rescale_t),
+                },
+            }
+            _ = yield from _stage("sample_tex_slat", tex_payload, 0.58)
+
+        # Stage: preview render (writes JPEGs + manifest)
+        preview_payload = {
+            "model_repo": "microsoft/TRELLIS.2-4B",
+            "shape_slat_path": str(shape_slat_path),
+            "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
+            "res": int(res),
+            "preview_dir": str(preview_dir),
+            "preview_manifest_path": str(preview_manifest_path),
+        }
+        _ = yield from _stage("render_preview", preview_payload, 0.82)
+
+        # Build the HTML preview from the saved JPEGs (CPU-only).
+        _log("Building preview UI…", 0.96)
+        _ensure_mode_icons()
+        manifest = _read_json(str(preview_manifest_path))
+        files = manifest.get("files", {})
+
+        images_html = ""
+        for m_idx, mode in enumerate(MODES):
+            render_key = mode["render_key"]
+            for s_idx in range(STEPS):
+                unique_id = f"view-m{m_idx}-s{s_idx}"
+                is_visible = (m_idx == DEFAULT_MODE and s_idx == DEFAULT_STEP)
+                vis_class = "visible" if is_visible else ""
+                img_path = files.get(render_key, [None] * STEPS)[s_idx]
+                if img_path:
+                    img_base64 = _jpeg_file_to_data_uri(img_path)
+                else:
+                    img_base64 = _image_to_base64(Image.fromarray(np.zeros((1024, 1024, 3), dtype=np.uint8)))
+                images_html += f"""
+                    <img id="{unique_id}"
+                         class="previewer-main-image {vis_class}"
+                         src="{img_base64}"
+                         loading="eager">
+                """
+
+        btns_html = ""
+        for idx, mode in enumerate(MODES):
+            active_class = "active" if idx == DEFAULT_MODE else ""
+            btns_html += f"""
+                <img src="{mode['icon_base64']}"
+                     class="mode-btn {active_class}"
+                     onclick="selectMode({idx})"
+                     title="{mode['name']}">
+            """
+
+        full_html = f"""
+        <div class="previewer-container">
+            <div class="tips-wrapper">
+                <div class="tips-icon">Tips</div>
+                <div class="tips-text">
+                    <p>● <b>Render Mode</b> — Click a circular button to switch render modes.</p>
+                    <p>● <b>View Angle</b> — Drag the slider to change view angle.</p>
+                </div>
+            </div>
+
+            <div class="display-row">
+                {images_html}
+            </div>
+
+            <div class="mode-row" id="btn-group">
+                {btns_html}
+            </div>
+
+            <div class="slider-row">
+                <input type="range" id="custom-slider" min="0" max="{STEPS - 1}" value="{DEFAULT_STEP}" step="1" oninput="onSliderChange(this.value)">
+            </div>
+        </div>
+        """
+        preview_html_path.write_text(full_html, encoding="utf-8")
+
+        state = {
+            "_mode": "subprocess",
+            "_run_id": run_id,
+            "_run_dir": str(run_dir),
+            "_pipeline_type": pipeline_type,
+            "res": int(res),
+            "shape_slat_path": str(shape_slat_path),
+            "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
+            "preview_manifest_path": str(preview_manifest_path),
+        }
+        _log("Done. You can now click “Extract GLB”.", 1.0)
+        yield state, full_html, status
+        return
 
     _log("Loading TRELLIS.2 pipeline (first run can take a while)…", 0.01)
     pipe = get_image_pipeline()
@@ -631,6 +1044,17 @@ def image_to_3d(
         "2048": "2048_cascade",
     }[resolution]
 
+    # Persist per-stage artifacts for this run (even in in-process mode).
+    cond_512_path = run_dir / "02_cond_512.pt"
+    cond_1024_path = (run_dir / "03_cond_1024.pt") if pipeline_type != "512" else None
+    coords_path = run_dir / "04_coords.pt"
+    shape_slat_path = run_dir / "05_shape_slat.npz"
+    shape_res_path = run_dir / "05_shape_res.json"
+    tex_slat_path = None if no_texture_gen else (run_dir / "06_tex_slat.npz")
+    preview_dir = run_dir / "07_preview"
+    preview_manifest_path = run_dir / "07_preview_manifest.json"
+    preview_html_path = run_dir / "07_preview.html"
+
     ss_params = {
         "steps": ss_sampling_steps,
         "guidance_strength": ss_guidance_strength,
@@ -650,23 +1074,44 @@ def image_to_3d(
         "rescale_t": tex_slat_rescale_t,
     }
 
+    # Preprocess (rembg + crop) at generate-time so examples/uploads behave consistently.
+    _log("Preprocessing image (background removal / crop)…", 0.06)
+    image = pipe.preprocess_image(image)
+    try:
+        image.save(str(preprocessed_path))
+    except Exception:
+        pass
+
     # Run the pipeline step-by-step so we can update status between stages.
     images = [image]
     torch.manual_seed(seed)
 
     _log("Computing image embeddings (512px)…", 0.08)
     cond_512 = pipe.get_cond(images, 512)
+    try:
+        torch.save({k: v.detach().cpu() for k, v in cond_512.items()}, str(cond_512_path))
+    except Exception:
+        pass
     yield None, empty_html, status
 
     cond_1024 = None
     if pipeline_type != "512":
         _log("Computing image embeddings (1024px)…", 0.12)
         cond_1024 = pipe.get_cond(images, 1024)
+        if cond_1024_path is not None:
+            try:
+                torch.save({k: v.detach().cpu() for k, v in cond_1024.items()}, str(cond_1024_path))
+            except Exception:
+                pass
         yield None, empty_html, status
 
     ss_res = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32, "2048_cascade": 32}[pipeline_type]
     _log("Stage 1/3: Sampling sparse structure…", 0.18)
     coords = pipe.sample_sparse_structure(cond_512, ss_res, 1, ss_params)
+    try:
+        torch.save(coords.detach().cpu(), str(coords_path))
+    except Exception:
+        pass
     yield None, empty_html, status
 
     if pipeline_type == "512":
@@ -724,6 +1169,23 @@ def image_to_3d(
     else:
         raise gr.Error(f"Unsupported pipeline type: {pipeline_type}")
 
+    # Save latents for inspection / later subprocess extraction.
+    try:
+        np.savez_compressed(
+            str(shape_slat_path),
+            feats=shape_slat.feats.detach().cpu().numpy(),
+            coords=shape_slat.coords.detach().cpu().numpy(),
+        )
+        _write_json(str(shape_res_path), {"res": int(res), "pipeline_type": pipeline_type})
+        if tex_slat is not None and tex_slat_path is not None:
+            np.savez_compressed(
+                str(tex_slat_path),
+                feats=tex_slat.feats.detach().cpu().numpy(),
+                coords=tex_slat.coords.detach().cpu().numpy(),
+            )
+    except Exception:
+        pass
+
     _log("Decoding latent to mesh…", 0.75)
     mesh = pipe.decode_latent(shape_slat, tex_slat, res)[0]
     yield None, empty_html, status
@@ -750,6 +1212,28 @@ def image_to_3d(
         # Still continue so state is produced and Extract works.
         images = {m["render_key"]: [np.zeros((1024, 1024, 3), dtype=np.uint8) for _ in range(STEPS)] for m in MODES}
     yield None, empty_html, status
+
+    # Save preview frames to disk (JPEG) + a manifest (used by subprocess mode too).
+    try:
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        manifest_files: Dict[str, List[str]] = {}
+        for m_idx, mode in enumerate(MODES):
+            key = mode["render_key"]
+            manifest_files[key] = []
+            for s_idx in range(STEPS):
+                path = preview_dir / f"view-m{m_idx}-s{s_idx}.jpg"
+                Image.fromarray(images[key][s_idx]).save(str(path), format="JPEG", quality=85)
+                manifest_files[key].append(str(path))
+        _write_json(
+            str(preview_manifest_path),
+            {
+                "modes": [{"name": m["name"], "render_key": m["render_key"]} for m in MODES],
+                "steps": STEPS,
+                "files": manifest_files,
+            },
+        )
+    except Exception:
+        pass
 
     _log("Packing generation state (for GLB extraction)…", 0.93)
     state = pack_state((shape_slat, tex_slat, res))
@@ -809,6 +1293,23 @@ def image_to_3d(
     </div>
     """
 
+    # Persist preview HTML and attach run metadata to the returned state so extraction can
+    # save into the same outputs/<run_id>/ folder without overwriting.
+    try:
+        preview_html_path.write_text(full_html, encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        state["_mode"] = "inproc"
+        state["_run_id"] = run_id
+        state["_run_dir"] = str(run_dir)
+        state["_pipeline_type"] = pipeline_type
+        state["shape_slat_path"] = str(shape_slat_path)
+        state["tex_slat_path"] = str(tex_slat_path) if tex_slat_path is not None else None
+        state["preview_manifest_path"] = str(preview_manifest_path)
+    except Exception:
+        pass
+
     _log("Done. You can now click “Extract GLB”.", 1.0)
     yield state, full_html, status
 
@@ -821,6 +1322,7 @@ def extract_glb(
     simplify_method: str,
     no_texture_gen: bool,
     prune_invisible_faces: bool,
+    subprocess_mode: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
 ) -> Tuple[Optional[str], Optional[str], str]:
@@ -829,9 +1331,79 @@ def extract_glb(
         # (or right after changing the image / clicking an example).
         raise gr.Error("Nothing to extract yet. Click **Generate** first.")
 
+    # If the run was generated in subprocess mode (or the checkbox is enabled),
+    # do extraction in a short-lived worker process to ensure VRAM goes back to 0.
+    if subprocess_mode or (isinstance(state, dict) and state.get("_mode") == "subprocess"):
+        status = ""
+
+        def _log(msg: str, p: Optional[float] = None) -> str:
+            nonlocal status
+            ts = datetime.now().strftime("%H:%M:%S")
+            line = f"[{ts}] {msg}"
+            status = (status + "\n" if status else "") + line
+            print(line, flush=True)
+            if p is not None:
+                progress(p, desc=msg)
+            return status
+
+        run_dir = Path(state.get("_run_dir", Path(TMP_DIR) / str(req.session_hash)))
+        logs_dir = ensure_dir(run_dir / "logs")
+        work_dir = Path(TMP_DIR) / str(req.session_hash) / "subprocess" / str(state.get("_run_id", "extract"))
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        shape_slat_path = state.get("shape_slat_path")
+        if not shape_slat_path:
+            raise gr.Error("Missing shape latent on disk. Please Generate again with subprocess mode enabled.")
+        tex_slat_path = state.get("tex_slat_path")
+        res = int(state.get("res"))
+
+        out_dir = run_dir / "08_extract"
+
+        _log("Starting GLB extraction (subprocess)…", 0.0)
+        yield None, None, status
+
+        payload = {
+            "model_repo": "microsoft/TRELLIS.2-4B",
+            "shape_slat_path": str(shape_slat_path),
+            "tex_slat_path": str(tex_slat_path) if tex_slat_path else None,
+            "res": int(res),
+            "decimation_target": int(decimation_target),
+            "texture_size": int(texture_size),
+            "remesh_method": remesh_method,
+            "simplify_method": simplify_method,
+            "prune_invisible_faces": bool(prune_invisible_faces),
+            "no_texture_gen": bool(no_texture_gen),
+            "out_dir": str(out_dir),
+            "prefix": "glb",
+        }
+
+        last_ui_update = 0.0
+        log_path = Path(logs_dir) / "extract_glb.log"
+        result = None
+        for ev in _iter_subprocess_stage("extract_glb", payload, work_dir, log_path):
+            if ev["type"] == "log":
+                line = ev["text"]
+                if line:
+                    status = status + "\n" + line
+                now = time.time()
+                if now - last_ui_update > 0.6:
+                    last_ui_update = now
+                    yield None, None, status
+            else:
+                result = ev["result"]
+
+        if not result or "glb_path" not in result:
+            raise gr.Error("Extraction failed (no GLB path returned). See logs in the run folder.")
+
+        glb_path = result["glb_path"]
+        _log("Done.", 1.0)
+        yield glb_path, glb_path, status
+        return
+
     texture_extraction = not no_texture_gen
 
-    user_dir = os.path.join(TMP_DIR, str(req.session_hash))
+    run_dir = Path(state.get("_run_dir", os.path.join(TMP_DIR, str(req.session_hash))))
+    out_dir = run_dir / "08_extract"
     try:
         shape_slat, tex_slat, res = unpack_state(state)
     except Exception:
@@ -883,11 +1455,9 @@ def extract_glb(
     yield None, None, status
 
     _log("Saving GLB…", 0.9)
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
-    os.makedirs(user_dir, exist_ok=True)
-    glb_path = os.path.join(user_dir, f"sample_{timestamp}.glb")
-    glb.export(glb_path, extension_webp=True)
+    _, glb_path_p = next_indexed_path(out_dir, prefix="glb", ext="glb", digits=4, start=1)
+    glb.export(str(glb_path_p), extension_webp=True)
+    glb_path = str(glb_path_p)
     torch.cuda.empty_cache()
     _log("Done.", 1.0)
     yield glb_path, glb_path, status
@@ -905,6 +1475,7 @@ def shapeimage_to_tex(
     tex_slat_guidance_rescale: float,
     tex_slat_sampling_steps: int,
     tex_slat_rescale_t: float,
+    subprocess_mode: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
 ) -> Tuple[Optional[str], Optional[str], str]:
@@ -925,7 +1496,126 @@ def shapeimage_to_tex(
     if image is None:
         raise gr.Error("Please provide a reference image (or use the example).")
 
-    _log("Starting Texturing…", 0.0)
+    if subprocess_mode:
+        run = allocate_run_dir(OUTPUTS_DIR, digits=4)
+        run_dir = run.run_dir
+        run_id = run.run_id
+        logs_dir = ensure_dir(run_dir / "logs")
+        work_dir = Path(TMP_DIR) / str(req.session_hash) / "subprocess" / run_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        # Persist inputs
+        src_mesh = Path(mesh_file)
+        mesh_copy = run_dir / f"00_mesh{src_mesh.suffix.lower() or '.ply'}"
+        try:
+            shutil.copyfile(str(src_mesh), str(mesh_copy))
+        except Exception:
+            mesh_copy = src_mesh
+        img_path = run_dir / "01_reference.png"
+        try:
+            image.save(str(img_path))
+        except Exception:
+            pass
+
+        _write_json(
+            str(run_dir / "run.json"),
+            {
+                "run_id": run_id,
+                "type": "texturing",
+                "subprocess_mode": True,
+                "seed": int(seed),
+                "resolution": int(resolution),
+                "texture_size": int(texture_size),
+                "tex_params": {
+                    "steps": int(tex_slat_sampling_steps),
+                    "guidance_strength": float(tex_slat_guidance_strength),
+                    "guidance_rescale": float(tex_slat_guidance_rescale),
+                    "rescale_t": float(tex_slat_rescale_t),
+                },
+            },
+        )
+
+        _log(f"Subprocess mode ON. Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.02)
+        yield None, None, status
+
+        payload = {
+            "model_repo": "microsoft/TRELLIS.2-4B",
+            "config_file": "texturing_pipeline.json",
+            "mesh_path": str(mesh_copy),
+            "image_path": str(img_path),
+            "seed": int(seed),
+            "resolution": int(resolution),
+            "texture_size": int(texture_size),
+            "tex_params": {
+                "steps": int(tex_slat_sampling_steps),
+                "guidance_strength": float(tex_slat_guidance_strength),
+                "guidance_rescale": float(tex_slat_guidance_rescale),
+                "rescale_t": float(tex_slat_rescale_t),
+            },
+            "out_dir": str(run_dir / "08_texturing"),
+            "prefix": "textured",
+        }
+
+        last_ui_update = 0.0
+        log_path = Path(logs_dir) / "texture_generate.log"
+        result = None
+        for ev in _iter_subprocess_stage("texture_generate", payload, work_dir, log_path):
+            if ev["type"] == "log":
+                line = ev["text"]
+                if line:
+                    status = status + "\n" + line
+                now = time.time()
+                if now - last_ui_update > 0.6:
+                    last_ui_update = now
+                    yield None, None, status
+            else:
+                result = ev["result"]
+
+        if not result or "glb_path" not in result:
+            raise gr.Error("Texturing failed (no GLB path returned). See logs in the run folder.")
+
+        glb_path = result["glb_path"]
+        _log("Done.", 1.0)
+        yield glb_path, glb_path, status
+        return
+
+    # In-process mode still writes all artifacts into a new outputs/<run_id>/ folder.
+    run = allocate_run_dir(OUTPUTS_DIR, digits=4)
+    run_dir = run.run_dir
+    run_id = run.run_id
+
+    # Persist inputs
+    src_mesh = Path(mesh_file)
+    mesh_copy = run_dir / f"00_mesh{src_mesh.suffix.lower() or '.ply'}"
+    try:
+        shutil.copyfile(str(src_mesh), str(mesh_copy))
+    except Exception:
+        mesh_copy = src_mesh
+    raw_img_path = run_dir / "01_reference_raw.png"
+    try:
+        image.save(str(raw_img_path))
+    except Exception:
+        pass
+
+    _write_json(
+        str(run_dir / "run.json"),
+        {
+            "run_id": run_id,
+            "type": "texturing",
+            "subprocess_mode": False,
+            "seed": int(seed),
+            "resolution": int(resolution),
+            "texture_size": int(texture_size),
+            "tex_params": {
+                "steps": int(tex_slat_sampling_steps),
+                "guidance_strength": float(tex_slat_guidance_strength),
+                "guidance_rescale": float(tex_slat_guidance_rescale),
+                "rescale_t": float(tex_slat_rescale_t),
+            },
+        },
+    )
+
+    _log(f"Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.0)
     yield None, None, status
 
     _log("Loading texturing pipeline (first run can take a while)…", 0.05)
@@ -934,7 +1624,7 @@ def shapeimage_to_tex(
 
     _log("Loading mesh…", 0.1)
 
-    mesh = trimesh.load(mesh_file)
+    mesh = trimesh.load(str(mesh_copy))
     if isinstance(mesh, trimesh.Scene):
         mesh = mesh.to_mesh()
     yield None, None, status
@@ -949,6 +1639,10 @@ def shapeimage_to_tex(
 
     _log("Preprocessing reference image…", 0.18)
     image = pipe.preprocess_image(image)
+    try:
+        image.save(str(run_dir / "02_reference_preprocessed.png"))
+    except Exception:
+        pass
     yield None, None, status
 
     _log("Preprocessing mesh…", 0.22)
@@ -978,12 +1672,10 @@ def shapeimage_to_tex(
     yield None, None, status
 
     _log("Saving textured GLB…", 0.9)
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
-    user_dir = os.path.join(TMP_DIR, str(req.session_hash))
-    os.makedirs(user_dir, exist_ok=True)
-    glb_path = os.path.join(user_dir, f"textured_{timestamp}.glb")
-    output.export(glb_path, extension_webp=True)
+    out_dir = run_dir / "08_texturing"
+    _, glb_path_p = next_indexed_path(out_dir, prefix="textured", ext="glb", digits=4, start=1)
+    output.export(str(glb_path_p), extension_webp=True)
+    glb_path = str(glb_path_p)
     torch.cuda.empty_cache()
     _log("Done.", 1.0)
     yield glb_path, glb_path, status
@@ -1005,6 +1697,12 @@ with gr.Blocks(
 - **Two tools in one app**: generate a mesh from an image, then (optionally) texture any mesh with a reference image.
 """
     )
+
+    with gr.Row():
+        subprocess_mode = gr.Checkbox(
+            label="Subprocess stage processing (zero leftover VRAM between stages)",
+            value=False,
+        )
 
     demo.load(start_session)
     demo.unload(end_session)
@@ -1073,9 +1771,6 @@ with gr.Blocks(
                             for image in os.listdir(os.path.join(APP_DIR, "assets", "example_image"))
                         ],
                         inputs=[image_prompt],
-                        fn=preprocess_image,
-                        outputs=[image_prompt],
-                        run_on_click=True,
                         examples_per_page=18,
                     )
 
@@ -1092,11 +1787,9 @@ with gr.Blocks(
                     "Select an image (upload or example), then click Generate.",  # status_box
                 )
 
-            image_prompt.upload(
-                preprocess_image,
-                inputs=[image_prompt],
-                outputs=[image_prompt],
-            )
+            # Note: We intentionally do not auto-preprocess on upload/example click.
+            # Both in-process and subprocess pipelines do preprocessing as part of "Generate",
+            # and each run saves both the raw input + the preprocessed image under outputs/<run_id>/.
 
             # Any time the input image changes (upload, example click, clear), invalidate previous results.
             image_prompt.change(
@@ -1135,6 +1828,7 @@ with gr.Blocks(
                     tex_slat_rescale_t,
                     no_texture_gen,
                     max_num_tokens,
+                    subprocess_mode,
                 ],
                 outputs=[output_buf, preview_output, status_box],
             ).then(
@@ -1145,7 +1839,16 @@ with gr.Blocks(
                 lambda: gr.Walkthrough(selected=1), outputs=walkthrough
             ).then(
                 extract_glb,
-                inputs=[output_buf, decimation_target, texture_size, remesh_method, simplify_method, no_texture_gen, prune_invisible_faces],
+                inputs=[
+                    output_buf,
+                    decimation_target,
+                    texture_size,
+                    remesh_method,
+                    simplify_method,
+                    no_texture_gen,
+                    prune_invisible_faces,
+                    subprocess_mode,
+                ],
                 outputs=[glb_output, download_btn, status_box],
             )
 
@@ -1208,6 +1911,7 @@ with gr.Blocks(
                     t_guidance_rescale,
                     t_sampling_steps,
                     t_rescale_t,
+                    subprocess_mode,
                 ],
                 outputs=[textured_glb_output, textured_download_btn, tex_status_box],
             )
@@ -1216,6 +1920,7 @@ with gr.Blocks(
 if __name__ == "__main__":
     os.makedirs(TMP_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR, exist_ok=True)
+    os.makedirs(OUTPUTS_DIR, exist_ok=True)
     demo.queue()
     demo.launch(server_name="0.0.0.0", server_port=7860)
 

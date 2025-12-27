@@ -79,14 +79,22 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         self._device = 'cpu'
 
     @classmethod
-    def from_pretrained(cls, path: str, config_file: str = "pipeline.json", load_texture_models: bool = True) -> "Trellis2ImageTo3DPipeline":
+    def from_pretrained(
+        cls,
+        path: str,
+        config_file: str = "pipeline.json",
+        load_texture_models: bool = True,
+        load_image_cond_model: bool = True,
+        load_rembg_model: bool = True,
+        ignore_models: Optional[List[str]] = None,
+    ) -> "Trellis2ImageTo3DPipeline":
         """
         Load a pretrained model.
 
         Args:
             path (str): The path to the model. Can be either local path or a Hugging Face repository.
         """
-        pipeline = super().from_pretrained(path, config_file)
+        pipeline = super().from_pretrained(path, ignore_models=ignore_models, config_file=config_file)
         args = pipeline._pretrained_args
 
         pipeline.sparse_structure_sampler = getattr(samplers, args['sparse_structure_sampler']['name'])(**args['sparse_structure_sampler']['args'])
@@ -105,8 +113,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             pipeline.tex_slat_sampler_params = {}
             pipeline.tex_slat_normalization = None
 
-        pipeline.image_cond_model = getattr(image_feature_extractor, args['image_cond_model']['name'])(**args['image_cond_model']['args'])
-        pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
+        pipeline.image_cond_model = (
+            getattr(image_feature_extractor, args['image_cond_model']['name'])(**args['image_cond_model']['args'])
+            if load_image_cond_model
+            else None
+        )
+        pipeline.rembg_model = (
+            getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
+            if load_rembg_model
+            else None
+        )
         
         pipeline.low_vram = args.get('low_vram', True)
         pipeline.default_pipeline_type = args.get('default_pipeline_type', '1024_cascade')
@@ -124,7 +140,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         self._device = device
         if not self.low_vram:
             super().to(device)
-            self.image_cond_model.to(device)
+            if self.image_cond_model is not None:
+                self.image_cond_model.to(device)
             if self.rembg_model is not None:
                 self.rembg_model.to(device)
 
@@ -132,6 +149,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         """
         Preprocess the input image.
         """
+        if self.rembg_model is None:
+            raise RuntimeError("rembg_model not loaded. Call from_pretrained(load_rembg_model=True).")
         # if has alpha channel, use it directly; otherwise, remove background
         has_alpha = False
         if input.mode == 'RGBA':
@@ -175,6 +194,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         Returns:
             dict: The conditioning information
         """
+        if self.image_cond_model is None:
+            raise RuntimeError("image_cond_model not loaded. Call from_pretrained(load_image_cond_model=True).")
         self.image_cond_model.image_size = resolution
         if self.low_vram:
             self.image_cond_model.to(self.device)
