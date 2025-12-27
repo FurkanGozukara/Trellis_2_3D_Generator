@@ -255,6 +255,18 @@ css = """
 
 /* Remove padding around the HTML preview block */
 .gradio-container .padded:has(.previewer-container) { padding: 0 !important; }
+
+/* ----------------------------- Model3D Fullscreen -------------------------- */
+/* Gradio's Model3D root uses data-testid="model3d" (see gradio/js/model3D/shared/Model3D.svelte) */
+[data-testid="model3d"]:fullscreen {
+    width: 100vw !important;
+    height: 100vh !important;
+    background: #000;
+}
+[data-testid="model3d"]:fullscreen canvas {
+    width: 100% !important;
+    height: 100% !important;
+}
 """
 
 head = """
@@ -1734,7 +1746,7 @@ with gr.Blocks(
     with gr.Row():
         subprocess_mode = gr.Checkbox(
             label="Subprocess stage processing (zero leftover VRAM between stages)",
-            value=False,
+            value=True,
         )
 
     demo.load(start_session)
@@ -1801,7 +1813,15 @@ with gr.Blocks(
                             view_extract_btn = gr.Button("View Extracted", interactive=False)
                         with gr.Step("Extract", id=1):
                             back_to_preview_btn = gr.Button("Back to Preview", variant="secondary")
-                            glb_output = gr.Model3D(label="Extracted GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
+                            fullscreen_glb_btn = gr.Button("Fullscreen", variant="secondary")
+                            glb_output = gr.Model3D(
+                                label="Extracted GLB",
+                                height=724,
+                                show_label=True,
+                                display_mode="solid",
+                                clear_color=(0.25, 0.25, 0.25, 1.0),
+                                elem_id="extracted_glb_viewer",
+                            )
                             download_btn = gr.DownloadButton(label="Download GLB")
 
                 with gr.Column(scale=1, min_width=172):
@@ -1899,6 +1919,25 @@ with gr.Blocks(
             # Navigation-only controls (do NOT re-run extraction)
             view_extract_btn.click(lambda: gr.Walkthrough(selected=1), outputs=walkthrough)
             back_to_preview_btn.click(lambda: gr.Walkthrough(selected=0), outputs=walkthrough)
+
+            # Fullscreen toggle for the extracted 3D viewer (client-side only)
+            fullscreen_glb_btn.click(
+                fn=None,
+                inputs=[],
+                outputs=None,
+                js="""
+() => {
+  const root = document.querySelector("#extracted_glb_viewer");
+  const el = root?.querySelector('[data-testid="model3d"]') || root;
+  if (!el) return;
+  if (document.fullscreenElement) {
+    document.exitFullscreen?.();
+  } else {
+    el.requestFullscreen?.();
+  }
+}
+""",
+            )
 
         # ---------------------------- Tab 2: Texturing -------------------------------
         with gr.Tab("Texturing"):
