@@ -1322,6 +1322,7 @@ def extract_glb(
     simplify_method: str,
     no_texture_gen: bool,
     prune_invisible_faces: bool,
+    export_formats: List[str],
     subprocess_mode: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
@@ -1362,6 +1363,10 @@ def extract_glb(
         _log("Starting GLB extraction (subprocess)…", 0.0)
         yield None, None, status
 
+        export_formats = export_formats or ["glb"]
+        if "glb" not in export_formats:
+            export_formats = ["glb"] + list(export_formats)
+
         payload = {
             "model_repo": "microsoft/TRELLIS.2-4B",
             "shape_slat_path": str(shape_slat_path),
@@ -1375,6 +1380,7 @@ def extract_glb(
             "no_texture_gen": bool(no_texture_gen),
             "out_dir": str(out_dir),
             "prefix": "glb",
+            "export_formats": list(export_formats),
         }
 
         last_ui_update = 0.0
@@ -1396,6 +1402,7 @@ def extract_glb(
             raise gr.Error("Extraction failed (no GLB path returned). See logs in the run folder.")
 
         glb_path = result["glb_path"]
+        _log(f"Saved: {safe_relpath(glb_path, APP_DIR)}", 0.98)
         _log("Done.", 1.0)
         yield glb_path, glb_path, status
         return
@@ -1455,10 +1462,36 @@ def extract_glb(
     yield None, None, status
 
     _log("Saving GLB…", 0.9)
-    _, glb_path_p = next_indexed_path(out_dir, prefix="glb", ext="glb", digits=4, start=1)
+    export_formats = export_formats or ["glb"]
+    if "glb" not in export_formats:
+        export_formats = ["glb"] + list(export_formats)
+
+    idx, glb_path_p = next_indexed_path(out_dir, prefix="glb", ext="glb", digits=4, start=1)
     glb.export(str(glb_path_p), extension_webp=True)
     glb_path = str(glb_path_p)
+
+    # Optional extra exports (best effort; never fail the main GLB export).
+    extras = [f for f in export_formats if f != "glb"]
+    for fmt in extras:
+        try:
+            fmt = str(fmt).lower().strip()
+            if fmt == "gltf":
+                gltf_path = out_dir / f"gltf_{idx:04d}.gltf"
+                glb.export(str(gltf_path))
+            elif fmt == "obj":
+                obj_path = out_dir / f"obj_{idx:04d}.obj"
+                glb.export(str(obj_path))
+            elif fmt == "ply":
+                ply_path = out_dir / f"ply_{idx:04d}.ply"
+                glb.export(str(ply_path))
+            elif fmt == "stl":
+                stl_path = out_dir / f"stl_{idx:04d}.stl"
+                glb.export(str(stl_path))
+        except Exception as e:
+            _log(f"Extra export '{fmt}' failed: {type(e).__name__}: {e}", 0.95)
+
     torch.cuda.empty_cache()
+    _log(f"Saved: {safe_relpath(glb_path, APP_DIR)}", 0.98)
     _log("Done.", 1.0)
     yield glb_path, glb_path, status
 
@@ -1723,6 +1756,11 @@ with gr.Blocks(
                     prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces", value=True)
                     no_texture_gen = gr.Checkbox(label="Skip Texture Generation", value=False)
                     texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
+                    export_formats = gr.CheckboxGroup(
+                        choices=["glb", "gltf", "obj", "ply", "stl"],
+                        value=["glb"],
+                        label="Auto-save export formats (saved into outputs/<run>/08_extract/)",
+                    )
 
                     status_box = gr.Textbox(
                         label="Progress",
@@ -1760,7 +1798,9 @@ with gr.Blocks(
                             preview_output = gr.HTML(empty_html, label="3D Asset Preview", show_label=True, container=True)
                             generate_btn = gr.Button("Generate", variant="primary")
                             extract_btn = gr.Button("Extract GLB", interactive=False)
+                            view_extract_btn = gr.Button("View Extracted", interactive=False)
                         with gr.Step("Extract", id=1):
+                            back_to_preview_btn = gr.Button("Back to Preview", variant="secondary")
                             glb_output = gr.Model3D(label="Extracted GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
                             download_btn = gr.DownloadButton(label="Download GLB")
 
@@ -1781,6 +1821,7 @@ with gr.Blocks(
                     None,  # output_buf
                     empty_html,  # preview_output
                     gr.update(interactive=False),  # extract_btn
+                    gr.update(interactive=False),  # view_extract_btn
                     gr.Walkthrough(selected=0),  # walkthrough
                     None,  # glb_output
                     None,  # download_btn
@@ -1795,7 +1836,7 @@ with gr.Blocks(
             image_prompt.change(
                 _reset_image_to_3d_ui,
                 inputs=[],
-                outputs=[output_buf, preview_output, extract_btn, walkthrough, glb_output, download_btn, status_box],
+                outputs=[output_buf, preview_output, extract_btn, view_extract_btn, walkthrough, glb_output, download_btn, status_box],
             )
 
             generate_btn.click(
@@ -1807,7 +1848,7 @@ with gr.Blocks(
             ).then(
                 _reset_image_to_3d_ui,
                 inputs=[],
-                outputs=[output_buf, preview_output, extract_btn, walkthrough, glb_output, download_btn, status_box],
+                outputs=[output_buf, preview_output, extract_btn, view_extract_btn, walkthrough, glb_output, download_btn, status_box],
             ).then(
                 image_to_3d,
                 inputs=[
@@ -1847,10 +1888,17 @@ with gr.Blocks(
                     simplify_method,
                     no_texture_gen,
                     prune_invisible_faces,
+                    export_formats,
                     subprocess_mode,
                 ],
                 outputs=[glb_output, download_btn, status_box],
+            ).then(
+                lambda: gr.update(interactive=True), outputs=view_extract_btn
             )
+
+            # Navigation-only controls (do NOT re-run extraction)
+            view_extract_btn.click(lambda: gr.Walkthrough(selected=1), outputs=walkthrough)
+            back_to_preview_btn.click(lambda: gr.Walkthrough(selected=0), outputs=walkthrough)
 
         # ---------------------------- Tab 2: Texturing -------------------------------
         with gr.Tab("Texturing"):

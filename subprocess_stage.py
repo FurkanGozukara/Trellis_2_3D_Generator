@@ -599,6 +599,10 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     out_dir = Path(payload["out_dir"])
     prefix = str(payload.get("prefix", "glb"))
+    export_formats = payload.get("export_formats") or ["glb"]
+    export_formats = [str(f).lower().strip() for f in export_formats]
+    if "glb" not in export_formats:
+        export_formats = ["glb"] + export_formats
 
     device = "cuda"
 
@@ -647,8 +651,28 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
         use_tqdm=True,
     )
 
-    _, glb_path = next_indexed_path(out_dir, prefix=prefix, ext="glb", digits=4, start=1)
+    idx, glb_path = next_indexed_path(out_dir, prefix=prefix, ext="glb", digits=4, start=1)
     glb.export(str(glb_path), extension_webp=True)
+
+    # Optional extra exports (best effort; never fail the main GLB export).
+    for fmt in export_formats:
+        if fmt == "glb":
+            continue
+        try:
+            if fmt == "gltf":
+                gltf_path = out_dir / f"gltf_{idx:04d}.gltf"
+                glb.export(str(gltf_path))
+            elif fmt == "obj":
+                obj_path = out_dir / f"obj_{idx:04d}.obj"
+                glb.export(str(obj_path))
+            elif fmt == "ply":
+                ply_path = out_dir / f"ply_{idx:04d}.ply"
+                glb.export(str(ply_path))
+            elif fmt == "stl":
+                stl_path = out_dir / f"stl_{idx:04d}.stl"
+                glb.export(str(stl_path))
+        except Exception as e:
+            print(f"[extract] extra export '{fmt}' failed: {type(e).__name__}: {e}", flush=True)
     torch.cuda.empty_cache()
     print(f"[extract] saved: {glb_path}", flush=True)
     return {"glb_path": str(glb_path)}
