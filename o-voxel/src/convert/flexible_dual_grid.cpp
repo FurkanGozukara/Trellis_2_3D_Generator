@@ -304,7 +304,7 @@ void boundry_qef(
         // Calculate the QEF for the edge (boundary) defined by v0 and v1
         Eigen::Vector3d dir(v1.x() - v0.x(), v1.y() - v0.y(), v1.z() - v0.z());
         double segment_length = dir.norm();
-        if (segment_length < 1e-6d) continue; // Skip degenerate edges (zero-length)
+        if (segment_length < 1e-6) continue; // Skip degenerate edges (zero-length)
         dir.normalize();  // unit direction vector
 
         // Projection matrix orthogonal to the direction: I - d d^T
@@ -334,7 +334,7 @@ void boundry_qef(
 
         Eigen::Vector3d tMax, tDelta;
         for (int axis = 0; axis < 3; ++axis) {
-            if (dir[axis] == 0.0d) {
+            if (dir[axis] == 0.0) {
                 tMax[axis] = std::numeric_limits<double>::infinity();
                 tDelta[axis] = std::numeric_limits<double>::infinity();
             } else {
@@ -438,19 +438,19 @@ void face_from_dual_vertices(
 
         // xy-plane
         if (is_intersected[2] && neigh_indices[0] != kInvalidIndex && neigh_indices[1] != kInvalidIndex && neigh_indices[2] != kInvalidIndex) {
-            int4 quad_indices{i, neigh_indices[0], neigh_indices[2], neigh_indices[1]};
+            int4 quad_indices{static_cast<int>(i), static_cast<int>(neigh_indices[0]), static_cast<int>(neigh_indices[2]), static_cast<int>(neigh_indices[1])};
             auto tri_indices = quad_to_2tri(dual_vertices, quad_indices);
             face_indices.insert(face_indices.end(), tri_indices.begin(), tri_indices.end());
         }
         // yz-plane
         if (is_intersected[0] && neigh_indices[1] != kInvalidIndex && neigh_indices[3] != kInvalidIndex && neigh_indices[5] != kInvalidIndex) {
-            int4 quad_indices{i, neigh_indices[1], neigh_indices[5], neigh_indices[3]};
+            int4 quad_indices{static_cast<int>(i), static_cast<int>(neigh_indices[1]), static_cast<int>(neigh_indices[5]), static_cast<int>(neigh_indices[3])};
             auto tri_indices = quad_to_2tri(dual_vertices, quad_indices);
             face_indices.insert(face_indices.end(), tri_indices.begin(), tri_indices.end());
         }
         // xz-plane
         if (is_intersected[1] && neigh_indices[0] != kInvalidIndex && neigh_indices[3] != kInvalidIndex && neigh_indices[4] != kInvalidIndex) {
-            int4 quad_indices{i, neigh_indices[0], neigh_indices[4], neigh_indices[3]};
+            int4 quad_indices{static_cast<int>(i), static_cast<int>(neigh_indices[0]), static_cast<int>(neigh_indices[4]), static_cast<int>(neigh_indices[3])};
             auto tri_indices = quad_to_2tri(dual_vertices, quad_indices);
             face_indices.insert(face_indices.end(), tri_indices.begin(), tri_indices.end());
         }

@@ -4,6 +4,59 @@ import os
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
+import sys
+import subprocess
+import importlib
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_O_VOXEL_SRC_DIR = os.path.join(APP_DIR, "o-voxel")
+
+
+def _ensure_o_voxel_available() -> None:
+    """
+    TRELLIS.2 depends on the CUDA extension package `o_voxel`.
+
+    On some installs (especially Windows), users may have the source present at
+    `./o-voxel` but not actually installed into the current environment yet.
+    This helper attempts a local install to avoid a hard crash on import.
+    """
+    try:
+        import o_voxel  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to import 'o_voxel' (it may be installed but unusable).\n"
+            "Try reinstalling from the bundled source:\n"
+            "  python -m pip install ./o-voxel --no-build-isolation\n"
+        ) from e
+
+    if not os.path.isdir(_O_VOXEL_SRC_DIR):
+        raise ModuleNotFoundError(
+            "No module named 'o_voxel'. Also could not find bundled source at "
+            f"{_O_VOXEL_SRC_DIR!r}."
+        )
+
+    print(f"[setup] 'o_voxel' not found. Installing from bundled source: {_O_VOXEL_SRC_DIR}")
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", _O_VOXEL_SRC_DIR, "--no-build-isolation"]
+        )
+    except Exception as e:
+        raise RuntimeError(
+            "Could not install the required CUDA extension 'o_voxel'.\n"
+            f"Tried: {sys.executable} -m pip install {_O_VOXEL_SRC_DIR} --no-build-isolation\n"
+            "Make sure you're running in the project's venv and have a working CUDA + C++ "
+            "build toolchain (NVCC + MSVC Build Tools on Windows)."
+        ) from e
+
+    importlib.invalidate_caches()
+    import o_voxel  # noqa: F401
+
+
+_ensure_o_voxel_available()
+
 from datetime import datetime
 import shutil
 import base64
@@ -25,7 +78,6 @@ import o_voxel
 
 # ------------------------------- Paths / Config ------------------------------
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(APP_DIR, "models")
 TMP_DIR = os.path.join(APP_DIR, "tmp")
 

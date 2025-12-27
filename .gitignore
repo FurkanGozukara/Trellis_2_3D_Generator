@@ -183,7 +183,7 @@ cython_debug/
 
 gradio/
 requirements_premium.txt
-
+models/
 
 # Visual Studio Code
 #  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
