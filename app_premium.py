@@ -89,6 +89,26 @@ def _has_nvdiffrec_render() -> bool:
         return False
 
 
+def _is_faithful_contouring_available() -> bool:
+    """
+    `faithful_contouring` remeshing in `o_voxel.postprocess.to_glb()` depends on optional
+    FaithC packages (`faithcontour` + `atom3d`). These are not installed by default in
+    many environments (especially Windows).
+    """
+    try:
+        return (
+            importlib.util.find_spec("faithcontour") is not None
+            and importlib.util.find_spec("atom3d") is not None
+        )
+    except Exception:
+        return False
+
+
+REMESH_METHOD_CHOICES = ["dual_contouring"]
+if _is_faithful_contouring_available():
+    REMESH_METHOD_CHOICES.append("faithful_contouring")
+
+
 # ------------------------------- Paths / Config ------------------------------
 
 MODELS_DIR = os.path.join(APP_DIR, "models")
@@ -1379,6 +1399,15 @@ def extract_glb(
         if "glb" not in export_formats:
             export_formats = ["glb"] + list(export_formats)
 
+        requested_remesh_method = str(remesh_method)
+        if requested_remesh_method == "faithful_contouring" and not _is_faithful_contouring_available():
+            remesh_method = "dual_contouring"
+            _log(
+                "WARNING: remesh_method='faithful_contouring' requires optional FaithC dependencies "
+                "(`faithcontour` + `atom3d`) which are not installed. Falling back to 'dual_contouring'."
+            )
+            yield None, None, status
+
         payload = {
             "model_repo": "microsoft/TRELLIS.2-4B",
             "shape_slat_path": str(shape_slat_path),
@@ -1452,25 +1481,48 @@ def extract_glb(
     yield None, None, status
 
     _log("Post-processing + baking GLB (this can take a while)…", 0.3)
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=pipe.pbr_attr_layout,
-        grid_size=res,
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=decimation_target,
-        simplify_method=simplify_method,
-        texture_extraction=texture_extraction,
-        texture_size=texture_size,
-        remesh=True,
-        remesh_band=1,
-        remesh_project=0,
-        remesh_method=remesh_method,
-        prune_invisible=prune_invisible_faces,
-        use_tqdm=True,
-    )
+    yield None, None, status
+
+    requested_remesh_method = str(remesh_method)
+    if requested_remesh_method == "faithful_contouring" and not _is_faithful_contouring_available():
+        remesh_method = "dual_contouring"
+        _log(
+            "WARNING: remesh_method='faithful_contouring' requires optional FaithC dependencies "
+            "(`faithcontour` + `atom3d`) which are not installed. Falling back to 'dual_contouring'."
+        )
+        yield None, None, status
+
+    to_glb_kwargs = {
+        "vertices": mesh.vertices,
+        "faces": mesh.faces,
+        "attr_volume": mesh.attrs,
+        "coords": mesh.coords,
+        "attr_layout": pipe.pbr_attr_layout,
+        "grid_size": res,
+        "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        "decimation_target": decimation_target,
+        "simplify_method": simplify_method,
+        "texture_extraction": texture_extraction,
+        "texture_size": texture_size,
+        "remesh": True,
+        "remesh_band": 1,
+        "remesh_project": 0,
+        "remesh_method": remesh_method,
+        "prune_invisible": prune_invisible_faces,
+        "use_tqdm": True,
+    }
+    try:
+        glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
+    except ImportError as e:
+        # Failsafe: if FaithC is missing/unusable, fall back to a built-in remesher
+        # instead of crashing extraction.
+        if requested_remesh_method == "faithful_contouring" and "Faithful Contouring is not installed" in str(e):
+            fallback_method = "dual_contouring"
+            _log(f"WARNING: {e} Falling back to remesh_method={fallback_method!r}.")
+            to_glb_kwargs["remesh_method"] = fallback_method
+            glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
+        else:
+            raise
     yield None, None, status
 
     _log("Saving GLB…", 0.9)
@@ -1763,7 +1815,12 @@ with gr.Blocks(
                     seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
                     randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
                     decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000)
-                    remesh_method = gr.Dropdown(["dual_contouring", "faithful_contouring"], label="Remesh Method", value="dual_contouring")
+                    remesh_method = gr.Dropdown(REMESH_METHOD_CHOICES, label="Remesh Method", value="dual_contouring")
+                    if "faithful_contouring" not in REMESH_METHOD_CHOICES:
+                        gr.Markdown(
+                            "**Note:** `faithful_contouring` remeshing requires optional FaithC dependencies "
+                            "(`faithcontour` + `atom3d`). Not detected in this environment, so the option is hidden."
+                        )
                     simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method", value="cumesh")
                     prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces", value=True)
                     no_texture_gen = gr.Checkbox(label="Skip Texture Generation", value=False)

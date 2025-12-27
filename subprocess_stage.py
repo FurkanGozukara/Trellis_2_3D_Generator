@@ -592,7 +592,8 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     decimation_target = int(payload["decimation_target"])
     texture_size = int(payload["texture_size"])
-    remesh_method = str(payload["remesh_method"])
+    requested_remesh_method = str(payload["remesh_method"])
+    remesh_method = requested_remesh_method
     simplify_method = str(payload["simplify_method"])
     prune_invisible_faces = bool(payload["prune_invisible_faces"])
     no_texture_gen = bool(payload["no_texture_gen"])
@@ -631,25 +632,59 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     mesh = pipe.decode_latent(shape_slat, tex_slat, res)[0]
 
     print("[extract] converting to GLB…", flush=True)
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=pipe.pbr_attr_layout,
-        grid_size=res,
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=decimation_target,
-        simplify_method=simplify_method,
-        texture_extraction=not no_texture_gen,
-        texture_size=texture_size,
-        remesh=True,
-        remesh_band=1,
-        remesh_project=0,
-        remesh_method=remesh_method,
-        prune_invisible=prune_invisible_faces,
-        use_tqdm=True,
-    )
+    # NOTE: `faithful_contouring` remeshing depends on optional FaithC packages
+    # (`faithcontour` + `atom3d`). These are not installed by default on many
+    # setups (especially Windows). Instead of failing the whole extraction,
+    # fall back to the built-in `dual_contouring` remesher with a clear log.
+    if remesh_method == "faithful_contouring":
+        try:
+            import importlib
+
+            importlib.import_module("faithcontour")
+            importlib.import_module("atom3d")
+        except Exception as e:
+            print(
+                "[extract] warning: remesh_method='faithful_contouring' requested but optional "
+                f"dependency is missing/unusable ({type(e).__name__}: {e}). "
+                "Falling back to 'dual_contouring'.",
+                flush=True,
+            )
+            remesh_method = "dual_contouring"
+
+    to_glb_kwargs = {
+        "vertices": mesh.vertices,
+        "faces": mesh.faces,
+        "attr_volume": mesh.attrs,
+        "coords": mesh.coords,
+        "attr_layout": pipe.pbr_attr_layout,
+        "grid_size": res,
+        "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        "decimation_target": decimation_target,
+        "simplify_method": simplify_method,
+        "texture_extraction": not no_texture_gen,
+        "texture_size": texture_size,
+        "remesh": True,
+        "remesh_band": 1,
+        "remesh_project": 0,
+        "remesh_method": remesh_method,
+        "prune_invisible": prune_invisible_faces,
+        "use_tqdm": True,
+    }
+    try:
+        glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
+    except ImportError as e:
+        # Failsafe: if the FaithC import fails inside `o_voxel` after our check,
+        # retry once with a safe remesher.
+        if requested_remesh_method == "faithful_contouring" and "Faithful Contouring is not installed" in str(e):
+            fallback_method = "dual_contouring"
+            print(
+                f"[extract] warning: {e} Falling back to remesh_method={fallback_method!r}.",
+                flush=True,
+            )
+            to_glb_kwargs["remesh_method"] = fallback_method
+            glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
+        else:
+            raise
 
     idx, glb_path = next_indexed_path(out_dir, prefix=prefix, ext="glb", digits=4, start=1)
     glb.export(str(glb_path), extension_webp=True)

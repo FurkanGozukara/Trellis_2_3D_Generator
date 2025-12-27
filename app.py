@@ -3,6 +3,7 @@ import gradio as gr
 import os
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import importlib.util
 from datetime import datetime
 import shutil
 import cv2
@@ -21,6 +22,26 @@ import o_voxel
 
 MAX_SEED = np.iinfo(np.int32).max
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
+
+
+def _is_faithful_contouring_available() -> bool:
+    """
+    `faithful_contouring` remeshing in `o_voxel.postprocess.to_glb()` depends on optional
+    FaithC packages (`faithcontour` + `atom3d`).
+    """
+    try:
+        return (
+            importlib.util.find_spec("faithcontour") is not None
+            and importlib.util.find_spec("atom3d") is not None
+        )
+    except Exception:
+        return False
+
+
+REMESH_METHOD_CHOICES = ["dual_contouring"]
+if _is_faithful_contouring_available():
+    REMESH_METHOD_CHOICES.append("faithful_contouring")
+
 MODES = [
     {"name": "Normal", "icon": "assets/app/normal.png", "render_key": "normal"},
     {"name": "Clay render", "icon": "assets/app/clay.png", "render_key": "clay"},
@@ -502,28 +523,58 @@ def extract_glb(
     """
     texture_extraction = not no_texture_gen
 
+    requested_remesh_method = str(remesh_method)
+    if requested_remesh_method == "faithful_contouring" and not _is_faithful_contouring_available():
+        remesh_method = "dual_contouring"
+        msg = (
+            "remesh_method='faithful_contouring' requires optional FaithC dependencies "
+            "(`faithcontour` + `atom3d`) which are not installed. Falling back to 'dual_contouring'."
+        )
+        print(f"[extract] warning: {msg}", flush=True)
+        try:
+            progress(0.0, desc=msg)
+        except Exception:
+            pass
+
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
     shape_slat, tex_slat, res = unpack_state(state)
     mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=pipeline.pbr_attr_layout,
-        grid_size=res,
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=decimation_target,
-        simplify_method=simplify_method,
-        texture_extraction=texture_extraction,
-        texture_size=texture_size,
-        remesh=True,
-        remesh_band=1,
-        remesh_project=0,
-        remesh_method=remesh_method,
-        prune_invisible=prune_invisible_faces,
-        use_tqdm=True,
-    )
+
+    to_glb_kwargs = {
+        "vertices": mesh.vertices,
+        "faces": mesh.faces,
+        "attr_volume": mesh.attrs,
+        "coords": mesh.coords,
+        "attr_layout": pipeline.pbr_attr_layout,
+        "grid_size": res,
+        "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        "decimation_target": decimation_target,
+        "simplify_method": simplify_method,
+        "texture_extraction": texture_extraction,
+        "texture_size": texture_size,
+        "remesh": True,
+        "remesh_band": 1,
+        "remesh_project": 0,
+        "remesh_method": remesh_method,
+        "prune_invisible": prune_invisible_faces,
+        "use_tqdm": True,
+    }
+    try:
+        glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
+    except ImportError as e:
+        # Failsafe: retry once with a safe remesher if FaithC is missing/unusable.
+        if requested_remesh_method == "faithful_contouring" and "Faithful Contouring is not installed" in str(e):
+            fallback_method = "dual_contouring"
+            msg = f"{e} Falling back to remesh_method={fallback_method!r}."
+            print(f"[extract] warning: {msg}", flush=True)
+            try:
+                progress(0.0, desc=msg)
+            except Exception:
+                pass
+            to_glb_kwargs["remesh_method"] = fallback_method
+            glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
+        else:
+            raise
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
     os.makedirs(user_dir, exist_ok=True)
@@ -548,7 +599,12 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
             randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
             decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000)
-            remesh_method = gr.Dropdown(["dual_contouring", "faithful_contouring"], label="Remesh Method", value="dual_contouring")
+            remesh_method = gr.Dropdown(REMESH_METHOD_CHOICES, label="Remesh Method", value="dual_contouring")
+            if "faithful_contouring" not in REMESH_METHOD_CHOICES:
+                gr.Markdown(
+                    "**Note:** `faithful_contouring` remeshing requires optional FaithC dependencies "
+                    "(`faithcontour` + `atom3d`). Not detected in this environment, so the option is hidden."
+                )
             simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method", value="cumesh")
             prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces", value=True)
             no_texture_gen = gr.Checkbox(label="Skip Texture Generation", value=False)

@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 
 # Set environment variables relative to app.py configuration
 os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
@@ -109,6 +110,22 @@ def main():
     print("Extracting GLB...")
     shape_slat, tex_slat, res = latents
     mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
+
+    remesh_method = args.remesh_method
+    if remesh_method == "faithful_contouring":
+        try:
+            import importlib
+
+            importlib.import_module("faithcontour")
+            importlib.import_module("atom3d")
+        except Exception as e:
+            print(
+                "[warn] remesh_method='faithful_contouring' requires optional FaithC dependencies "
+                f"(`faithcontour` + `atom3d`). Missing/unusable ({type(e).__name__}: {e}). "
+                "Falling back to 'dual_contouring'.",
+                file=sys.stderr,
+            )
+            remesh_method = "dual_contouring"
     
     # Prune config
     glb = o_voxel.postprocess.to_glb(
@@ -126,7 +143,7 @@ def main():
         remesh=True,
         remesh_band=1,
         remesh_project=0,
-        remesh_method=args.remesh_method,
+        remesh_method=remesh_method,
         prune_invisible=args.prune_invisible_faces,
         use_tqdm=True,
     )
