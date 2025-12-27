@@ -1,5 +1,6 @@
 import gradio as gr
 
+import argparse
 import os
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -747,6 +748,302 @@ def unpack_state(state: Optional[dict]) -> Tuple[SparseTensor, Optional[SparseTe
 
 def get_seed(randomize_seed: bool, seed: int) -> int:
     return np.random.randint(0, MAX_SEED) if randomize_seed else seed
+
+
+_BATCH_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+_WIN_INVALID_NAME_CHARS = '<>:"/\\|?*'
+
+
+def _resolve_user_path(path_str: Optional[str], *, base_dir: str) -> Optional[Path]:
+    """
+    Resolve a user-supplied path in a cross-platform way.
+    - Empty/None => None
+    - Relative paths => relative to `base_dir` (app folder)
+    - Quoted paths are supported
+    """
+    if path_str is None:
+        return None
+    s = str(path_str).strip()
+    if not s:
+        return None
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+    if not s:
+        return None
+    if os.path.isabs(s):
+        return Path(os.path.abspath(s))
+    return Path(os.path.abspath(os.path.join(base_dir, s)))
+
+
+def _sanitize_folder_name(name: str) -> str:
+    """
+    Make a reasonably safe folder name for Windows + Linux.
+    """
+    name = str(name or "").strip()
+    # Windows disallows trailing dots/spaces for folder names.
+    name = name.rstrip(" .")
+    for ch in _WIN_INVALID_NAME_CHARS:
+        name = name.replace(ch, "_")
+    if not name:
+        name = "run"
+    # Very small reserved-name guard (Windows)
+    upper = name.upper()
+    reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+    if upper in reserved:
+        name = f"_{name}"
+    return name
+
+
+def _format_eta(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "?"
+    try:
+        s = max(0, int(round(float(seconds))))
+    except Exception:
+        return "?"
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def _list_images_in_folder(folder: Path) -> List[Path]:
+    if not folder.exists() or not folder.is_dir():
+        raise gr.Error(f"Input folder not found: {folder}")
+    files = [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in _BATCH_IMAGE_EXTS]
+    files.sort(key=lambda p: p.name.lower())
+    return files
+
+
+def _move_run_dir(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        raise FileExistsError(f"Target already exists: {dst}")
+    try:
+        src.rename(dst)
+    except Exception:
+        shutil.move(str(src), str(dst))
+
+
+def batch_process_folder(
+    enabled: bool,
+    input_folder: str,
+    output_folder: str,
+    randomize_seed: bool,
+    seed: int,
+    resolution: str,
+    ss_guidance_strength: float,
+    ss_guidance_rescale: float,
+    ss_guidance_interval_start: float,
+    ss_guidance_interval_end: float,
+    ss_sampling_steps: int,
+    ss_rescale_t: float,
+    shape_slat_guidance_strength: float,
+    shape_slat_guidance_rescale: float,
+    shape_slat_guidance_interval_start: float,
+    shape_slat_guidance_interval_end: float,
+    shape_slat_sampling_steps: int,
+    shape_slat_rescale_t: float,
+    tex_slat_guidance_strength: float,
+    tex_slat_guidance_rescale: float,
+    tex_slat_guidance_interval_start: float,
+    tex_slat_guidance_interval_end: float,
+    tex_slat_sampling_steps: int,
+    tex_slat_rescale_t: float,
+    no_texture_gen: bool,
+    max_num_tokens: int,
+    decimation_target: int,
+    texture_size: int,
+    remesh_method: str,
+    simplify_method: str,
+    prune_invisible_faces: bool,
+    export_formats: List[str],
+    subprocess_mode: bool,
+    req: gr.Request,
+    progress=gr.Progress(track_tqdm=True),
+) -> str:
+    """
+    Batch-process all images in a folder using the *same* pipeline + settings as single-image runs.
+    Outputs are saved into per-image folders named after the input image (stem).
+    """
+    if not enabled:
+        yield "Batch Processing is disabled."
+        return
+
+    in_dir = _resolve_user_path(input_folder, base_dir=APP_DIR)
+    if in_dir is None:
+        raise gr.Error("Batch Input Folder is required.")
+    out_root = _resolve_user_path(output_folder, base_dir=APP_DIR) or Path(OUTPUTS_DIR)
+
+    files = _list_images_in_folder(in_dir)
+    if not files:
+        raise gr.Error(f"No supported images found in: {in_dir}\nSupported: {', '.join(sorted(_BATCH_IMAGE_EXTS))}")
+
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    log_lines: List[str] = []
+    current_desc: str = ""
+    last_yield = 0.0
+    started = time.time()
+    processed = 0
+    skipped = 0
+    failed = 0
+    total = len(files)
+
+    def _append(line: str) -> None:
+        nonlocal log_lines
+        ts = datetime.now().strftime("%H:%M:%S")
+        log_lines.append(f"[{ts}] {line}")
+        # Keep UI responsive (avoid giant payloads)
+        if len(log_lines) > 400:
+            log_lines = log_lines[-350:]
+
+    def _render_status() -> str:
+        done = processed + skipped + failed
+        elapsed = time.time() - started
+        remaining = max(0, total - done)
+        avg = (elapsed / done) if done > 0 else None
+        eta = (avg * remaining) if avg is not None else None
+        summary = (
+            f"Batch: {done}/{total} done | processed={processed}, skipped={skipped}, failed={failed} | "
+            f"elapsed={_format_eta(elapsed)} | ETA={_format_eta(eta)}"
+        )
+        lines = [summary] + log_lines
+        if current_desc:
+            lines.append(f"Current: {current_desc}")
+        return "\n".join(lines[-420:])
+
+    def _maybe_yield(force: bool = False):
+        nonlocal last_yield
+        now = time.time()
+        if force or (now - last_yield) > 0.7:
+            last_yield = now
+            return _render_status()
+        return None
+
+    _append(f"Input folder: {in_dir}")
+    _append(f"Output folder: {out_root}")
+    _append(f"Found {total} image(s). Starting…")
+    progress(0.0, desc="Batch starting…")
+    yield _render_status()
+
+    for i, img_path in enumerate(files, start=1):
+        name = _sanitize_folder_name(img_path.stem)
+        target_dir = out_root / name
+
+        # Update desc shown in the Gradio progress UI
+        current_desc = f"[{i}/{total}] {img_path.name}"
+        progress((i - 1) / total, desc=current_desc)
+
+        if target_dir.exists():
+            skipped += 1
+            _append(f"SKIP [{i}/{total}] {img_path.name} → {target_dir} (already exists)")
+            maybe = _maybe_yield(force=True)
+            if maybe is not None:
+                yield maybe
+            continue
+
+        run_seed = get_seed(randomize_seed, int(seed))
+        _append(f"RUN  [{i}/{total}] {img_path.name} (seed={run_seed})")
+        maybe = _maybe_yield(force=True)
+        if maybe is not None:
+            yield maybe
+
+        # Scale inner per-image progress into overall batch progress
+        base = (i - 1) / total
+        span = 1.0 / total
+
+        def _scaled_progress(p: float, desc: Optional[str] = None):
+            nonlocal current_desc
+            if desc:
+                current_desc = str(desc)
+            try:
+                pp = float(p)
+            except Exception:
+                pp = 0.0
+            pp = max(0.0, min(1.0, pp))
+            progress(base + pp * span, desc=current_desc)
+
+        # --- Run generate + extract using the same pipeline functions (no duplicated logic) ---
+        try:
+            with Image.open(str(img_path)) as im:
+                pil_img = im.convert("RGBA").copy()
+
+            state: Optional[dict] = None
+            for s, _html, _st in image_to_3d(
+                pil_img,
+                int(run_seed),
+                resolution,
+                ss_guidance_strength,
+                ss_guidance_rescale,
+                ss_guidance_interval_start,
+                ss_guidance_interval_end,
+                ss_sampling_steps,
+                ss_rescale_t,
+                shape_slat_guidance_strength,
+                shape_slat_guidance_rescale,
+                shape_slat_guidance_interval_start,
+                shape_slat_guidance_interval_end,
+                shape_slat_sampling_steps,
+                shape_slat_rescale_t,
+                tex_slat_guidance_strength,
+                tex_slat_guidance_rescale,
+                tex_slat_guidance_interval_start,
+                tex_slat_guidance_interval_end,
+                tex_slat_sampling_steps,
+                tex_slat_rescale_t,
+                no_texture_gen,
+                max_num_tokens,
+                subprocess_mode,
+                req=req,
+                progress=_scaled_progress,
+            ):
+                if s is not None:
+                    state = s
+                maybe = _maybe_yield()
+                if maybe is not None:
+                    yield maybe
+
+            if not state or not isinstance(state, dict) or not state.get("_run_dir"):
+                raise gr.Error("Generation returned no valid state. See console/logs.")
+
+            glb_path: Optional[str] = None
+            for gp, _dl, _st in extract_glb(
+                state,
+                int(decimation_target),
+                int(texture_size),
+                str(remesh_method),
+                str(simplify_method),
+                bool(no_texture_gen),
+                bool(prune_invisible_faces),
+                export_formats,
+                subprocess_mode,
+                req=req,
+                progress=_scaled_progress,
+            ):
+                if gp:
+                    glb_path = gp
+                maybe = _maybe_yield()
+                if maybe is not None:
+                    yield maybe
+
+            run_dir = Path(str(state.get("_run_dir")))
+            _move_run_dir(run_dir, target_dir)
+            processed += 1
+            _append(f"DONE [{i}/{total}] Saved → {target_dir}")
+            if glb_path:
+                # Note: glb_path points to the old location; after moving, it's still valid *as a file*, but path string differs.
+                pass
+            yield _render_status()
+        except Exception as e:
+            failed += 1
+            _append(f"FAIL [{i}/{total}] {img_path.name}: {type(e).__name__}: {e}")
+            yield _render_status()
+            continue
+
+    current_desc = ""
+    progress(1.0, desc="Batch complete.")
+    _append("Batch complete.")
+    yield _render_status()
 
 
 def preprocess_image(
@@ -2075,7 +2372,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
                     export_formats = gr.CheckboxGroup(
                         choices=["glb", "gltf", "obj", "ply", "stl"],
-                        value=["glb"],
+                        value=["glb", "gltf", "obj", "ply", "stl"],
                         label="Auto-save export formats (saved into outputs/<run>/08_extract/)",
                     )
 
@@ -2117,6 +2414,24 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 generate_btn = gr.Button("Generate", variant="primary")
                                 extract_btn = gr.Button("Extract GLB", interactive=False)
                                 view_extract_btn = gr.Button("View Extracted", interactive=False)
+                            with gr.Accordion(label="📦 Batch Processing", open=False):
+                                batch_enabled = gr.Checkbox(label="Enable batch processing", value=False)
+                                batch_input_folder = gr.Textbox(
+                                    label="Input folder (required)",
+                                    placeholder="e.g. ./my_images (or an absolute path)",
+                                )
+                                batch_output_folder = gr.Textbox(
+                                    label="Output folder (optional)",
+                                    placeholder="Leave blank to use ./outputs",
+                                )
+                                with gr.Row():
+                                    batch_run_btn = gr.Button("Run Batch", variant="primary", interactive=False)
+                                batch_status_box = gr.Textbox(
+                                    label="Batch Progress",
+                                    value="",
+                                    lines=12,
+                                    interactive=False,
+                                )
                             with gr.Accordion(label="Advanced Settings", open=True):
                                 gr.Markdown("Stage 1: Sparse Structure Generation")
                                 with gr.Row():
@@ -2317,6 +2632,54 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 show_progress="hidden",
             )
 
+            # Batch Processing wiring (reuses the same image_to_3d -> extract_glb pipeline)
+            batch_enabled.change(
+                fn=lambda v: gr.update(interactive=bool(v)),
+                inputs=[batch_enabled],
+                outputs=[batch_run_btn],
+                queue=False,
+                show_progress="hidden",
+            )
+            batch_run_btn.click(
+                fn=batch_process_folder,
+                inputs=[
+                    batch_enabled,
+                    batch_input_folder,
+                    batch_output_folder,
+                    randomize_seed,
+                    seed,
+                    resolution,
+                    ss_guidance_strength,
+                    ss_guidance_rescale,
+                    ss_guidance_interval_start,
+                    ss_guidance_interval_end,
+                    ss_sampling_steps,
+                    ss_rescale_t,
+                    shape_slat_guidance_strength,
+                    shape_slat_guidance_rescale,
+                    shape_slat_guidance_interval_start,
+                    shape_slat_guidance_interval_end,
+                    shape_slat_sampling_steps,
+                    shape_slat_rescale_t,
+                    tex_slat_guidance_strength,
+                    tex_slat_guidance_rescale,
+                    tex_slat_guidance_interval_start,
+                    tex_slat_guidance_interval_end,
+                    tex_slat_sampling_steps,
+                    tex_slat_rescale_t,
+                    no_texture_gen,
+                    max_num_tokens,
+                    decimation_target,
+                    texture_size,
+                    remesh_method,
+                    simplify_method,
+                    prune_invisible_faces,
+                    export_formats,
+                    subprocess_mode,
+                ],
+                outputs=[batch_status_box],
+            )
+
         # ---------------------------- Tab 2: Texturing -------------------------------
         with gr.Tab("Texturing"):
             with gr.Row():
@@ -2411,6 +2774,65 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 outputs=[tex_status_box],
                 queue=False,
                 show_progress="hidden",
+            )
+
+        # ---------------------------- Tab 3: View 3D Files ----------------------------
+        with gr.Tab("View 3D Files"):
+            gr.Markdown(
+                "Drag & drop / upload a 3D file to preview it.\n\n"
+                "**Supported:** `.glb`, `.gltf`, `.obj`, `.ply`, `.stl`"
+            )
+            with gr.Row():
+                with gr.Column(scale=1, min_width=380):
+                    view3d_file = gr.File(
+                        label="3D File",
+                        file_types=[".glb", ".gltf", ".obj", ".ply", ".stl"],
+                        file_count="single",
+                    )
+                    view3d_fullscreen_btn = gr.Button("Fullscreen", variant="secondary")
+                with gr.Column(scale=2, min_width=520):
+                    view3d_output = gr.Model3D(
+                        label="3D Preview",
+                        height=724,
+                        show_label=True,
+                        display_mode="solid",
+                        clear_color=(0.25, 0.25, 0.25, 1.0),
+                        elem_id="view3d_files_viewer",
+                    )
+
+            def _coerce_file_to_path(f):
+                if f is None:
+                    return None
+                if isinstance(f, str):
+                    return f
+                if isinstance(f, dict):
+                    return f.get("name") or f.get("path")
+                return getattr(f, "name", None) or str(f)
+
+            view3d_file.change(
+                fn=_coerce_file_to_path,
+                inputs=[view3d_file],
+                outputs=[view3d_output],
+                queue=False,
+                show_progress="hidden",
+            )
+
+            view3d_fullscreen_btn.click(
+                fn=None,
+                inputs=[],
+                outputs=None,
+                js="""
+() => {
+  const root = document.querySelector("#view3d_files_viewer");
+  const el = root?.querySelector('[data-testid="model3d"]') || root;
+  if (!el) return;
+  if (document.fullscreenElement) {
+    document.exitFullscreen?.();
+  } else {
+    el.requestFullscreen?.();
+  }
+}
+""",
             )
 
     # ---------------------------- Preset Wiring ----------------------------
@@ -2632,11 +3054,28 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
     )
 
 
+def _parse_launch_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="TRELLIS.2 Premium (Gradio)")
+    parser.add_argument("--share", action="store_true", help="Create a public Gradio share link")
+    parser.add_argument("--server-name", type=str, default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
+    parser.add_argument("--server-port", type=int, default=7860, help="Port to listen on (default: 7860)")
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="Do not auto-open the app in a browser (inbrowser is ON by default)",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
     os.makedirs(TMP_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR, exist_ok=True)
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
     os.makedirs(PRESETS_DIR, exist_ok=True)
     demo.queue()
-
-
+    args = _parse_launch_args()
+    demo.launch(
+        share=args.share,
+        inbrowser=True,
+        show_error=True,
+    )
