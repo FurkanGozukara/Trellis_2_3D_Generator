@@ -280,7 +280,34 @@ class VarLenTensor:
         if dim is None or 0 in dim:
             return red
         
-        red = torch.segment_reduce(red, reduce=op, lengths=self.seqlen)
+        # Reduce across the variable-length (concatenated) dimension into per-batch outputs.
+        #
+        # NOTE: Some PyTorch CUDA builds ship without a CUDA kernel for `torch.segment_reduce`,
+        # which crashes with "DispatchStub: missing kernel for cuda". We provide a GPU fallback
+        # for the ops we need at inference time.
+        try:
+            red = torch.segment_reduce(red, reduce=op, lengths=self.seqlen)
+        except RuntimeError as e:
+            msg = str(e)
+            if red.is_cuda and ("missing kernel for cuda" in msg or "segment_reduce" in msg):
+                num_batches = len(self.layout)
+                seg_ids = self.batch_boardcast_map  # (N,) long
+                if op in ("sum", "mean"):
+                    out = torch.zeros((num_batches, *red.shape[1:]), device=red.device, dtype=red.dtype)
+                    out.index_add_(0, seg_ids, red)
+                    if op == "mean":
+                        denom = self.seqlen.to(red.dtype)
+                        view_shape = (num_batches,) + (1,) * (red.ndim - 1)
+                        out = out / denom.view(view_shape).clamp_min(1)
+                    red = out
+                elif op == "prod":
+                    # Slower fallback; prod is rarely used in inference.
+                    chunks = red.split(self.seqlen.tolist(), dim=0)
+                    red = torch.stack([c.prod(dim=0) for c in chunks], dim=0)
+                else:
+                    raise
+            else:
+                raise
         return red
     
     def mean(self, dim: Optional[Union[int, Tuple[int,...]]] = None, keepdim: bool = False) -> torch.Tensor:

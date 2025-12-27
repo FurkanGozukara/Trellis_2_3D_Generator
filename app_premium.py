@@ -61,7 +61,7 @@ from datetime import datetime
 import shutil
 import base64
 import io
-from typing import Tuple
+from typing import Tuple, Optional, Dict, List
 
 import cv2
 import numpy as np
@@ -74,6 +74,16 @@ from trellis2.pipelines import Trellis2ImageTo3DPipeline, Trellis2TexturingPipel
 from trellis2.renderers import EnvMap
 from trellis2.utils import render_utils
 import o_voxel
+
+
+# ------------------------------- Capability Checks ---------------------------
+
+def _has_nvdiffrec_render() -> bool:
+    try:
+        import nvdiffrec_render  # noqa: F401
+        return True
+    except ModuleNotFoundError:
+        return False
 
 
 # ------------------------------- Paths / Config ------------------------------
@@ -374,7 +384,17 @@ def pack_state(latents: Tuple[SparseTensor, SparseTensor, int]) -> dict:
     }
 
 
-def unpack_state(state: dict) -> Tuple[SparseTensor, SparseTensor, int]:
+def unpack_state(state: Optional[dict]) -> Tuple[SparseTensor, Optional[SparseTensor], int]:
+    if state is None:
+        raise ValueError("No generation state found.")
+    if not isinstance(state, dict):
+        raise ValueError(f"Invalid generation state type: {type(state)!r}")
+    for k in ("shape_slat_feats", "coords", "res"):
+        if k not in state:
+            raise ValueError(f"Missing key in generation state: {k!r}")
+        if state[k] is None:
+            raise ValueError(f"Missing value in generation state: {k!r}")
+
     shape_slat = SparseTensor(
         feats=torch.from_numpy(state["shape_slat_feats"]).cuda(),
         coords=torch.from_numpy(state["coords"]).cuda(),
@@ -392,9 +412,156 @@ def get_seed(randomize_seed: bool, seed: int) -> int:
     return np.random.randint(0, MAX_SEED) if randomize_seed else seed
 
 
-def preprocess_image(image: Image.Image) -> Image.Image:
+def preprocess_image(
+    image: Image.Image,
+    progress=gr.Progress(track_tqdm=True),
+) -> Image.Image:
+    # Used by Upload and Examples. On first run it may load the full pipeline.
+    progress(0.05, desc="Loading Image→3D pipeline (TRELLIS.2-4B)…")
     pipe = get_image_pipeline()
-    return pipe.preprocess_image(image)
+    progress(0.2, desc="Preprocessing image (background removal / crop)…")
+    out = pipe.preprocess_image(image)
+    progress(1.0, desc="Image ready.")
+    return out
+
+
+# ------------------------------- Preview Rendering ---------------------------
+
+def _tensor_to_uint8_hwc(img: torch.Tensor) -> np.ndarray:
+    """
+    Convert a (C,H,W) float tensor in [0,1] to (H,W,3) uint8 numpy.
+    """
+    if img.dim() != 3:
+        raise ValueError(f"Expected (C,H,W) tensor, got shape {tuple(img.shape)}")
+    if img.shape[0] == 1:
+        img = img.repeat(3, 1, 1)
+    img = img.detach().float().clamp(0, 1)
+    return (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+
+def _simple_shaded(base_color: torch.Tensor, normal_01: torch.Tensor, tint: torch.Tensor) -> torch.Tensor:
+    """
+    Very simple lambert-ish shading from normals and base color (no PBR / no envmap).
+    Inputs are (3,H,W) in [0,1].
+    """
+    n = (normal_01 * 2.0 - 1.0)
+    # Fixed light direction in camera space (roughly top-right-front)
+    light_dir = torch.tensor([0.4, 0.2, 0.9], device=n.device, dtype=n.dtype)
+    light_dir = light_dir / (light_dir.norm() + 1e-8)
+    lambert = (n * light_dir.view(3, 1, 1)).sum(dim=0, keepdim=True).clamp(0.0, 1.0)
+    ambient = 0.35
+    shaded = base_color * (ambient + (1.0 - ambient) * lambert)
+    shaded = shaded * tint.view(3, 1, 1).clamp(0.0, 2.0)
+    return shaded.clamp(0.0, 1.0)
+
+
+def _render_preview_snapshots_incremental(
+    mesh,
+    *,
+    resolution: int,
+    r: float,
+    fov: float,
+    nviews: int,
+    envmap: Optional[Dict[str, EnvMap]],
+    pbr_supported: bool,
+    progress: gr.Progress,
+    log_fn,
+) -> Dict[str, List[np.ndarray]]:
+    """
+    Render preview images with per-view progress updates.
+    Returns dict mapping render_key -> list[H,W,3 uint8] of length nviews.
+    """
+    # Camera setup
+    yaw = np.linspace(0, 2 * np.pi, nviews, endpoint=False)
+    yaw_offset = -16 / 180 * np.pi
+    yaw = [float(y + yaw_offset) for y in yaw]
+    pitch = [20 / 180 * np.pi for _ in range(nviews)]
+    extrinsics, intrinsics = render_utils.yaw_pitch_r_fov_to_extrinsics_intrinsics(yaw, pitch, r, fov)
+
+    images: Dict[str, List[np.ndarray]] = {m["render_key"]: [] for m in MODES}
+
+    if pbr_supported:
+        # Full PBR renderer (requires nvdiffrec_render)
+        from trellis2.renderers import PbrMeshRenderer
+
+        if envmap is None:
+            raise RuntimeError("PBR rendering requested but envmap is None.")
+
+        renderer = PbrMeshRenderer(
+            rendering_options={
+                "resolution": resolution,
+                "near": 1,
+                "far": 100,
+                "ssaa": 2,
+                "peel_layers": 8,
+            }
+        )
+
+        for j, (extr, intr) in enumerate(zip(extrinsics, intrinsics)):
+            p = 0.88 + 0.08 * (j / max(1, nviews - 1))
+            log_fn(f"Rendering preview view {j + 1}/{nviews}…", p)
+            res = renderer.render(mesh, extr, intr, envmap=envmap)
+            for mode in MODES:
+                key = mode["render_key"]
+                if key not in res:
+                    # If a key is missing, just fall back to base_color.
+                    fallback = res.get("base_color", res.get("clay"))
+                    images[key].append(_tensor_to_uint8_hwc(fallback))
+                else:
+                    images[key].append(_tensor_to_uint8_hwc(res[key]))
+        return images
+
+    # Fallback renderer (no nvdiffrec_render): use MeshRenderer and synthesize shaded modes.
+    from trellis2.renderers import MeshRenderer
+
+    log_fn(
+        "HDRI/PBR preview disabled (missing 'nvdiffrec_render'). Using simple preview shading.",
+        0.88,
+    )
+    renderer = MeshRenderer(
+        rendering_options={
+            "resolution": resolution,
+            "near": 1,
+            "far": 100,
+            "ssaa": 2,
+            "chunk_size": None,
+        }
+    )
+
+    t_forest = torch.tensor([0.85, 1.05, 0.85], device="cuda")
+    t_sunset = torch.tensor([1.10, 0.90, 0.75], device="cuda")
+    t_court = torch.tensor([0.85, 0.95, 1.10], device="cuda")
+
+    for j, (extr, intr) in enumerate(zip(extrinsics, intrinsics)):
+        p = 0.88 + 0.08 * (j / max(1, nviews - 1))
+        log_fn(f"Rendering preview view {j + 1}/{nviews}…", p)
+        res = renderer.render(mesh, extr, intr, return_types=["mask", "normal", "attr"])
+
+        normal = res["normal"]  # (3,H,W) in [0,1]
+        base_color = res.get("base_color", torch.full_like(normal, 0.8))
+
+        # Clay: simple AO-less clay from normal lighting
+        clay_base = torch.full_like(base_color, 0.78)
+        clay = _simple_shaded(clay_base, normal, torch.tensor([1.0, 1.0, 1.0], device=normal.device))
+
+        shaded_forest = _simple_shaded(base_color, normal, t_forest)
+        shaded_sunset = _simple_shaded(base_color, normal, t_sunset)
+        shaded_courtyard = _simple_shaded(base_color, normal, t_court)
+
+        # Fill all modes (keep existing UI keys)
+        mode_map = {
+            "normal": normal,
+            "clay": clay,
+            "base_color": base_color,
+            "shaded_forest": shaded_forest,
+            "shaded_sunset": shaded_sunset,
+            "shaded_courtyard": shaded_courtyard,
+        }
+        for mode in MODES:
+            key = mode["render_key"]
+            images[key].append(_tensor_to_uint8_hwc(mode_map[key]))
+
+    return images
 
 
 # ------------------------------- Image -> 3D --------------------------------
@@ -419,53 +586,184 @@ def image_to_3d(
     max_num_tokens: int,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
-) -> Tuple[dict, str]:
+) -> Tuple[Optional[dict], str, str]:
+    # Stream step-by-step status so users aren't "in the dark" during long runs.
+    status = ""
+
+    def _log(msg: str, p: Optional[float] = None) -> str:
+        nonlocal status
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        status = (status + "\n" if status else "") + line
+        print(line, flush=True)
+        if p is not None:
+            progress(p, desc=msg)
+        return status
+
+    if image is None:
+        raise gr.Error("Please provide an image (upload or pick an example).")
+
+    _log("Starting Image → 3D generation…", 0.0)
+    yield None, empty_html, status
+
+    _log("Loading TRELLIS.2 pipeline (first run can take a while)…", 0.01)
     pipe = get_image_pipeline()
-    envmap = _get_envmap()
+    yield None, empty_html, status
+
+    pbr_supported = _has_nvdiffrec_render()
+    envmap = None
+    if pbr_supported:
+        _log("Loading HDRI environment maps…", 0.03)
+        envmap = _get_envmap()
+        yield None, empty_html, status
+    else:
+        _log("PBR preview not available (missing 'nvdiffrec_render'); will use fallback preview.", 0.03)
+        yield None, empty_html, status
+
+    _log("Preparing UI render-mode icons…", 0.05)
     _ensure_mode_icons()
+    yield None, empty_html, status
 
-    outputs, latents = pipe.run(
-        image,
-        seed=seed,
-        preprocess_image=False,
-        sparse_structure_sampler_params={
-            "steps": ss_sampling_steps,
-            "guidance_strength": ss_guidance_strength,
-            "guidance_rescale": ss_guidance_rescale,
-            "rescale_t": ss_rescale_t,
-        },
-        shape_slat_sampler_params={
-            "steps": shape_slat_sampling_steps,
-            "guidance_strength": shape_slat_guidance_strength,
-            "guidance_rescale": shape_slat_guidance_rescale,
-            "rescale_t": shape_slat_rescale_t,
-        },
-        tex_slat_sampler_params={
-            "steps": tex_slat_sampling_steps,
-            "guidance_strength": tex_slat_guidance_strength,
-            "guidance_rescale": tex_slat_guidance_rescale,
-            "rescale_t": tex_slat_rescale_t,
-        },
-        pipeline_type={
-            "512": "512",
-            "1024": "1024_cascade",
-            "1536": "1536_cascade",
-            "2048": "2048_cascade",
-        }[resolution],
-        return_latent=True,
-        max_num_tokens=max_num_tokens,
-        no_texture_gen=no_texture_gen,
-    )
-    mesh = outputs[0]
+    pipeline_type = {
+        "512": "512",
+        "1024": "1024_cascade",
+        "1536": "1536_cascade",
+        "2048": "2048_cascade",
+    }[resolution]
+
+    ss_params = {
+        "steps": ss_sampling_steps,
+        "guidance_strength": ss_guidance_strength,
+        "guidance_rescale": ss_guidance_rescale,
+        "rescale_t": ss_rescale_t,
+    }
+    shape_params = {
+        "steps": shape_slat_sampling_steps,
+        "guidance_strength": shape_slat_guidance_strength,
+        "guidance_rescale": shape_slat_guidance_rescale,
+        "rescale_t": shape_slat_rescale_t,
+    }
+    tex_params = {
+        "steps": tex_slat_sampling_steps,
+        "guidance_strength": tex_slat_guidance_strength,
+        "guidance_rescale": tex_slat_guidance_rescale,
+        "rescale_t": tex_slat_rescale_t,
+    }
+
+    # Run the pipeline step-by-step so we can update status between stages.
+    images = [image]
+    torch.manual_seed(seed)
+
+    _log("Computing image embeddings (512px)…", 0.08)
+    cond_512 = pipe.get_cond(images, 512)
+    yield None, empty_html, status
+
+    cond_1024 = None
+    if pipeline_type != "512":
+        _log("Computing image embeddings (1024px)…", 0.12)
+        cond_1024 = pipe.get_cond(images, 1024)
+        yield None, empty_html, status
+
+    ss_res = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32, "2048_cascade": 32}[pipeline_type]
+    _log("Stage 1/3: Sampling sparse structure…", 0.18)
+    coords = pipe.sample_sparse_structure(cond_512, ss_res, 1, ss_params)
+    yield None, empty_html, status
+
+    if pipeline_type == "512":
+        _log("Stage 2/3: Sampling shape latent (512)…", 0.35)
+        shape_slat = pipe.sample_shape_slat(cond_512, pipe.models["shape_slat_flow_model_512"], coords, shape_params)
+        yield None, empty_html, status
+
+        if not no_texture_gen:
+            _log("Stage 3/3: Sampling texture latent (512)…", 0.55)
+            tex_slat = pipe.sample_tex_slat(cond_512, pipe.models["tex_slat_flow_model_512"], shape_slat, tex_params)
+            yield None, empty_html, status
+        else:
+            _log("Stage 3/3: Skipping texture generation.", 0.55)
+            tex_slat = None
+            yield None, empty_html, status
+        res = 512
+    elif pipeline_type == "1024":
+        _log("Stage 2/3: Sampling shape latent (1024)…", 0.35)
+        shape_slat = pipe.sample_shape_slat(cond_1024, pipe.models["shape_slat_flow_model_1024"], coords, shape_params)
+        yield None, empty_html, status
+
+        if not no_texture_gen:
+            _log("Stage 3/3: Sampling texture latent (1024)…", 0.55)
+            tex_slat = pipe.sample_tex_slat(cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, tex_params)
+            yield None, empty_html, status
+        else:
+            _log("Stage 3/3: Skipping texture generation.", 0.55)
+            tex_slat = None
+            yield None, empty_html, status
+        res = 1024
+    elif pipeline_type in {"1024_cascade", "1536_cascade", "2048_cascade"}:
+        target_res = {"1024_cascade": 1024, "1536_cascade": 1536, "2048_cascade": 2048}[pipeline_type]
+        _log(f"Stage 2/3: Sampling shape latent (cascade → {target_res})…", 0.35)
+        shape_slat, res = pipe.sample_shape_slat_cascade(
+            cond_512,
+            cond_1024,
+            pipe.models["shape_slat_flow_model_512"],
+            pipe.models["shape_slat_flow_model_1024"],
+            512,
+            target_res,
+            coords,
+            shape_params,
+            max_num_tokens,
+        )
+        yield None, empty_html, status
+
+        if not no_texture_gen:
+            _log("Stage 3/3: Sampling texture latent (1024)…", 0.55)
+            tex_slat = pipe.sample_tex_slat(cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, tex_params)
+            yield None, empty_html, status
+        else:
+            _log("Stage 3/3: Skipping texture generation.", 0.55)
+            tex_slat = None
+            yield None, empty_html, status
+    else:
+        raise gr.Error(f"Unsupported pipeline type: {pipeline_type}")
+
+    _log("Decoding latent to mesh…", 0.75)
+    mesh = pipe.decode_latent(shape_slat, tex_slat, res)[0]
+    yield None, empty_html, status
+
+    _log("Simplifying mesh…", 0.82)
     mesh.simplify(16777216)  # nvdiffrast limit
-    images = render_utils.render_snapshot(mesh, resolution=1024, r=2, fov=36, nviews=STEPS, envmap=envmap)
-    state = pack_state(latents)
-    torch.cuda.empty_cache()
+    yield None, empty_html, status
 
-    # Build HTML (48 images)
+    _log("Rendering preview snapshots…", 0.88)
+    try:
+        images = _render_preview_snapshots_incremental(
+            mesh,
+            resolution=1024,
+            r=2,
+            fov=36,
+            nviews=STEPS,
+            envmap=envmap,
+            pbr_supported=pbr_supported,
+            progress=progress,
+            log_fn=_log,
+        )
+    except Exception as e:
+        _log(f"Preview rendering failed ({type(e).__name__}: {e}). Continuing without preview.", 0.92)
+        # Still continue so state is produced and Extract works.
+        images = {m["render_key"]: [np.zeros((1024, 1024, 3), dtype=np.uint8) for _ in range(STEPS)] for m in MODES}
+    yield None, empty_html, status
+
+    _log("Packing generation state (for GLB extraction)…", 0.93)
+    state = pack_state((shape_slat, tex_slat, res))
+    torch.cuda.empty_cache()
+    yield None, empty_html, status
+
+    _log("Building preview UI…", 0.97)
     images_html = ""
     for m_idx, mode in enumerate(MODES):
         for s_idx in range(STEPS):
+            # Small progress ticks while we convert images to base64 and build HTML.
+            # (48 images total)
+            p = 0.97 + 0.02 * ((m_idx * STEPS + s_idx) / max(1, (len(MODES) * STEPS - 1)))
+            progress(p, desc="Building preview UI…")
             unique_id = f"view-m{m_idx}-s{s_idx}"
             is_visible = (m_idx == DEFAULT_MODE and s_idx == DEFAULT_STEP)
             vis_class = "visible" if is_visible else ""
@@ -511,7 +809,8 @@ def image_to_3d(
     </div>
     """
 
-    return state, full_html
+    _log("Done. You can now click “Extract GLB”.", 1.0)
+    yield state, full_html, status
 
 
 def extract_glb(
@@ -524,13 +823,44 @@ def extract_glb(
     prune_invisible_faces: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
-) -> Tuple[str, str]:
+) -> Tuple[Optional[str], Optional[str], str]:
+    if state is None:
+        # This happens when users click "Extract GLB" before clicking "Generate"
+        # (or right after changing the image / clicking an example).
+        raise gr.Error("Nothing to extract yet. Click **Generate** first.")
+
     texture_extraction = not no_texture_gen
 
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
-    shape_slat, tex_slat, res = unpack_state(state)
+    try:
+        shape_slat, tex_slat, res = unpack_state(state)
+    except Exception:
+        raise gr.Error("Invalid/empty generation state. Please click **Generate** again.")
+
+    status = ""
+
+    def _log(msg: str, p: Optional[float] = None) -> str:
+        nonlocal status
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        status = (status + "\n" if status else "") + line
+        print(line, flush=True)
+        if p is not None:
+            progress(p, desc=msg)
+        return status
+
+    _log("Starting GLB extraction…", 0.0)
+    yield None, None, status
+
+    _log("Loading TRELLIS.2 pipeline…", 0.05)
     pipe = get_image_pipeline()
+    yield None, None, status
+
+    _log("Decoding latent to mesh…", 0.15)
     mesh = pipe.decode_latent(shape_slat, tex_slat, res)[0]
+    yield None, None, status
+
+    _log("Post-processing + baking GLB (this can take a while)…", 0.3)
     glb = o_voxel.postprocess.to_glb(
         vertices=mesh.vertices,
         faces=mesh.faces,
@@ -550,13 +880,17 @@ def extract_glb(
         prune_invisible=prune_invisible_faces,
         use_tqdm=True,
     )
+    yield None, None, status
+
+    _log("Saving GLB…", 0.9)
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
     os.makedirs(user_dir, exist_ok=True)
     glb_path = os.path.join(user_dir, f"sample_{timestamp}.glb")
     glb.export(glb_path, extension_webp=True)
     torch.cuda.empty_cache()
-    return glb_path, glb_path
+    _log("Done.", 1.0)
+    yield glb_path, glb_path, status
 
 
 # ------------------------------- Texturing ----------------------------------
@@ -573,28 +907,77 @@ def shapeimage_to_tex(
     tex_slat_rescale_t: float,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
-) -> Tuple[str, str]:
+) -> Tuple[Optional[str], Optional[str], str]:
+    status = ""
+
+    def _log(msg: str, p: Optional[float] = None) -> str:
+        nonlocal status
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        status = (status + "\n" if status else "") + line
+        print(line, flush=True)
+        if p is not None:
+            progress(p, desc=msg)
+        return status
+
+    if mesh_file is None:
+        raise gr.Error("Please upload a mesh file (or use the example).")
+    if image is None:
+        raise gr.Error("Please provide a reference image (or use the example).")
+
+    _log("Starting Texturing…", 0.0)
+    yield None, None, status
+
+    _log("Loading texturing pipeline (first run can take a while)…", 0.05)
     pipe = get_texturing_pipeline()
+    yield None, None, status
+
+    _log("Loading mesh…", 0.1)
 
     mesh = trimesh.load(mesh_file)
     if isinstance(mesh, trimesh.Scene):
         mesh = mesh.to_mesh()
+    yield None, None, status
 
-    output = pipe.run(
-        mesh,
-        image,
-        seed=seed,
-        # Let the pipeline handle preprocessing so Examples also work correctly.
-        preprocess_image=True,
-        tex_slat_sampler_params={
-            "steps": tex_slat_sampling_steps,
-            "guidance_strength": tex_slat_guidance_strength,
-            "guidance_rescale": tex_slat_guidance_rescale,
-            "rescale_t": tex_slat_rescale_t,
-        },
-        resolution=int(resolution),
-        texture_size=texture_size,
-    )
+    res_int = int(resolution)
+    tex_params = {
+        "steps": tex_slat_sampling_steps,
+        "guidance_strength": tex_slat_guidance_strength,
+        "guidance_rescale": tex_slat_guidance_rescale,
+        "rescale_t": tex_slat_rescale_t,
+    }
+
+    _log("Preprocessing reference image…", 0.18)
+    image = pipe.preprocess_image(image)
+    yield None, None, status
+
+    _log("Preprocessing mesh…", 0.22)
+    mesh = pipe.preprocess_mesh(mesh)
+    yield None, None, status
+
+    torch.manual_seed(seed)
+    _log(f"Computing image embeddings ({512 if res_int == 512 else 1024}px)…", 0.3)
+    cond = pipe.get_cond([image], 512) if res_int == 512 else pipe.get_cond([image], 1024)
+    yield None, None, status
+
+    _log("Encoding mesh to shape latent…", 0.4)
+    shape_slat = pipe.encode_shape_slat(mesh, res_int)
+    yield None, None, status
+
+    tex_model = pipe.models["tex_slat_flow_model_512"] if res_int == 512 else pipe.models["tex_slat_flow_model_1024"]
+    _log("Sampling texture latent…", 0.55)
+    tex_slat = pipe.sample_tex_slat(cond, tex_model, shape_slat, tex_params)
+    yield None, None, status
+
+    _log("Decoding texture latent…", 0.72)
+    pbr_voxel = pipe.decode_tex_slat(tex_slat)
+    yield None, None, status
+
+    _log("Baking textures onto mesh…", 0.84)
+    output = pipe.postprocess_mesh(mesh, pbr_voxel, res_int, texture_size)
+    yield None, None, status
+
+    _log("Saving textured GLB…", 0.9)
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
@@ -602,7 +985,8 @@ def shapeimage_to_tex(
     glb_path = os.path.join(user_dir, f"textured_{timestamp}.glb")
     output.export(glb_path, extension_webp=True)
     torch.cuda.empty_cache()
-    return glb_path, glb_path
+    _log("Done.", 1.0)
+    yield glb_path, glb_path, status
 
 
 # --------------------------------- App UI -----------------------------------
@@ -642,7 +1026,12 @@ with gr.Blocks(
                     no_texture_gen = gr.Checkbox(label="Skip Texture Generation", value=False)
                     texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
 
-                    generate_btn = gr.Button("Generate", variant="primary")
+                    status_box = gr.Textbox(
+                        label="Progress",
+                        value="Select an image (upload or example), then click Generate.",
+                        lines=10,
+                        interactive=False,
+                    )
 
                     with gr.Accordion(label="Advanced Settings", open=False):
                         gr.Markdown("Stage 1: Sparse Structure Generation")
@@ -671,7 +1060,8 @@ with gr.Blocks(
                     with gr.Walkthrough(selected=0) as walkthrough:
                         with gr.Step("Preview", id=0):
                             preview_output = gr.HTML(empty_html, label="3D Asset Preview", show_label=True, container=True)
-                            extract_btn = gr.Button("Extract GLB")
+                            generate_btn = gr.Button("Generate", variant="primary")
+                            extract_btn = gr.Button("Extract GLB", interactive=False)
                         with gr.Step("Extract", id=1):
                             glb_output = gr.Model3D(label="Extracted GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
                             download_btn = gr.DownloadButton(label="Download GLB")
@@ -691,10 +1081,28 @@ with gr.Blocks(
 
             output_buf = gr.State()
 
+            def _reset_image_to_3d_ui():
+                return (
+                    None,  # output_buf
+                    empty_html,  # preview_output
+                    gr.update(interactive=False),  # extract_btn
+                    gr.Walkthrough(selected=0),  # walkthrough
+                    None,  # glb_output
+                    None,  # download_btn
+                    "Select an image (upload or example), then click Generate.",  # status_box
+                )
+
             image_prompt.upload(
                 preprocess_image,
                 inputs=[image_prompt],
                 outputs=[image_prompt],
+            )
+
+            # Any time the input image changes (upload, example click, clear), invalidate previous results.
+            image_prompt.change(
+                _reset_image_to_3d_ui,
+                inputs=[],
+                outputs=[output_buf, preview_output, extract_btn, walkthrough, glb_output, download_btn, status_box],
             )
 
             generate_btn.click(
@@ -703,6 +1111,10 @@ with gr.Blocks(
                 outputs=[seed],
             ).then(
                 lambda: gr.Walkthrough(selected=0), outputs=walkthrough
+            ).then(
+                _reset_image_to_3d_ui,
+                inputs=[],
+                outputs=[output_buf, preview_output, extract_btn, walkthrough, glb_output, download_btn, status_box],
             ).then(
                 image_to_3d,
                 inputs=[
@@ -724,7 +1136,9 @@ with gr.Blocks(
                     no_texture_gen,
                     max_num_tokens,
                 ],
-                outputs=[output_buf, preview_output],
+                outputs=[output_buf, preview_output, status_box],
+            ).then(
+                lambda: gr.update(interactive=True), outputs=extract_btn
             )
 
             extract_btn.click(
@@ -732,7 +1146,7 @@ with gr.Blocks(
             ).then(
                 extract_glb,
                 inputs=[output_buf, decimation_target, texture_size, remesh_method, simplify_method, no_texture_gen, prune_invisible_faces],
-                outputs=[glb_output, download_btn],
+                outputs=[glb_output, download_btn, status_box],
             )
 
         # ---------------------------- Tab 2: Texturing -------------------------------
@@ -748,6 +1162,12 @@ with gr.Blocks(
                     tex_texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
 
                     tex_generate_btn = gr.Button("Generate Textured GLB", variant="primary")
+                    tex_status_box = gr.Textbox(
+                        label="Progress",
+                        value="Upload a mesh + reference image (or use the example), then click Generate.",
+                        lines=10,
+                        interactive=False,
+                    )
 
                     with gr.Accordion(label="Advanced Settings", open=False):
                         with gr.Row():
@@ -789,7 +1209,7 @@ with gr.Blocks(
                     t_sampling_steps,
                     t_rescale_t,
                 ],
-                outputs=[textured_glb_output, textured_download_btn],
+                outputs=[textured_glb_output, textured_download_btn, tex_status_box],
             )
 
 
