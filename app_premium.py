@@ -64,7 +64,7 @@ from datetime import datetime
 import shutil
 import base64
 import io
-from typing import Tuple, Optional, Dict, List
+from typing import Tuple, Optional, Dict, List, Any
 
 import cv2
 import numpy as np
@@ -114,6 +114,7 @@ if _is_faithful_contouring_available():
 MODELS_DIR = os.path.join(APP_DIR, "models")
 TMP_DIR = os.path.join(APP_DIR, "tmp")
 OUTPUTS_DIR = os.path.join(APP_DIR, "outputs")
+PRESETS_DIR = os.path.join(APP_DIR, "presets")
 SUBPROCESS_STAGE_SCRIPT = os.path.join(APP_DIR, "subprocess_stage.py")
 
 # Ensure TRELLIS_MODELS_DIR is set (trellis2 code also falls back to ../models).
@@ -366,6 +367,210 @@ def _write_json(path: str, data: dict) -> None:
 
 def _read_json(path: str) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+# ------------------------------- Presets / Config ----------------------------
+
+UI_PRESET_VERSION = "1.0"
+UI_PRESET_FORMAT = "trellis2_premium_ui"
+_LAST_USED_UI_PRESET_FILE = ".last_used_ui_preset.txt"
+
+
+def _sanitize_preset_name(name: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(name))
+    return safe.strip("._") or "default"
+
+
+def _ui_preset_path(preset_name: str) -> Path:
+    safe = _sanitize_preset_name(preset_name)
+    return Path(PRESETS_DIR) / f"{safe}.json"
+
+
+def _list_ui_presets() -> List[str]:
+    root = Path(PRESETS_DIR)
+    if not root.exists():
+        return []
+    return sorted([p.stem for p in root.glob("*.json") if p.is_file()])
+
+
+def _set_last_used_ui_preset(preset_name: str) -> None:
+    try:
+        root = Path(PRESETS_DIR)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / _LAST_USED_UI_PRESET_FILE).write_text(_sanitize_preset_name(preset_name), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _get_last_used_ui_preset() -> Optional[str]:
+    root = Path(PRESETS_DIR)
+    path = root / _LAST_USED_UI_PRESET_FILE
+    if not path.exists():
+        return None
+    try:
+        name = path.read_text(encoding="utf-8").strip()
+        return name or None
+    except Exception:
+        return None
+
+
+def _default_ui_config() -> dict:
+    """
+    Must match ALL user-settable UI defaults.
+    (Inputs like uploaded images/files are intentionally not saved in presets.)
+    """
+    return {
+        "_meta": {
+            "version": UI_PRESET_VERSION,
+            "format": UI_PRESET_FORMAT,
+        },
+        "global": {
+            "subprocess_mode": True,
+        },
+        "image_to_3d": {
+            "resolution": "1024",
+            "seed": 99,
+            "randomize_seed": False,
+            "decimation_target": 500000,
+            "remesh_method": "dual_contouring",
+            "simplify_method": "cumesh",
+            "prune_invisible_faces": True,
+            "no_texture_gen": False,
+            "texture_size": 2048,
+            "export_formats": ["glb"],
+            "ss_guidance_strength": 7.5,
+            "ss_guidance_rescale": 0.7,
+            "ss_guidance_interval_start": 0.6,
+            "ss_guidance_interval_end": 1.0,
+            "ss_sampling_steps": 12,
+            "ss_rescale_t": 5.0,
+            "shape_slat_guidance_strength": 7.5,
+            "shape_slat_guidance_rescale": 0.5,
+            "shape_slat_guidance_interval_start": 0.6,
+            "shape_slat_guidance_interval_end": 1.0,
+            "shape_slat_sampling_steps": 12,
+            "shape_slat_rescale_t": 3.0,
+            "max_num_tokens": 49152,
+            "tex_slat_guidance_strength": 1.0,
+            "tex_slat_guidance_rescale": 0.0,
+            "tex_slat_guidance_interval_start": 0.6,
+            "tex_slat_guidance_interval_end": 0.9,
+            "tex_slat_sampling_steps": 12,
+            "tex_slat_rescale_t": 3.0,
+        },
+        "texturing": {
+            "resolution": "1024",
+            "seed": 99,
+            "randomize_seed": False,
+            "texture_size": 2048,
+            "guidance_strength": 1.0,
+            "guidance_rescale": 0.0,
+            "guidance_interval_start": 0.6,
+            "guidance_interval_end": 0.9,
+            "sampling_steps": 12,
+            "rescale_t": 3.0,
+        },
+    }
+
+
+def _merge_ui_config(cfg: Optional[dict]) -> dict:
+    """
+    Merge a loaded config with defaults so older presets still work after adding new params.
+    """
+    base = _default_ui_config()
+    if not isinstance(cfg, dict):
+        return base
+
+    meta = cfg.get("_meta")
+    if isinstance(meta, dict):
+        base["_meta"].update(meta)
+
+    for section in ("global", "image_to_3d", "texturing"):
+        section_data = cfg.get(section)
+        if isinstance(section_data, dict):
+            base[section].update(section_data)
+
+    return base
+
+
+def _save_ui_preset(preset_name: str, config: dict) -> str:
+    if not preset_name or not str(preset_name).strip():
+        raise ValueError("Preset name cannot be empty.")
+
+    safe_name = _sanitize_preset_name(str(preset_name).strip())
+    root = Path(PRESETS_DIR)
+    root.mkdir(parents=True, exist_ok=True)
+
+    cfg = _merge_ui_config(config)
+    cfg.setdefault("_meta", {})
+    cfg["_meta"]["version"] = UI_PRESET_VERSION
+    cfg["_meta"]["format"] = UI_PRESET_FORMAT
+    cfg["_meta"]["last_modified"] = datetime.now().isoformat()
+    if "created_at" not in cfg["_meta"]:
+        cfg["_meta"]["created_at"] = cfg["_meta"]["last_modified"]
+
+    out_path = _ui_preset_path(safe_name)
+    tmp_path = out_path.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    tmp_path.replace(out_path)
+
+    _set_last_used_ui_preset(safe_name)
+    return safe_name
+
+
+def _load_ui_preset(preset_name: str) -> Optional[dict]:
+    if not preset_name:
+        return None
+    path = _ui_preset_path(preset_name)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    _set_last_used_ui_preset(preset_name)
+    return _merge_ui_config(data)
+
+
+def _delete_ui_preset(preset_name: str) -> bool:
+    if not preset_name:
+        return False
+    path = _ui_preset_path(preset_name)
+    if not path.exists():
+        return False
+    try:
+        path.unlink()
+        return True
+    except Exception:
+        return False
+
+
+def _append_status(current: str, msg: str) -> str:
+    current = current or ""
+    msg = msg or ""
+    if not current:
+        return msg
+    if not msg:
+        return current
+    return current + "\n" + msg
+
+
+def _open_folder(path: str) -> None:
+    path = os.path.abspath(path)
+    if os.name == "nt":
+        os.startfile(path)  # type: ignore[attr-defined]
+        return
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+        return
+    # Linux / WSL / others
+    for cmd in (["xdg-open", path], ["gio", "open", path]):
+        try:
+            subprocess.Popen(cmd)
+            return
+        except FileNotFoundError:
+            continue
+    raise FileNotFoundError("No folder opener found (tried: xdg-open, gio).")
 
 
 def _iter_subprocess_stage(stage: str, payload: dict, work_dir: Path, log_path: Path):
@@ -760,14 +965,20 @@ def image_to_3d(
     resolution: str,
     ss_guidance_strength: float,
     ss_guidance_rescale: float,
+    ss_guidance_interval_start: float,
+    ss_guidance_interval_end: float,
     ss_sampling_steps: int,
     ss_rescale_t: float,
     shape_slat_guidance_strength: float,
     shape_slat_guidance_rescale: float,
+    shape_slat_guidance_interval_start: float,
+    shape_slat_guidance_interval_end: float,
     shape_slat_sampling_steps: int,
     shape_slat_rescale_t: float,
     tex_slat_guidance_strength: float,
     tex_slat_guidance_rescale: float,
+    tex_slat_guidance_interval_start: float,
+    tex_slat_guidance_interval_end: float,
     tex_slat_sampling_steps: int,
     tex_slat_rescale_t: float,
     no_texture_gen: bool,
@@ -852,18 +1063,21 @@ def image_to_3d(
                     "steps": int(ss_sampling_steps),
                     "guidance_strength": float(ss_guidance_strength),
                     "guidance_rescale": float(ss_guidance_rescale),
+                    "guidance_interval": [float(ss_guidance_interval_start), float(ss_guidance_interval_end)],
                     "rescale_t": float(ss_rescale_t),
                 },
                 "shape_params": {
                     "steps": int(shape_slat_sampling_steps),
                     "guidance_strength": float(shape_slat_guidance_strength),
                     "guidance_rescale": float(shape_slat_guidance_rescale),
+                    "guidance_interval": [float(shape_slat_guidance_interval_start), float(shape_slat_guidance_interval_end)],
                     "rescale_t": float(shape_slat_rescale_t),
                 },
                 "tex_params": {
                     "steps": int(tex_slat_sampling_steps),
                     "guidance_strength": float(tex_slat_guidance_strength),
                     "guidance_rescale": float(tex_slat_guidance_rescale),
+                    "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
                     "rescale_t": float(tex_slat_rescale_t),
                 },
             },
@@ -923,6 +1137,7 @@ def image_to_3d(
                 "steps": int(ss_sampling_steps),
                 "guidance_strength": float(ss_guidance_strength),
                 "guidance_rescale": float(ss_guidance_rescale),
+                "guidance_interval": [float(ss_guidance_interval_start), float(ss_guidance_interval_end)],
                 "rescale_t": float(ss_rescale_t),
             },
         }
@@ -941,6 +1156,7 @@ def image_to_3d(
                 "steps": int(shape_slat_sampling_steps),
                 "guidance_strength": float(shape_slat_guidance_strength),
                 "guidance_rescale": float(shape_slat_guidance_rescale),
+                "guidance_interval": [float(shape_slat_guidance_interval_start), float(shape_slat_guidance_interval_end)],
                 "rescale_t": float(shape_slat_rescale_t),
             },
             "max_num_tokens": int(max_num_tokens),
@@ -961,6 +1177,7 @@ def image_to_3d(
                     "steps": int(tex_slat_sampling_steps),
                     "guidance_strength": float(tex_slat_guidance_strength),
                     "guidance_rescale": float(tex_slat_guidance_rescale),
+                    "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
                     "rescale_t": float(tex_slat_rescale_t),
                 },
             }
@@ -1091,18 +1308,21 @@ def image_to_3d(
         "steps": ss_sampling_steps,
         "guidance_strength": ss_guidance_strength,
         "guidance_rescale": ss_guidance_rescale,
+        "guidance_interval": [float(ss_guidance_interval_start), float(ss_guidance_interval_end)],
         "rescale_t": ss_rescale_t,
     }
     shape_params = {
         "steps": shape_slat_sampling_steps,
         "guidance_strength": shape_slat_guidance_strength,
         "guidance_rescale": shape_slat_guidance_rescale,
+        "guidance_interval": [float(shape_slat_guidance_interval_start), float(shape_slat_guidance_interval_end)],
         "rescale_t": shape_slat_rescale_t,
     }
     tex_params = {
         "steps": tex_slat_sampling_steps,
         "guidance_strength": tex_slat_guidance_strength,
         "guidance_rescale": tex_slat_guidance_rescale,
+        "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
         "rescale_t": tex_slat_rescale_t,
     }
 
@@ -1570,6 +1790,8 @@ def shapeimage_to_tex(
     texture_size: int,
     tex_slat_guidance_strength: float,
     tex_slat_guidance_rescale: float,
+    tex_slat_guidance_interval_start: float,
+    tex_slat_guidance_interval_end: float,
     tex_slat_sampling_steps: int,
     tex_slat_rescale_t: float,
     subprocess_mode: bool,
@@ -1627,6 +1849,7 @@ def shapeimage_to_tex(
                     "steps": int(tex_slat_sampling_steps),
                     "guidance_strength": float(tex_slat_guidance_strength),
                     "guidance_rescale": float(tex_slat_guidance_rescale),
+                    "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
                     "rescale_t": float(tex_slat_rescale_t),
                 },
             },
@@ -1647,6 +1870,7 @@ def shapeimage_to_tex(
                 "steps": int(tex_slat_sampling_steps),
                 "guidance_strength": float(tex_slat_guidance_strength),
                 "guidance_rescale": float(tex_slat_guidance_rescale),
+                "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
                 "rescale_t": float(tex_slat_rescale_t),
             },
             "out_dir": str(run_dir / "08_texturing"),
@@ -1707,6 +1931,7 @@ def shapeimage_to_tex(
                 "steps": int(tex_slat_sampling_steps),
                 "guidance_strength": float(tex_slat_guidance_strength),
                 "guidance_rescale": float(tex_slat_guidance_rescale),
+                "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
                 "rescale_t": float(tex_slat_rescale_t),
             },
         },
@@ -1731,6 +1956,7 @@ def shapeimage_to_tex(
         "steps": tex_slat_sampling_steps,
         "guidance_strength": tex_slat_guidance_strength,
         "guidance_rescale": tex_slat_guidance_rescale,
+        "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
         "rescale_t": tex_slat_rescale_t,
     }
 
@@ -1782,16 +2008,37 @@ def shapeimage_to_tex(
 
 with gr.Blocks(
     title="TRELLIS.2 Premium",
-    theme=gr.themes.Soft(),
+    theme=gr.themes.Soft(
+        primary_hue="indigo",
+        secondary_hue="sky",
+        neutral_hue="slate",
+        radius_size="lg",
+        font=(
+            "'Segoe UI Variable Display'",
+            "'Segoe UI Variable'",
+            "'Segoe UI'",
+            "'Inter'",
+            "ui-sans-serif",
+            "system-ui",
+            "sans-serif",
+        ),
+        font_mono=(
+            "'Cascadia Mono'",
+            "'Cascadia Code'",
+            "'JetBrains Mono'",
+            "'Consolas'",
+            "ui-monospace",
+            "monospace",
+        ),
+    ),
     css=css,
     head=head,
     delete_cache=(600, 600),
 ) as demo:
     gr.Markdown(
         """
-## TRELLIS.2 Premium (Image → 3D + Texturing)
-- **Offline-ready**: download models into `Trellis_2_3D_Generator/models/` via `HF_model_downloader.py`.
-- **Two tools in one app**: generate a mesh from an image, then (optionally) texture any mesh with a reference image.
+## TRELLIS.2 Premium
+Generate a 3D asset from an image, export as GLB, and optionally texture an existing mesh.
 """
     )
 
@@ -1808,12 +2055,13 @@ with gr.Blocks(
         # ---------------------------- Tab 1: Image -> 3D ----------------------------
         with gr.Tab("Image → 3D"):
             with gr.Row():
-                with gr.Column(scale=1, min_width=360):
+                with gr.Column(scale=1, min_width=380):
                     image_prompt = gr.Image(label="Image Prompt", format="png", image_mode="RGBA", type="pil", height=400)
 
                     resolution = gr.Radio(["512", "1024", "1536", "2048"], label="Resolution", value="1024")
-                    seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
-                    randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
+                    with gr.Row():
+                        seed = gr.Slider(0, MAX_SEED, label="Seed", value=99, step=1, scale=4)
+                        randomize_seed = gr.Checkbox(label="Randomize Seed", value=False, scale=1)
                     decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000)
                     remesh_method = gr.Dropdown(REMESH_METHOD_CHOICES, label="Remesh Method", value="dual_contouring")
                     if "faithful_contouring" not in REMESH_METHOD_CHOICES:
@@ -1838,39 +2086,84 @@ with gr.Blocks(
                         interactive=False,
                     )
 
-                    with gr.Accordion(label="Advanced Settings", open=False):
-                        gr.Markdown("Stage 1: Sparse Structure Generation")
+                    with gr.Accordion("⚙️ Config Presets (Save / Load)", open=True):
+                        gr.Markdown(
+                            "Saves/loads **all settings** from **both** tabs (inputs like images/files are not included)."
+                        )
+                        ui_preset_dropdown = gr.Dropdown(
+                            label="Select Preset",
+                            choices=_list_ui_presets(),
+                            value=_get_last_used_ui_preset() or "",
+                            allow_custom_value=False,
+                        )
                         with gr.Row():
-                            ss_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1)
-                            ss_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.7, step=0.01)
-                            ss_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
-                            ss_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=5.0, step=0.1)
-
-                        gr.Markdown("Stage 2: Shape Generation")
+                            ui_preset_name = gr.Textbox(
+                                label="New Preset Name",
+                                placeholder="my_settings",
+                                scale=3,
+                            )
+                            ui_preset_save_btn = gr.Button("💾 Save", variant="primary", scale=1)
                         with gr.Row():
-                            shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1)
-                            shape_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.5, step=0.01)
-                            shape_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
-                            shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1)
-                            max_num_tokens = gr.Slider(10000, 200000, label="Max Number of Tokens", value=49152, step=1000)
+                            ui_preset_load_btn = gr.Button("📂 Load Selected", scale=1)
+                            ui_preset_reset_btn = gr.Button("🔄 Reset Defaults", variant="secondary", scale=1)
+                            ui_preset_delete_btn = gr.Button("🗑️ Delete", variant="stop", scale=1)
+                        ui_preset_status = gr.Markdown("")
 
-                        gr.Markdown("Stage 3: Material Generation")
-                        with gr.Row():
-                            tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1)
-                            tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.0, step=0.01)
-                            tex_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
-                            tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1)
-
-                with gr.Column(scale=10):
+                with gr.Column(scale=2, min_width=520):
                     with gr.Walkthrough(selected=0) as walkthrough:
                         with gr.Step("Preview", id=0):
                             preview_output = gr.HTML(empty_html, label="3D Asset Preview", show_label=True, container=True)
-                            generate_btn = gr.Button("Generate", variant="primary")
-                            extract_btn = gr.Button("Extract GLB", interactive=False)
-                            view_extract_btn = gr.Button("View Extracted", interactive=False)
+                            with gr.Row():
+                                generate_btn = gr.Button("Generate", variant="primary")
+                                extract_btn = gr.Button("Extract GLB", interactive=False)
+                                view_extract_btn = gr.Button("View Extracted", interactive=False)
+                            with gr.Accordion(label="Advanced Settings", open=True):
+                                gr.Markdown("Stage 1: Sparse Structure Generation")
+                                with gr.Row():
+                                    ss_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1)
+                                    ss_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.7, step=0.01)
+                                    ss_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
+                                with gr.Row():
+                                    ss_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=5.0, step=0.1)
+                                    ss_guidance_interval_start = gr.Slider(
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01
+                                    )
+                                    ss_guidance_interval_end = gr.Slider(
+                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01
+                                    )
+
+                                gr.Markdown("Stage 2: Shape Generation")
+                                with gr.Row():
+                                    shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1)
+                                    shape_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.5, step=0.01)
+                                    shape_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
+                                with gr.Row():
+                                    shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1)
+                                    shape_slat_guidance_interval_start = gr.Slider(
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01
+                                    )
+                                    shape_slat_guidance_interval_end = gr.Slider(
+                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01
+                                    )
+                                    max_num_tokens = gr.Slider(10000, 200000, label="Max Number of Tokens", value=49152, step=1000)
+
+                                gr.Markdown("Stage 3: Material Generation")
+                                with gr.Row():
+                                    tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1)
+                                    tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.0, step=0.01)
+                                    tex_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
+                                with gr.Row():
+                                    tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1)
+                                    tex_slat_guidance_interval_start = gr.Slider(
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01
+                                    )
+                                    tex_slat_guidance_interval_end = gr.Slider(
+                                        0.0, 1.0, label="Guidance Interval End", value=0.9, step=0.01
+                                    )
                         with gr.Step("Extract", id=1):
-                            back_to_preview_btn = gr.Button("Back to Preview", variant="secondary")
-                            fullscreen_glb_btn = gr.Button("Fullscreen", variant="secondary")
+                            with gr.Row():
+                                back_to_preview_btn = gr.Button("Back to Preview", variant="secondary")
+                                fullscreen_glb_btn = gr.Button("Fullscreen", variant="secondary")
                             glb_output = gr.Model3D(
                                 label="Extracted GLB",
                                 height=724,
@@ -1879,17 +2172,19 @@ with gr.Blocks(
                                 clear_color=(0.25, 0.25, 0.25, 1.0),
                                 elem_id="extracted_glb_viewer",
                             )
-                            download_btn = gr.DownloadButton(label="Download GLB")
+                            with gr.Row():
+                                download_btn = gr.DownloadButton(label="Download GLB", variant="primary")
+                                open_outputs_btn = gr.Button("Open outputs folder", variant="secondary")
 
-                with gr.Column(scale=1, min_width=172):
-                    examples = gr.Examples(
-                        examples=[
-                            os.path.join(APP_DIR, "assets", "example_image", image)
-                            for image in os.listdir(os.path.join(APP_DIR, "assets", "example_image"))
-                        ],
-                        inputs=[image_prompt],
-                        examples_per_page=18,
-                    )
+            gr.Markdown("### Examples")
+            examples = gr.Examples(
+                examples=[
+                    os.path.join(APP_DIR, "assets", "example_image", image)
+                    for image in os.listdir(os.path.join(APP_DIR, "assets", "example_image"))
+                ],
+                inputs=[image_prompt],
+                examples_per_page=18,
+            )
 
             output_buf = gr.State()
 
@@ -1934,14 +2229,20 @@ with gr.Blocks(
                     resolution,
                     ss_guidance_strength,
                     ss_guidance_rescale,
+                    ss_guidance_interval_start,
+                    ss_guidance_interval_end,
                     ss_sampling_steps,
                     ss_rescale_t,
                     shape_slat_guidance_strength,
                     shape_slat_guidance_rescale,
+                    shape_slat_guidance_interval_start,
+                    shape_slat_guidance_interval_end,
                     shape_slat_sampling_steps,
                     shape_slat_rescale_t,
                     tex_slat_guidance_strength,
                     tex_slat_guidance_rescale,
+                    tex_slat_guidance_interval_start,
+                    tex_slat_guidance_interval_end,
                     tex_slat_sampling_steps,
                     tex_slat_rescale_t,
                     no_texture_gen,
@@ -1996,16 +2297,37 @@ with gr.Blocks(
 """,
             )
 
+            def _open_outputs_from_image_tab(current_status: str) -> str:
+                os.makedirs(OUTPUTS_DIR, exist_ok=True)
+                ts = datetime.now().strftime("%H:%M:%S")
+                try:
+                    _open_folder(OUTPUTS_DIR)
+                    return _append_status(
+                        current_status,
+                        f"[{ts}] Opened outputs folder: {safe_relpath(OUTPUTS_DIR, APP_DIR)}",
+                    )
+                except Exception as e:
+                    return _append_status(current_status, f"[{ts}] Could not open outputs folder: {e}")
+
+            open_outputs_btn.click(
+                fn=_open_outputs_from_image_tab,
+                inputs=[status_box],
+                outputs=[status_box],
+                queue=False,
+                show_progress="hidden",
+            )
+
         # ---------------------------- Tab 2: Texturing -------------------------------
         with gr.Tab("Texturing"):
             with gr.Row():
-                with gr.Column(scale=1, min_width=360):
+                with gr.Column(scale=1, min_width=380):
                     mesh_file = gr.File(label="Upload Mesh", file_types=[".ply", ".obj", ".glb", ".gltf"], file_count="single")
                     tex_image = gr.Image(label="Reference Image", format="png", image_mode="RGBA", type="pil", height=400)
 
                     tex_resolution = gr.Radio(["512", "1024", "1536"], label="Resolution", value="1024")
-                    tex_seed = gr.Slider(0, MAX_SEED, label="Seed", value=0, step=1)
-                    tex_randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
+                    with gr.Row():
+                        tex_seed = gr.Slider(0, MAX_SEED, label="Seed", value=99, step=1, scale=4)
+                        tex_randomize_seed = gr.Checkbox(label="Randomize Seed", value=False, scale=1)
                     tex_texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
 
                     tex_generate_btn = gr.Button("Generate Textured GLB", variant="primary")
@@ -2021,23 +2343,32 @@ with gr.Blocks(
                             t_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1)
                             t_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.0, step=0.01)
                             t_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
+                        with gr.Row():
                             t_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1)
+                            t_guidance_interval_start = gr.Slider(
+                                0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01
+                            )
+                            t_guidance_interval_end = gr.Slider(
+                                0.0, 1.0, label="Guidance Interval End", value=0.9, step=0.01
+                            )
 
-                with gr.Column(scale=10):
+                with gr.Column(scale=2, min_width=520):
                     textured_glb_output = gr.Model3D(label="Textured GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
-                    textured_download_btn = gr.DownloadButton(label="Download Textured GLB")
+                    with gr.Row():
+                        textured_download_btn = gr.DownloadButton(label="Download Textured GLB", variant="primary")
+                        tex_open_outputs_btn = gr.Button("Open outputs folder", variant="secondary")
 
-                with gr.Column(scale=1, min_width=172):
-                    tex_examples = gr.Examples(
-                        examples=[
-                            [
-                                os.path.join(APP_DIR, "assets", "example_texturing", "the_forgotten_knight.ply"),
-                                os.path.join(APP_DIR, "assets", "example_texturing", "image.webp"),
-                            ]
-                        ],
-                        inputs=[mesh_file, tex_image],
-                        examples_per_page=6,
-                    )
+            gr.Markdown("### Examples")
+            tex_examples = gr.Examples(
+                examples=[
+                    [
+                        os.path.join(APP_DIR, "assets", "example_texturing", "the_forgotten_knight.ply"),
+                        os.path.join(APP_DIR, "assets", "example_texturing", "image.webp"),
+                    ]
+                ],
+                inputs=[mesh_file, tex_image],
+                examples_per_page=6,
+            )
 
             tex_generate_btn.click(
                 get_seed,
@@ -2053,6 +2384,8 @@ with gr.Blocks(
                     tex_texture_size,
                     t_guidance_strength,
                     t_guidance_rescale,
+                    t_guidance_interval_start,
+                    t_guidance_interval_end,
                     t_sampling_steps,
                     t_rescale_t,
                     subprocess_mode,
@@ -2060,12 +2393,250 @@ with gr.Blocks(
                 outputs=[textured_glb_output, textured_download_btn, tex_status_box],
             )
 
+            def _open_outputs_from_texturing_tab(current_status: str) -> str:
+                os.makedirs(OUTPUTS_DIR, exist_ok=True)
+                ts = datetime.now().strftime("%H:%M:%S")
+                try:
+                    _open_folder(OUTPUTS_DIR)
+                    return _append_status(
+                        current_status,
+                        f"[{ts}] Opened outputs folder: {safe_relpath(OUTPUTS_DIR, APP_DIR)}",
+                    )
+                except Exception as e:
+                    return _append_status(current_status, f"[{ts}] Could not open outputs folder: {e}")
+
+            tex_open_outputs_btn.click(
+                fn=_open_outputs_from_texturing_tab,
+                inputs=[tex_status_box],
+                outputs=[tex_status_box],
+                queue=False,
+                show_progress="hidden",
+            )
+
+    # ---------------------------- Preset Wiring ----------------------------
+    _CONFIG_KEYS = [
+        ("global", "subprocess_mode"),
+        ("image_to_3d", "resolution"),
+        ("image_to_3d", "seed"),
+        ("image_to_3d", "randomize_seed"),
+        ("image_to_3d", "decimation_target"),
+        ("image_to_3d", "remesh_method"),
+        ("image_to_3d", "simplify_method"),
+        ("image_to_3d", "prune_invisible_faces"),
+        ("image_to_3d", "no_texture_gen"),
+        ("image_to_3d", "texture_size"),
+        ("image_to_3d", "export_formats"),
+        ("image_to_3d", "ss_guidance_strength"),
+        ("image_to_3d", "ss_guidance_rescale"),
+        ("image_to_3d", "ss_guidance_interval_start"),
+        ("image_to_3d", "ss_guidance_interval_end"),
+        ("image_to_3d", "ss_sampling_steps"),
+        ("image_to_3d", "ss_rescale_t"),
+        ("image_to_3d", "shape_slat_guidance_strength"),
+        ("image_to_3d", "shape_slat_guidance_rescale"),
+        ("image_to_3d", "shape_slat_guidance_interval_start"),
+        ("image_to_3d", "shape_slat_guidance_interval_end"),
+        ("image_to_3d", "shape_slat_sampling_steps"),
+        ("image_to_3d", "shape_slat_rescale_t"),
+        ("image_to_3d", "max_num_tokens"),
+        ("image_to_3d", "tex_slat_guidance_strength"),
+        ("image_to_3d", "tex_slat_guidance_rescale"),
+        ("image_to_3d", "tex_slat_guidance_interval_start"),
+        ("image_to_3d", "tex_slat_guidance_interval_end"),
+        ("image_to_3d", "tex_slat_sampling_steps"),
+        ("image_to_3d", "tex_slat_rescale_t"),
+        ("texturing", "resolution"),
+        ("texturing", "seed"),
+        ("texturing", "randomize_seed"),
+        ("texturing", "texture_size"),
+        ("texturing", "guidance_strength"),
+        ("texturing", "guidance_rescale"),
+        ("texturing", "guidance_interval_start"),
+        ("texturing", "guidance_interval_end"),
+        ("texturing", "sampling_steps"),
+        ("texturing", "rescale_t"),
+    ]
+
+    _CONFIG_COMPONENTS = [
+        subprocess_mode,
+        resolution,
+        seed,
+        randomize_seed,
+        decimation_target,
+        remesh_method,
+        simplify_method,
+        prune_invisible_faces,
+        no_texture_gen,
+        texture_size,
+        export_formats,
+        ss_guidance_strength,
+        ss_guidance_rescale,
+        ss_guidance_interval_start,
+        ss_guidance_interval_end,
+        ss_sampling_steps,
+        ss_rescale_t,
+        shape_slat_guidance_strength,
+        shape_slat_guidance_rescale,
+        shape_slat_guidance_interval_start,
+        shape_slat_guidance_interval_end,
+        shape_slat_sampling_steps,
+        shape_slat_rescale_t,
+        max_num_tokens,
+        tex_slat_guidance_strength,
+        tex_slat_guidance_rescale,
+        tex_slat_guidance_interval_start,
+        tex_slat_guidance_interval_end,
+        tex_slat_sampling_steps,
+        tex_slat_rescale_t,
+        tex_resolution,
+        tex_seed,
+        tex_randomize_seed,
+        tex_texture_size,
+        t_guidance_strength,
+        t_guidance_rescale,
+        t_guidance_interval_start,
+        t_guidance_interval_end,
+        t_sampling_steps,
+        t_rescale_t,
+    ]
+
+    def _values_to_ui_config(*values) -> dict:
+        cfg = _default_ui_config()
+        for (section, key), val in zip(_CONFIG_KEYS, values):
+            cfg[section][key] = val
+        return cfg
+
+    def _ui_config_to_values(cfg: dict) -> List[Any]:
+        merged = _merge_ui_config(cfg)
+
+        # Light validation/clamping for list-like and choice-like inputs.
+        # If a key is invalid, fall back to defaults (keeps UI consistent).
+        defaults = _default_ui_config()
+
+        # Image→3D resolution
+        if merged["image_to_3d"]["resolution"] not in ["512", "1024", "1536", "2048"]:
+            merged["image_to_3d"]["resolution"] = defaults["image_to_3d"]["resolution"]
+        # Texturing resolution
+        if merged["texturing"]["resolution"] not in ["512", "1024", "1536"]:
+            merged["texturing"]["resolution"] = defaults["texturing"]["resolution"]
+        # Remesh method (depends on env)
+        if merged["image_to_3d"]["remesh_method"] not in REMESH_METHOD_CHOICES:
+            merged["image_to_3d"]["remesh_method"] = defaults["image_to_3d"]["remesh_method"]
+        # Simplify method
+        if merged["image_to_3d"]["simplify_method"] not in ["cumesh", "meshlib"]:
+            merged["image_to_3d"]["simplify_method"] = defaults["image_to_3d"]["simplify_method"]
+        # Export formats
+        ef = merged["image_to_3d"].get("export_formats")
+        if not isinstance(ef, list):
+            ef = defaults["image_to_3d"]["export_formats"]
+        ef = [str(x) for x in ef if str(x) in {"glb", "gltf", "obj", "ply", "stl"}]
+        merged["image_to_3d"]["export_formats"] = ef or defaults["image_to_3d"]["export_formats"]
+
+        def _clamp01(v, d):
+            try:
+                v = float(v)
+            except Exception:
+                v = float(d)
+            return max(0.0, min(1.0, v))
+
+        def _fix_interval(section: str, start_key: str, end_key: str) -> None:
+            s = _clamp01(merged[section].get(start_key), defaults[section][start_key])
+            e = _clamp01(merged[section].get(end_key), defaults[section][end_key])
+            if s > e:
+                s, e = e, s
+            merged[section][start_key] = s
+            merged[section][end_key] = e
+
+        _fix_interval("image_to_3d", "ss_guidance_interval_start", "ss_guidance_interval_end")
+        _fix_interval("image_to_3d", "shape_slat_guidance_interval_start", "shape_slat_guidance_interval_end")
+        _fix_interval("image_to_3d", "tex_slat_guidance_interval_start", "tex_slat_guidance_interval_end")
+        _fix_interval("texturing", "guidance_interval_start", "guidance_interval_end")
+
+        return [merged[s][k] for (s, k) in _CONFIG_KEYS]
+
+    def _save_preset_ui(preset_name: str, *values):
+        try:
+            cfg = _values_to_ui_config(*values)
+            saved = _save_ui_preset(preset_name, cfg)
+            presets = _list_ui_presets()
+            return (
+                gr.update(choices=presets, value=saved),
+                f"✅ Saved preset **{saved}**",
+            )
+        except Exception as e:
+            return gr.update(), f"❌ Save failed: {e}"
+
+    def _load_preset_ui(preset_name: str):
+        if not preset_name:
+            cfg = _default_ui_config()
+            vals = _ui_config_to_values(cfg)
+            return (*vals, "ℹ️ No preset selected (showing defaults).")
+
+        cfg = _load_ui_preset(preset_name)
+        if not cfg:
+            cfg = _default_ui_config()
+            vals = _ui_config_to_values(cfg)
+            return (*vals, f"⚠️ Preset **{preset_name}** not found (loaded defaults).")
+
+        vals = _ui_config_to_values(cfg)
+        return (*vals, f"✅ Loaded preset **{preset_name}**")
+
+    def _reset_defaults_ui():
+        cfg = _default_ui_config()
+        vals = _ui_config_to_values(cfg)
+        return (*vals, "✅ Reset to defaults")
+
+    def _delete_preset_ui(preset_name: str):
+        if not preset_name:
+            return gr.update(), "⚠️ No preset selected"
+        ok = _delete_ui_preset(preset_name)
+        presets = _list_ui_presets()
+        if ok:
+            return gr.update(choices=presets, value=""), f"✅ Deleted preset **{preset_name}**"
+        return gr.update(choices=presets), f"⚠️ Could not delete preset **{preset_name}**"
+
+    ui_preset_save_btn.click(
+        fn=_save_preset_ui,
+        inputs=[ui_preset_name] + _CONFIG_COMPONENTS,
+        outputs=[ui_preset_dropdown, ui_preset_status],
+        queue=False,
+        show_progress="hidden",
+    )
+    ui_preset_load_btn.click(
+        fn=_load_preset_ui,
+        inputs=[ui_preset_dropdown],
+        outputs=_CONFIG_COMPONENTS + [ui_preset_status],
+        queue=False,
+        show_progress="hidden",
+    )
+    ui_preset_dropdown.change(
+        fn=_load_preset_ui,
+        inputs=[ui_preset_dropdown],
+        outputs=_CONFIG_COMPONENTS + [ui_preset_status],
+        queue=False,
+        show_progress="hidden",
+    )
+    ui_preset_reset_btn.click(
+        fn=_reset_defaults_ui,
+        inputs=[],
+        outputs=_CONFIG_COMPONENTS + [ui_preset_status],
+        queue=False,
+        show_progress="hidden",
+    )
+    ui_preset_delete_btn.click(
+        fn=_delete_preset_ui,
+        inputs=[ui_preset_dropdown],
+        outputs=[ui_preset_dropdown, ui_preset_status],
+        queue=False,
+        show_progress="hidden",
+    )
+
 
 if __name__ == "__main__":
     os.makedirs(TMP_DIR, exist_ok=True)
     os.makedirs(MODELS_DIR, exist_ok=True)
     os.makedirs(OUTPUTS_DIR, exist_ok=True)
+    os.makedirs(PRESETS_DIR, exist_ok=True)
     demo.queue()
-    demo.launch(server_name="0.0.0.0", server_port=7860)
 
 
