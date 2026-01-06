@@ -183,6 +183,7 @@ def stage_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
     image_path = Path(payload["image_path"])
     resolution = str(payload["resolution"])
     pipeline_type = _pipeline_type_from_resolution(resolution)
+    force_high_res_conditional = payload.get("force_high_res_conditional", False)
 
     cond_512_path = Path(payload["cond_512_path"])
     cond_1024_path = Path(payload["cond_1024_path"]) if payload.get("cond_1024_path") else None
@@ -198,8 +199,10 @@ def stage_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     pipe.cuda()
 
-    print("[cond] computing image embeddings (512px)…", flush=True)
-    cond_512 = pipe.get_cond([img], 512)
+    # Use 1024 resolution for sparse structure conditioning if force_high_res_conditional is enabled
+    cond_512_res = 1024 if force_high_res_conditional else 512
+    print(f"[cond] computing image embeddings ({cond_512_res}px for sparse structure)…", flush=True)
+    cond_512 = pipe.get_cond([img], cond_512_res)
     _save_cond(cond_512_path, cond_512)
     print(f"[cond] saved: {cond_512_path}", flush=True)
 

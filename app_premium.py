@@ -487,6 +487,7 @@ def _default_ui_config() -> dict:
             "ss_guidance_interval_end": 1.0,
             "ss_sampling_steps": 12,
             "ss_rescale_t": 5.0,
+            "force_high_res_conditional": False,
             "shape_slat_guidance_strength": 7.5,
             "shape_slat_guidance_rescale": 0.5,
             "shape_slat_guidance_interval_start": 0.6,
@@ -1119,6 +1120,7 @@ def batch_process_folder(
     ss_guidance_interval_end: float,
     ss_sampling_steps: int,
     ss_rescale_t: float,
+    force_high_res_conditional: bool,
     shape_slat_guidance_strength: float,
     shape_slat_guidance_rescale: float,
     shape_slat_guidance_interval_start: float,
@@ -1279,6 +1281,7 @@ def batch_process_folder(
                     ss_guidance_interval_end,
                     ss_sampling_steps,
                     ss_rescale_t,
+                    force_high_res_conditional,
                     shape_slat_guidance_strength,
                     shape_slat_guidance_rescale,
                     shape_slat_guidance_interval_start,
@@ -1586,6 +1589,7 @@ def image_to_3d(
     ss_guidance_interval_end: float,
     ss_sampling_steps: int,
     ss_rescale_t: float,
+    force_high_res_conditional: bool,
     shape_slat_guidance_strength: float,
     shape_slat_guidance_rescale: float,
     shape_slat_guidance_interval_start: float,
@@ -1677,6 +1681,7 @@ def image_to_3d(
                 "pipeline_type": pipeline_type,
                 "no_texture_gen": bool(no_texture_gen),
                 "max_num_tokens": int(max_num_tokens),
+                "force_high_res_conditional": bool(force_high_res_conditional),
                 "ss_params": {
                     "steps": int(ss_sampling_steps),
                     "guidance_strength": float(ss_guidance_strength),
@@ -1755,6 +1760,7 @@ def image_to_3d(
             "resolution": resolution,
             "cond_512_path": str(cond_512_path),
             "cond_1024_path": str(cond_1024_path) if cond_1024_path is not None else None,
+            "force_high_res_conditional": bool(force_high_res_conditional),
         }
         try:
             cond_result = yield from _stage("encode_cond", cond_payload, 0.08)
@@ -1768,6 +1774,7 @@ def image_to_3d(
             "resolution": resolution,
             "cond_512_path": str(cond_512_path),
             "coords_path": str(coords_path),
+            "force_high_res_conditional": bool(force_high_res_conditional),
             "ss_params": {
                 "steps": int(ss_sampling_steps),
                 "guidance_strength": float(ss_guidance_strength),
@@ -2833,6 +2840,12 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                     ss_guidance_interval_end = gr.Slider(
                                         0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01
                                     )
+                                with gr.Row():
+                                    force_high_res_conditional = gr.Checkbox(
+                                        label="Force High-Res Conditioning",
+                                        value=False,
+                                        info="Use 1024 resolution for sparse structure conditioning instead of 512. May improve stability but increases VRAM usage."
+                                    )
 
                                 gr.Markdown("Stage 2: Shape Generation")
                                 with gr.Row():
@@ -2938,6 +2951,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     ss_guidance_interval_end,
                     ss_sampling_steps,
                     ss_rescale_t,
+                    force_high_res_conditional,
                     shape_slat_guidance_strength,
                     shape_slat_guidance_rescale,
                     shape_slat_guidance_interval_start,
@@ -3137,6 +3151,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     ss_guidance_interval_end,
                     ss_sampling_steps,
                     ss_rescale_t,
+                    force_high_res_conditional,
                     shape_slat_guidance_strength,
                     shape_slat_guidance_rescale,
                     shape_slat_guidance_interval_start,
@@ -3639,6 +3654,7 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         ("image_to_3d", "ss_guidance_interval_end"),
         ("image_to_3d", "ss_sampling_steps"),
         ("image_to_3d", "ss_rescale_t"),
+        ("image_to_3d", "force_high_res_conditional"),
         ("image_to_3d", "shape_slat_guidance_strength"),
         ("image_to_3d", "shape_slat_guidance_rescale"),
         ("image_to_3d", "shape_slat_guidance_interval_start"),
@@ -3682,6 +3698,7 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         ss_guidance_interval_end,
         ss_sampling_steps,
         ss_rescale_t,
+        force_high_res_conditional,
         shape_slat_guidance_strength,
         shape_slat_guidance_rescale,
         shape_slat_guidance_interval_start,
