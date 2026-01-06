@@ -22,6 +22,7 @@ var/
 wheels/
 share/python-wheels/
 *.egg-info/
+org_trellis/
 .installed.cfg
 *.egg
 MANIFEST

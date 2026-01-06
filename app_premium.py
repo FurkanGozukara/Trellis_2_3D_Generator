@@ -3,13 +3,15 @@ import gradio as gr
 import argparse
 import os
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import sys
 import subprocess
+import signal
 import importlib
 import json
 import time
+import threading
 from pathlib import Path
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -147,7 +149,9 @@ css = """
     position: relative;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     width: 100%;
-    height: 722px;
+    /* Bigger main preview while staying responsive */
+    height: min(820px, 72vh);
+    min-height: 680px;
     margin: 0 auto;
     padding: 20px;
     display: flex;
@@ -277,6 +281,25 @@ css = """
 
 /* Remove padding around the HTML preview block */
 .gradio-container .padded:has(.previewer-container) { padding: 0 !important; }
+
+/* ---------------------------- Preview Progress Overlay --------------------- */
+/* Replaces the old left-side Progress panel: keep progress on top of the preview. */
+#preview_stack { position: relative; }
+#preview_status_overlay {
+    position: absolute;
+    left: 12px;
+    top: 12px;
+    width: min(560px, 48%);
+    z-index: 50;
+}
+#preview_status_overlay textarea {
+    background: rgba(0, 0, 0, 0.66) !important;
+    color: #fff !important;
+    border: 1px solid rgba(255, 255, 255, 0.18) !important;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
+    font-size: 12px !important;
+    line-height: 1.25 !important;
+}
 
 /* ----------------------------- Model3D Fullscreen -------------------------- */
 /* Gradio's Model3D root uses data-testid="model3d" (see gradio/js/model3D/shared/Model3D.svelte) */
@@ -556,6 +579,37 @@ def _append_status(current: str, msg: str) -> str:
     return current + "\n" + msg
 
 
+# Keep streamed UI logs bounded so Gradio + the browser never get overwhelmed.
+_UI_STATUS_MAX_LINES = 200
+_UI_STATUS_MAX_CHARS = 20000
+
+
+def _trim_status(
+    status: str,
+    *,
+    max_lines: int = _UI_STATUS_MAX_LINES,
+    max_chars: int = _UI_STATUS_MAX_CHARS,
+) -> str:
+    status = status or ""
+    if not status:
+        return status
+
+    # Char-bound first (avoid huge splitlines() cost if something goes wild).
+    if max_chars and len(status) > max_chars * 2:
+        status = status[-max_chars * 2 :]
+
+    if max_lines:
+        lines = status.splitlines()
+        if len(lines) > max_lines:
+            lines = ["… (truncated) …"] + lines[-max_lines:]
+            status = "\n".join(lines)
+
+    if max_chars and len(status) > max_chars:
+        status = "… (truncated) …\n" + status[-max_chars:]
+
+    return status
+
+
 def _open_folder(path: str) -> None:
     path = os.path.abspath(path)
     if os.name == "nt":
@@ -574,7 +628,7 @@ def _open_folder(path: str) -> None:
     raise FileNotFoundError("No folder opener found (tried: xdg-open, gio).")
 
 
-def _iter_subprocess_stage(stage: str, payload: dict, work_dir: Path, log_path: Path):
+def _iter_subprocess_stage(stage: str, payload: dict, work_dir: Path, log_path: Path, *, session: str):
     """
     Run one stage in a fresh Python subprocess and stream its stdout.
     Yields dict events:
@@ -603,6 +657,12 @@ def _iter_subprocess_stage(stage: str, payload: dict, work_dir: Path, log_path: 
     env = dict(os.environ)
     env.setdefault("PYTHONIOENCODING", "utf-8")
 
+    popen_kwargs: Dict[str, Any] = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+
     proc = subprocess.Popen(
         cmd,
         cwd=APP_DIR,
@@ -612,7 +672,9 @@ def _iter_subprocess_stage(stage: str, payload: dict, work_dir: Path, log_path: 
         text=True,
         encoding="utf-8",
         errors="replace",
+        **popen_kwargs,
     )
+    _register_active_subproc(session, proc, stage)
 
     try:
         # Stream output to both UI and a per-run log file.
@@ -623,6 +685,7 @@ def _iter_subprocess_stage(stage: str, payload: dict, work_dir: Path, log_path: 
                 lf.flush()
                 yield {"type": "log", "text": line.rstrip("\n")}
     finally:
+        _unregister_active_subproc(session, proc)
         # If the Gradio request is cancelled, this generator can be closed mid-stream.
         # Ensure we don't leave any worker subprocess running.
         if proc.poll() is None:
@@ -638,11 +701,16 @@ def _iter_subprocess_stage(stage: str, payload: dict, work_dir: Path, log_path: 
 
     rc = proc.wait()
     if not result_path.exists():
+        # If a user cancellation killed the worker, treat it as a clean cancel instead of an error.
+        if _is_cancel_all(session):
+            raise UserCancelled(f"Cancelled during stage {stage!r}.")
         raise RuntimeError(f"Stage {stage!r} failed (rc={rc}) and produced no result file.")
 
     data = json.loads(result_path.read_text(encoding="utf-8"))
     if not data.get("ok", False):
         tb = data.get("traceback") or ""
+        if _is_cancel_all(session):
+            raise UserCancelled(f"Cancelled during stage {stage!r}.")
         raise RuntimeError(f"Stage {stage!r} failed: {data.get('error_type')}: {data.get('error')}\n{tb}")
 
     yield {"type": "result", "result": data.get("result", {})}
@@ -703,11 +771,206 @@ def get_texturing_pipeline():
 def start_session(req: gr.Request):
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
     os.makedirs(user_dir, exist_ok=True)
+    # Defensive: clear any stale flags if a session is re-used.
+    session = _session_key(req)
+    _clear_cancel_all(session)
+    _clear_cancel_batch(session)
 
 
 def end_session(req: gr.Request):
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
+    session = _session_key(req)
+    # Best-effort cleanup so we don't keep stale state around.
+    proc, _stage = _get_active_subproc(session)
+    if proc is not None:
+        _terminate_process(proc)
+    with _CANCEL_LOCK:
+        _RUNNING_TASKS.pop(session, None)
+        _CANCEL_ALL.pop(session, None)
+        _CANCEL_BATCH.pop(session, None)
+        _ACTIVE_SUBPROCS.pop(session, None)
+        _ACTIVE_SUBPROCS_STAGE.pop(session, None)
     shutil.rmtree(user_dir, ignore_errors=True)
+
+
+# ------------------------------- Cancellation -------------------------------
+
+class UserCancelled(RuntimeError):
+    """Raised when a user explicitly cancels a running operation."""
+
+
+_CANCEL_LOCK = threading.Lock()
+
+# Per-session running tasks (used to avoid "sticky" cancels when nothing is running).
+_RUNNING_TASKS: Dict[str, set[str]] = {}
+
+# Per-session cancellation flags.
+_CANCEL_ALL: Dict[str, threading.Event] = {}
+_CANCEL_BATCH: Dict[str, threading.Event] = {}
+
+# Per-session active subprocess (subprocess-mode stages).
+_ACTIVE_SUBPROCS: Dict[str, subprocess.Popen] = {}
+_ACTIVE_SUBPROCS_STAGE: Dict[str, str] = {}
+
+
+def _session_key(req: gr.Request) -> str:
+    return str(req.session_hash)
+
+
+def _get_or_create_event(store: Dict[str, threading.Event], session: str) -> threading.Event:
+    with _CANCEL_LOCK:
+        ev = store.get(session)
+        if ev is None:
+            ev = threading.Event()
+            store[session] = ev
+        return ev
+
+
+def _is_cancel_all(session: str) -> bool:
+    return _get_or_create_event(_CANCEL_ALL, session).is_set()
+
+
+def _is_cancel_batch(session: str) -> bool:
+    return _get_or_create_event(_CANCEL_BATCH, session).is_set()
+
+
+def _request_cancel_all(session: str) -> None:
+    _get_or_create_event(_CANCEL_ALL, session).set()
+
+
+def _request_cancel_batch(session: str) -> None:
+    _get_or_create_event(_CANCEL_BATCH, session).set()
+
+
+def _clear_cancel_all(session: str) -> None:
+    with _CANCEL_LOCK:
+        ev = _CANCEL_ALL.get(session)
+        if ev is not None:
+            ev.clear()
+
+
+def _clear_cancel_batch(session: str) -> None:
+    with _CANCEL_LOCK:
+        ev = _CANCEL_BATCH.get(session)
+        if ev is not None:
+            ev.clear()
+
+
+def _mark_task_running(session: str, task: str, running: bool) -> None:
+    with _CANCEL_LOCK:
+        tasks = _RUNNING_TASKS.get(session)
+        if tasks is None:
+            tasks = set()
+            _RUNNING_TASKS[session] = tasks
+        if running:
+            tasks.add(task)
+        else:
+            tasks.discard(task)
+        if not tasks:
+            _RUNNING_TASKS.pop(session, None)
+
+
+def _is_any_task_running(session: str) -> bool:
+    with _CANCEL_LOCK:
+        return bool(_RUNNING_TASKS.get(session))
+
+
+def _is_task_running(session: str, task: str) -> bool:
+    with _CANCEL_LOCK:
+        tasks = _RUNNING_TASKS.get(session)
+        return bool(tasks and task in tasks)
+
+
+def _register_active_subproc(session: str, proc: subprocess.Popen, stage: str) -> None:
+    with _CANCEL_LOCK:
+        _ACTIVE_SUBPROCS[session] = proc
+        _ACTIVE_SUBPROCS_STAGE[session] = stage
+
+
+def _unregister_active_subproc(session: str, proc: subprocess.Popen) -> None:
+    with _CANCEL_LOCK:
+        cur = _ACTIVE_SUBPROCS.get(session)
+        if cur is proc:
+            _ACTIVE_SUBPROCS.pop(session, None)
+            _ACTIVE_SUBPROCS_STAGE.pop(session, None)
+
+
+def _get_active_subproc(session: str) -> Tuple[Optional[subprocess.Popen], Optional[str]]:
+    with _CANCEL_LOCK:
+        return _ACTIVE_SUBPROCS.get(session), _ACTIVE_SUBPROCS_STAGE.get(session)
+
+
+def _terminate_process(proc: subprocess.Popen) -> None:
+    """
+    Best-effort termination of a subprocess stage worker.
+    - On POSIX: we start each worker in its own session and kill its process group.
+    - On Windows: we terminate/kill the process (child processes are uncommon here).
+    """
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        return
+
+    # First try graceful termination.
+    try:
+        if os.name == "nt":
+            proc.terminate()
+        else:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except Exception:
+                proc.terminate()
+        proc.wait(timeout=3)
+    except Exception:
+        pass
+
+    # Escalate to hard kill.
+    try:
+        if proc.poll() is None:
+            if os.name == "nt":
+                proc.kill()
+            else:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except Exception:
+                    proc.kill()
+            proc.wait(timeout=3)
+    except Exception:
+        pass
+
+
+def _cancel_now(session: str, *, scope: str) -> str:
+    """
+    Trigger cancellation for this session.
+    scope:
+      - "batch": only batch runs should stop
+      - "all": stop everything (and kill any active subprocess stage)
+    Returns a human-friendly description of what was cancelled.
+    """
+    if scope not in {"batch", "all"}:
+        scope = "batch"
+
+    if scope == "batch":
+        if not _is_task_running(session, "batch"):
+            return "Nothing to cancel (batch is not running)."
+        _request_cancel_batch(session)
+        return "Cancel requested: batch processing."
+
+    # scope == "all"
+    _request_cancel_all(session)
+    _request_cancel_batch(session)
+
+    proc, stage = _get_active_subproc(session)
+    if proc is None and not _is_task_running(session, "batch"):
+        # Avoid "sticky" cancels that would affect the next run.
+        _clear_cancel_all(session)
+        _clear_cancel_batch(session)
+        return "Nothing to cancel (no active subprocess stage detected)."
+    if proc is not None:
+        _terminate_process(proc)
+        return f"Cancel requested: all processing (killed active subprocess stage: {stage or 'unknown'})."
+    return "Cancel requested: all processing."
 
 
 # ------------------------------- State Packing ------------------------------
@@ -869,181 +1132,219 @@ def batch_process_folder(
         yield "Batch Processing is disabled."
         return
 
-    in_dir = _resolve_user_path(input_folder, base_dir=APP_DIR)
-    if in_dir is None:
-        raise gr.Error("Batch Input Folder is required.")
-    out_root = _resolve_user_path(output_folder, base_dir=APP_DIR) or Path(OUTPUTS_DIR)
+    session = _session_key(req)
+    _mark_task_running(session, "batch", True)
+    try:
+        def _should_cancel() -> bool:
+            return _is_cancel_all(session) or _is_cancel_batch(session)
 
-    files = _list_images_in_folder(in_dir)
-    if not files:
-        raise gr.Error(f"No supported images found in: {in_dir}\nSupported: {', '.join(sorted(_BATCH_IMAGE_EXTS))}")
+        in_dir = _resolve_user_path(input_folder, base_dir=APP_DIR)
+        if in_dir is None:
+            raise gr.Error("Batch Input Folder is required.")
+        out_root = _resolve_user_path(output_folder, base_dir=APP_DIR) or Path(OUTPUTS_DIR)
 
-    out_root.mkdir(parents=True, exist_ok=True)
+        files = _list_images_in_folder(in_dir)
+        if not files:
+            raise gr.Error(f"No supported images found in: {in_dir}\nSupported: {', '.join(sorted(_BATCH_IMAGE_EXTS))}")
 
-    log_lines: List[str] = []
-    current_desc: str = ""
-    last_yield = 0.0
-    started = time.time()
-    processed = 0
-    skipped = 0
-    failed = 0
-    total = len(files)
+        out_root.mkdir(parents=True, exist_ok=True)
 
-    def _append(line: str) -> None:
-        nonlocal log_lines
-        ts = datetime.now().strftime("%H:%M:%S")
-        log_lines.append(f"[{ts}] {line}")
-        # Keep UI responsive (avoid giant payloads)
-        if len(log_lines) > 400:
-            log_lines = log_lines[-350:]
+        log_lines: List[str] = []
+        current_desc: str = ""
+        last_yield = 0.0
+        started = time.time()
+        processed = 0
+        skipped = 0
+        failed = 0
+        total = len(files)
 
-    def _render_status() -> str:
-        done = processed + skipped + failed
-        elapsed = time.time() - started
-        remaining = max(0, total - done)
-        avg = (elapsed / done) if done > 0 else None
-        eta = (avg * remaining) if avg is not None else None
-        summary = (
-            f"Batch: {done}/{total} done | processed={processed}, skipped={skipped}, failed={failed} | "
-            f"elapsed={_format_eta(elapsed)} | ETA={_format_eta(eta)}"
-        )
-        lines = [summary] + log_lines
-        if current_desc:
-            lines.append(f"Current: {current_desc}")
-        return "\n".join(lines[-420:])
+        def _append(line: str) -> None:
+            nonlocal log_lines
+            ts = datetime.now().strftime("%H:%M:%S")
+            log_lines.append(f"[{ts}] {line}")
+            # Keep UI responsive (avoid giant payloads)
+            if len(log_lines) > 400:
+                log_lines = log_lines[-350:]
 
-    def _maybe_yield(force: bool = False):
-        nonlocal last_yield
-        now = time.time()
-        if force or (now - last_yield) > 0.7:
-            last_yield = now
-            return _render_status()
-        return None
+        def _render_status() -> str:
+            done = processed + skipped + failed
+            elapsed = time.time() - started
+            remaining = max(0, total - done)
+            avg = (elapsed / done) if done > 0 else None
+            eta = (avg * remaining) if avg is not None else None
+            summary = (
+                f"Batch: {done}/{total} done | processed={processed}, skipped={skipped}, failed={failed} | "
+                f"elapsed={_format_eta(elapsed)} | ETA={_format_eta(eta)}"
+            )
+            lines = [summary] + log_lines
+            if current_desc:
+                lines.append(f"Current: {current_desc}")
+            return "\n".join(lines[-420:])
 
-    _append(f"Input folder: {in_dir}")
-    _append(f"Output folder: {out_root}")
-    _append(f"Found {total} image(s). Starting…")
-    progress(0.0, desc="Batch starting…")
-    yield _render_status()
+        def _maybe_yield(force: bool = False):
+            nonlocal last_yield
+            now = time.time()
+            if force or (now - last_yield) > 0.7:
+                last_yield = now
+                return _render_status()
+            return None
 
-    for i, img_path in enumerate(files, start=1):
-        name = _sanitize_folder_name(img_path.stem)
-        target_dir = out_root / name
+        _append(f"Input folder: {in_dir}")
+        _append(f"Output folder: {out_root}")
+        _append(f"Found {total} image(s). Starting…")
+        progress(0.0, desc="Batch starting…")
+        yield _render_status()
 
-        # Update desc shown in the Gradio progress UI
-        current_desc = f"[{i}/{total}] {img_path.name}"
-        progress((i - 1) / total, desc=current_desc)
+        if _should_cancel():
+            _append("CANCELLED by user. Stopping batch.")
+            progress(1.0, desc="Batch cancelled.")
+            yield _render_status()
+            return
 
-        if target_dir.exists():
-            skipped += 1
-            _append(f"SKIP [{i}/{total}] {img_path.name} → {target_dir} (already exists)")
+        for i, img_path in enumerate(files, start=1):
+            if _should_cancel():
+                _append("CANCELLED by user. Stopping batch.")
+                progress(1.0, desc="Batch cancelled.")
+                yield _render_status()
+                return
+
+            name = _sanitize_folder_name(img_path.stem)
+            target_dir = out_root / name
+
+            # Update desc shown in the Gradio progress UI
+            current_desc = f"[{i}/{total}] {img_path.name}"
+            progress((i - 1) / total, desc=current_desc)
+
+            if target_dir.exists():
+                skipped += 1
+                _append(f"SKIP [{i}/{total}] {img_path.name} → {target_dir} (already exists)")
+                maybe = _maybe_yield(force=True)
+                if maybe is not None:
+                    yield maybe
+                continue
+
+            run_seed = get_seed(randomize_seed, int(seed))
+            _append(f"RUN  [{i}/{total}] {img_path.name} (seed={run_seed})")
             maybe = _maybe_yield(force=True)
             if maybe is not None:
                 yield maybe
-            continue
 
-        run_seed = get_seed(randomize_seed, int(seed))
-        _append(f"RUN  [{i}/{total}] {img_path.name} (seed={run_seed})")
-        maybe = _maybe_yield(force=True)
-        if maybe is not None:
-            yield maybe
+            # Scale inner per-image progress into overall batch progress
+            base = (i - 1) / total
+            span = 1.0 / total
 
-        # Scale inner per-image progress into overall batch progress
-        base = (i - 1) / total
-        span = 1.0 / total
+            def _scaled_progress(p: float, desc: Optional[str] = None):
+                nonlocal current_desc
+                if desc:
+                    current_desc = str(desc)
+                try:
+                    pp = float(p)
+                except Exception:
+                    pp = 0.0
+                pp = max(0.0, min(1.0, pp))
+                progress(base + pp * span, desc=current_desc)
 
-        def _scaled_progress(p: float, desc: Optional[str] = None):
-            nonlocal current_desc
-            if desc:
-                current_desc = str(desc)
+            # --- Run generate + extract using the same pipeline functions (no duplicated logic) ---
             try:
-                pp = float(p)
-            except Exception:
-                pp = 0.0
-            pp = max(0.0, min(1.0, pp))
-            progress(base + pp * span, desc=current_desc)
+                with Image.open(str(img_path)) as im:
+                    pil_img = im.convert("RGBA").copy()
 
-        # --- Run generate + extract using the same pipeline functions (no duplicated logic) ---
-        try:
-            with Image.open(str(img_path)) as im:
-                pil_img = im.convert("RGBA").copy()
+                state: Optional[dict] = None
+                for s, _html, _st in image_to_3d(
+                    pil_img,
+                    int(run_seed),
+                    resolution,
+                    ss_guidance_strength,
+                    ss_guidance_rescale,
+                    ss_guidance_interval_start,
+                    ss_guidance_interval_end,
+                    ss_sampling_steps,
+                    ss_rescale_t,
+                    shape_slat_guidance_strength,
+                    shape_slat_guidance_rescale,
+                    shape_slat_guidance_interval_start,
+                    shape_slat_guidance_interval_end,
+                    shape_slat_sampling_steps,
+                    shape_slat_rescale_t,
+                    tex_slat_guidance_strength,
+                    tex_slat_guidance_rescale,
+                    tex_slat_guidance_interval_start,
+                    tex_slat_guidance_interval_end,
+                    tex_slat_sampling_steps,
+                    tex_slat_rescale_t,
+                    no_texture_gen,
+                    max_num_tokens,
+                    subprocess_mode,
+                    req=req,
+                    progress=_scaled_progress,
+                ):
+                    if s is not None:
+                        state = s
+                    maybe = _maybe_yield()
+                    if maybe is not None:
+                        yield maybe
+                    if _should_cancel():
+                        _append("CANCELLED by user. Stopping batch.")
+                        progress(1.0, desc="Batch cancelled.")
+                        yield _render_status()
+                        return
 
-            state: Optional[dict] = None
-            for s, _html, _st in image_to_3d(
-                pil_img,
-                int(run_seed),
-                resolution,
-                ss_guidance_strength,
-                ss_guidance_rescale,
-                ss_guidance_interval_start,
-                ss_guidance_interval_end,
-                ss_sampling_steps,
-                ss_rescale_t,
-                shape_slat_guidance_strength,
-                shape_slat_guidance_rescale,
-                shape_slat_guidance_interval_start,
-                shape_slat_guidance_interval_end,
-                shape_slat_sampling_steps,
-                shape_slat_rescale_t,
-                tex_slat_guidance_strength,
-                tex_slat_guidance_rescale,
-                tex_slat_guidance_interval_start,
-                tex_slat_guidance_interval_end,
-                tex_slat_sampling_steps,
-                tex_slat_rescale_t,
-                no_texture_gen,
-                max_num_tokens,
-                subprocess_mode,
-                req=req,
-                progress=_scaled_progress,
-            ):
-                if s is not None:
-                    state = s
-                maybe = _maybe_yield()
-                if maybe is not None:
-                    yield maybe
+                if not state or not isinstance(state, dict) or not state.get("_run_dir"):
+                    raise gr.Error("Generation returned no valid state. See console/logs.")
 
-            if not state or not isinstance(state, dict) or not state.get("_run_dir"):
-                raise gr.Error("Generation returned no valid state. See console/logs.")
+                glb_path: Optional[str] = None
+                for gp, _dl, _st in extract_glb(
+                    state,
+                    int(decimation_target),
+                    int(texture_size),
+                    str(remesh_method),
+                    str(simplify_method),
+                    bool(no_texture_gen),
+                    bool(prune_invisible_faces),
+                    export_formats,
+                    subprocess_mode,
+                    req=req,
+                    progress=_scaled_progress,
+                ):
+                    if gp:
+                        glb_path = gp
+                    maybe = _maybe_yield()
+                    if maybe is not None:
+                        yield maybe
+                    if _should_cancel():
+                        _append("CANCELLED by user. Stopping batch.")
+                        progress(1.0, desc="Batch cancelled.")
+                        yield _render_status()
+                        return
 
-            glb_path: Optional[str] = None
-            for gp, _dl, _st in extract_glb(
-                state,
-                int(decimation_target),
-                int(texture_size),
-                str(remesh_method),
-                str(simplify_method),
-                bool(no_texture_gen),
-                bool(prune_invisible_faces),
-                export_formats,
-                subprocess_mode,
-                req=req,
-                progress=_scaled_progress,
-            ):
-                if gp:
-                    glb_path = gp
-                maybe = _maybe_yield()
-                if maybe is not None:
-                    yield maybe
+                run_dir = Path(str(state.get("_run_dir")))
+                _move_run_dir(run_dir, target_dir)
+                processed += 1
+                _append(f"DONE [{i}/{total}] Saved → {target_dir}")
+                if glb_path:
+                    # Note: glb_path points to the old location; after moving, it's still valid *as a file*, but path string differs.
+                    pass
+                yield _render_status()
+            except UserCancelled:
+                _append("CANCELLED by user. Stopping batch.")
+                progress(1.0, desc="Batch cancelled.")
+                yield _render_status()
+                return
+            except Exception as e:
+                failed += 1
+                _append(f"FAIL [{i}/{total}] {img_path.name}: {type(e).__name__}: {e}")
+                yield _render_status()
+                continue
 
-            run_dir = Path(str(state.get("_run_dir")))
-            _move_run_dir(run_dir, target_dir)
-            processed += 1
-            _append(f"DONE [{i}/{total}] Saved → {target_dir}")
-            if glb_path:
-                # Note: glb_path points to the old location; after moving, it's still valid *as a file*, but path string differs.
-                pass
-            yield _render_status()
-        except Exception as e:
-            failed += 1
-            _append(f"FAIL [{i}/{total}] {img_path.name}: {type(e).__name__}: {e}")
-            yield _render_status()
-            continue
-
-    current_desc = ""
-    progress(1.0, desc="Batch complete.")
-    _append("Batch complete.")
-    yield _render_status()
+        current_desc = ""
+        progress(1.0, desc="Batch complete.")
+        _append("Batch complete.")
+        yield _render_status()
+    finally:
+        _mark_task_running(session, "batch", False)
+        # Clear cancellation flags after the batch run ends so future runs work normally.
+        _clear_cancel_batch(session)
+        _clear_cancel_all(session)
 
 
 def preprocess_image(
@@ -1083,7 +1384,7 @@ def preprocess_image(
     }
 
     last = ""
-    for ev in _iter_subprocess_stage("preprocess_image", payload, work_dir, log_path):
+    for ev in _iter_subprocess_stage("preprocess_image", payload, work_dir, log_path, session=_session_key(req)):
         if ev["type"] == "log":
             last = ev["text"]
             # Keep UI responsive without spamming.
@@ -1286,6 +1587,7 @@ def image_to_3d(
 ) -> Tuple[Optional[dict], str, str]:
     # Stream step-by-step status so users aren't "in the dark" during long runs.
     status = ""
+    session = _session_key(req)
 
     def _log(msg: str, p: Optional[float] = None) -> str:
         nonlocal status
@@ -1390,12 +1692,13 @@ def image_to_3d(
 
             log_path = Path(logs_dir) / f"{stage_name}.log"
             result = None
-            for ev in _iter_subprocess_stage(stage_name, payload, work_dir, log_path):
+            for ev in _iter_subprocess_stage(stage_name, payload, work_dir, log_path, session=_session_key(req)):
                 if ev["type"] == "log":
                     # Append a small subset of logs to the UI box (keeps it readable).
                     line = ev["text"]
                     if line:
                         status = status + "\n" + line
+                        status = _trim_status(status)
                     now = time.time()
                     if now - last_ui_update > 0.6:
                         last_ui_update = now
@@ -1406,13 +1709,25 @@ def image_to_3d(
                 raise gr.Error(f"Stage {stage_name} produced no result.")
             return result
 
+        def _cancelled_exit(msg: str = "CANCELLED by user."):
+            nonlocal status
+            # Make sure the UI gets a final line instead of a stack trace.
+            _log(msg, 0.0)
+            yield None, empty_html, status
+            _clear_cancel_all(session)
+            _clear_cancel_batch(session)
+
         # Stage: preprocess image (writes 01_preprocessed.png)
         preprocess_payload = {
             "model_repo": "microsoft/TRELLIS.2-4B",
             "input_image_path": str(input_path),
             "output_image_path": str(preprocessed_path),
         }
-        _ = yield from _stage("preprocess_image", preprocess_payload, 0.05)
+        try:
+            _ = yield from _stage("preprocess_image", preprocess_payload, 0.05)
+        except UserCancelled:
+            yield from _cancelled_exit()
+            return
 
         # Stage: encode conditioning
         cond_payload = {
@@ -1422,7 +1737,11 @@ def image_to_3d(
             "cond_512_path": str(cond_512_path),
             "cond_1024_path": str(cond_1024_path) if cond_1024_path is not None else None,
         }
-        cond_result = yield from _stage("encode_cond", cond_payload, 0.08)
+        try:
+            cond_result = yield from _stage("encode_cond", cond_payload, 0.08)
+        except UserCancelled:
+            yield from _cancelled_exit()
+            return
 
         # Stage: sparse structure
         sparse_payload = {
@@ -1438,7 +1757,11 @@ def image_to_3d(
                 "rescale_t": float(ss_rescale_t),
             },
         }
-        _ = yield from _stage("sample_sparse_structure", sparse_payload, 0.18)
+        try:
+            _ = yield from _stage("sample_sparse_structure", sparse_payload, 0.18)
+        except UserCancelled:
+            yield from _cancelled_exit()
+            return
 
         # Stage: shape latent
         shape_payload = {
@@ -1458,7 +1781,11 @@ def image_to_3d(
             },
             "max_num_tokens": int(max_num_tokens),
         }
-        shape_result = yield from _stage("sample_shape_slat", shape_payload, 0.40)
+        try:
+            shape_result = yield from _stage("sample_shape_slat", shape_payload, 0.40)
+        except UserCancelled:
+            yield from _cancelled_exit()
+            return
         res = int(shape_result["res"])
 
         # Stage: texture latent (optional)
@@ -1478,7 +1805,11 @@ def image_to_3d(
                     "rescale_t": float(tex_slat_rescale_t),
                 },
             }
-            _ = yield from _stage("sample_tex_slat", tex_payload, 0.58)
+            try:
+                _ = yield from _stage("sample_tex_slat", tex_payload, 0.58)
+            except UserCancelled:
+                yield from _cancelled_exit()
+                return
 
         # Stage: preview render (writes JPEGs + manifest)
         preview_payload = {
@@ -1489,7 +1820,11 @@ def image_to_3d(
             "preview_dir": str(preview_dir),
             "preview_manifest_path": str(preview_manifest_path),
         }
-        _ = yield from _stage("render_preview", preview_payload, 0.82)
+        try:
+            _ = yield from _stage("render_preview", preview_payload, 0.82)
+        except UserCancelled:
+            yield from _cancelled_exit()
+            return
 
         # Build the HTML preview from the saved JPEGs (CPU-only).
         _log("Building preview UI…", 0.96)
@@ -1881,6 +2216,8 @@ def extract_glb(
         # (or right after changing the image / clicking an example).
         raise gr.Error("Nothing to extract yet. Click **Generate** first.")
 
+    session = _session_key(req)
+
     # If the run was generated in subprocess mode (or the checkbox is enabled),
     # do extraction in a short-lived worker process to ensure VRAM goes back to 0.
     if subprocess_mode or (isinstance(state, dict) and state.get("_mode") == "subprocess"):
@@ -1944,17 +2281,25 @@ def extract_glb(
         last_ui_update = 0.0
         log_path = Path(logs_dir) / "extract_glb.log"
         result = None
-        for ev in _iter_subprocess_stage("extract_glb", payload, work_dir, log_path):
-            if ev["type"] == "log":
-                line = ev["text"]
-                if line:
-                    status = status + "\n" + line
-                now = time.time()
-                if now - last_ui_update > 0.6:
-                    last_ui_update = now
-                    yield None, None, status
-            else:
-                result = ev["result"]
+        try:
+            for ev in _iter_subprocess_stage("extract_glb", payload, work_dir, log_path, session=session):
+                if ev["type"] == "log":
+                    line = ev["text"]
+                    if line:
+                        status = status + "\n" + line
+                        status = _trim_status(status)
+                    now = time.time()
+                    if now - last_ui_update > 0.6:
+                        last_ui_update = now
+                        yield None, None, status
+                else:
+                    result = ev["result"]
+        except UserCancelled:
+            _log("CANCELLED by user.", 0.0)
+            yield None, None, status
+            _clear_cancel_all(session)
+            _clear_cancel_batch(session)
+            return
 
         if not result or "glb_path" not in result:
             raise gr.Error("Extraction failed (no GLB path returned). See logs in the run folder.")
@@ -2096,6 +2441,7 @@ def shapeimage_to_tex(
     progress=gr.Progress(track_tqdm=True),
 ) -> Tuple[Optional[str], Optional[str], str]:
     status = ""
+    session = _session_key(req)
 
     def _log(msg: str, p: Optional[float] = None) -> str:
         nonlocal status
@@ -2177,17 +2523,25 @@ def shapeimage_to_tex(
         last_ui_update = 0.0
         log_path = Path(logs_dir) / "texture_generate.log"
         result = None
-        for ev in _iter_subprocess_stage("texture_generate", payload, work_dir, log_path):
-            if ev["type"] == "log":
-                line = ev["text"]
-                if line:
-                    status = status + "\n" + line
-                now = time.time()
-                if now - last_ui_update > 0.6:
-                    last_ui_update = now
-                    yield None, None, status
-            else:
-                result = ev["result"]
+        try:
+            for ev in _iter_subprocess_stage("texture_generate", payload, work_dir, log_path, session=session):
+                if ev["type"] == "log":
+                    line = ev["text"]
+                    if line:
+                        status = status + "\n" + line
+                        status = _trim_status(status)
+                    now = time.time()
+                    if now - last_ui_update > 0.6:
+                        last_ui_update = now
+                        yield None, None, status
+                else:
+                    result = ev["result"]
+        except UserCancelled:
+            _log("CANCELLED by user.", 0.0)
+            yield None, None, status
+            _clear_cancel_all(session)
+            _clear_cancel_batch(session)
+            return
 
         if not result or "glb_path" not in result:
             raise gr.Error("Texturing failed (no GLB path returned). See logs in the run folder.")
@@ -2376,13 +2730,6 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                         label="Auto-save export formats (saved into outputs/<run>/08_extract/)",
                     )
 
-                    status_box = gr.Textbox(
-                        label="Progress",
-                        value="Select an image (upload or example), then click Generate.",
-                        lines=10,
-                        interactive=False,
-                    )
-
                     with gr.Accordion("⚙️ Config Presets (Save / Load)", open=True):
                         gr.Markdown(
                             "Saves/loads **all settings** from **both** tabs (inputs like images/files are not included)."
@@ -2406,14 +2753,29 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                             ui_preset_delete_btn = gr.Button("🗑️ Delete", variant="stop", scale=1)
                         ui_preset_status = gr.Markdown("")
 
-                with gr.Column(scale=2, min_width=520):
+                with gr.Column(scale=3, min_width=680):
                     with gr.Walkthrough(selected=0) as walkthrough:
                         with gr.Step("Preview", id=0):
-                            preview_output = gr.HTML(empty_html, label="3D Asset Preview", show_label=True, container=True)
+                            with gr.Column(elem_id="preview_stack"):
+                                preview_output = gr.HTML(
+                                    empty_html, label="3D Asset Preview", show_label=True, container=True
+                                )
+                                # Progress shown directly on top of the preview (no separate side panel).
+                                status_box = gr.Textbox(
+                                    value="Select an image (upload or example), then click Generate.",
+                                    lines=10,
+                                    interactive=False,
+                                    show_label=False,
+                                    elem_id="preview_status_overlay",
+                                )
                             with gr.Row():
                                 generate_btn = gr.Button("Generate", variant="primary")
                                 extract_btn = gr.Button("Extract GLB", interactive=False)
                                 view_extract_btn = gr.Button("View Extracted", interactive=False)
+                            cancel_confirm_state = gr.State({"armed": False, "armed_at": 0.0, "scope": ""})
+                            with gr.Row():
+                                open_outputs_top_btn = gr.Button("📂 Open outputs folder", variant="secondary")
+                                cancel_processing_btn = gr.Button("🛑 Cancel processing", variant="stop")
                             with gr.Accordion(label="📦 Batch Processing", open=False):
                                 batch_enabled = gr.Checkbox(label="Enable batch processing", value=False)
                                 batch_input_folder = gr.Textbox(
@@ -2569,9 +2931,8 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 lambda: gr.update(interactive=True), outputs=extract_btn
             )
 
+            # Keep users on the Preview step while extracting so progress stays visible on the preview.
             extract_btn.click(
-                lambda: gr.Walkthrough(selected=1), outputs=walkthrough
-            ).then(
                 extract_glb,
                 inputs=[
                     output_buf,
@@ -2586,7 +2947,9 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 ],
                 outputs=[glb_output, download_btn, status_box],
             ).then(
-                lambda: gr.update(interactive=True), outputs=view_extract_btn
+                # Enable "View Extracted" and automatically switch to the Extract step once ready.
+                lambda: (gr.update(interactive=True), gr.Walkthrough(selected=1)),
+                outputs=[view_extract_btn, walkthrough],
             )
 
             # Navigation-only controls (do NOT re-run extraction)
@@ -2628,6 +2991,97 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 fn=_open_outputs_from_image_tab,
                 inputs=[status_box],
                 outputs=[status_box],
+                queue=False,
+                show_progress="hidden",
+            )
+
+            def _open_outputs_from_main_controls(current_status: str, current_batch_status: str) -> Tuple[str, str]:
+                os.makedirs(OUTPUTS_DIR, exist_ok=True)
+                ts = datetime.now().strftime("%H:%M:%S")
+                try:
+                    _open_folder(OUTPUTS_DIR)
+                    msg = f"[{ts}] Opened outputs folder: {safe_relpath(OUTPUTS_DIR, APP_DIR)}"
+                except Exception as e:
+                    msg = f"[{ts}] Could not open outputs folder: {e}"
+                return (
+                    _append_status(current_status, msg),
+                    _append_status(current_batch_status, msg),
+                )
+
+            open_outputs_top_btn.click(
+                fn=_open_outputs_from_main_controls,
+                inputs=[status_box, batch_status_box],
+                outputs=[status_box, batch_status_box],
+                queue=False,
+                show_progress="hidden",
+            )
+
+            def _cancel_processing_click(
+                confirm_state: dict,
+                subprocess_mode: bool,
+                current_status: str,
+                current_batch_status: str,
+                req: gr.Request,
+            ) -> Tuple[dict, Any, str, str]:
+                """
+                Two-step cancel:
+                  - 1st click arms cancellation (no-op)
+                  - 2nd click within a short window triggers cancellation
+
+                Behavior:
+                  - If subprocess_mode is ON: cancels all processing and kills the active subprocess stage.
+                  - If subprocess_mode is OFF: cancels batch processing only.
+                """
+                confirm_state = confirm_state if isinstance(confirm_state, dict) else {}
+                now = time.time()
+                session = _session_key(req)
+                scope = "all" if subprocess_mode else "batch"
+                # If a subprocess stage is currently running, always cancel-all (even if the checkbox is off),
+                # because we *can* terminate it safely.
+                proc, _stage = _get_active_subproc(session)
+                if proc is not None:
+                    scope = "all"
+
+                armed = bool(confirm_state.get("armed", False))
+                armed_at = float(confirm_state.get("armed_at", 0.0) or 0.0)
+                armed_scope = str(confirm_state.get("scope", ""))
+
+                ts = datetime.now().strftime("%H:%M:%S")
+                confirm_window_s = 7.0
+
+                if armed and armed_scope == scope and (now - armed_at) <= confirm_window_s:
+                    msg = _cancel_now(session, scope=scope)
+                    new_state = {"armed": False, "armed_at": 0.0, "scope": ""}
+                    btn_update = gr.update(value="🛑 Cancel processing")
+                    line = f"[{ts}] {msg}"
+                    return (
+                        new_state,
+                        btn_update,
+                        _append_status(current_status, line),
+                        _append_status(current_batch_status, line),
+                    )
+
+                # Arm (no cancellation yet)
+                label = "⚠️ CONFIRM cancel (click again)"
+                if scope == "batch":
+                    hint = (
+                        f"[{ts}] Cancel armed. Click again to confirm (subprocess mode is OFF → batch only)."
+                    )
+                else:
+                    hint = f"[{ts}] Cancel armed. Click again to confirm (this will stop ALL processing)."
+
+                new_state = {"armed": True, "armed_at": now, "scope": scope}
+                return (
+                    new_state,
+                    gr.update(value=label),
+                    _append_status(current_status, hint),
+                    _append_status(current_batch_status, hint),
+                )
+
+            cancel_processing_btn.click(
+                fn=_cancel_processing_click,
+                inputs=[cancel_confirm_state, subprocess_mode, status_box, batch_status_box],
+                outputs=[cancel_confirm_state, cancel_processing_btn, status_box, batch_status_box],
                 queue=False,
                 show_progress="hidden",
             )
@@ -2833,6 +3287,309 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
   }
 }
 """,
+            )
+
+        # ---------------------------- Tab 4: Help / Guide ----------------------------
+        with gr.Tab("📘 Help / Settings Guide"):
+            gr.Markdown(
+                """
+## Quick start (most people)
+
+1. Go to **Image → 3D**.
+2. Upload an image in **Image Prompt** (best: one object, centered, clear silhouette).
+3. Keep defaults, click **Generate**.
+4. When preview is ready, click **Extract GLB**.
+5. Your files are saved into `./outputs/<run_id>/` (for example `./outputs/0007/`).
+
+If you want to stop a run:
+- **Subprocess mode ON**: **Cancel processing** will stop everything and terminate the active worker stage immediately.
+- **Subprocess mode OFF**: **Cancel processing** will stop **batch only** (in-process jobs can’t be force-killed safely).
+
+---
+
+## What the pipeline does (Image → 3D)
+
+The Image → 3D pipeline is intentionally split into stages so progress can be shown and (in subprocess mode) VRAM can be released between stages:
+
+1. **Preprocess image**: background removal + crop/center.  
+   - Goal: give the model a clean, object-focused input.
+2. **Encode conditioning**: compute image embeddings (512px and/or 1024px depending on resolution).
+3. **Stage 1 — Sparse structure**: generate a sparse 3D structure (where the object exists in space).
+4. **Stage 2 — Shape generation**: generate the high-detail geometry latent.
+5. **Stage 3 — Material generation** (optional): generate texture/material latent (basecolor/roughness/metallic/opacity).
+6. **Preview render**: render multi-view snapshots for the UI preview.
+7. **Extract GLB**: convert the latent representation into a mesh and bake textures into a GLB (and optional extra formats).
+
+---
+
+## GLOBAL setting
+
+### Subprocess stage processing (zero leftover VRAM between stages)
+**What it is**: When enabled, each major stage runs in a fresh Python subprocess. This keeps the UI process from “holding onto” VRAM between stages.  
+**When to enable**:
+- Enable if you get CUDA OOM errors, driver resets, or your VRAM stays high after a run.
+- Enable if you run large resolutions (1536/2048) or do batch processing.
+**When to disable**:
+- Disable if you prefer slightly simpler execution and you’re not memory constrained.
+**Important**:
+- With subprocess mode ON, the **Cancel processing** button can immediately terminate the worker stage.
+- With subprocess mode OFF, in-process work can only stop at “safe points” (and we intentionally only cancel batch).
+
+---
+
+## IMAGE → 3D settings (left panel)
+
+### Image Prompt (upload)
+Upload the input image you want to convert to 3D.
+
+**Best practices**:
+- Use a single main object. Avoid busy backgrounds.
+- Center the object and keep it large in the frame.
+- If you have a PNG with transparency, that’s ideal.
+
+**Examples**:
+- Good: a centered product photo on a plain background.
+- Risky: multiple characters, cluttered scenery, tiny object in the distance.
+
+### Resolution
+Choose the target generation quality/speed level. Higher resolutions produce more detail but cost more VRAM/time.
+
+**Options**:
+- **512**: fastest and lightest. Great for quick tests and low‑VRAM GPUs.
+- **1024**: good default balance (recommended starting point).
+- **1536 / 2048**: highest detail, slowest, and most VRAM‑intensive.
+
+**Example decision**:
+- “I want fast previews”: start with **512** or **1024**.
+- “I need maximum detail”: try **1536**, and only use **2048** if your GPU has enough VRAM and you can wait.
+
+### Seed
+Controls randomness. Same inputs + same seed + same settings = very similar output (useful for reproducibility).
+
+**Example**:
+- If you find a good result at seed `12345`, keep that seed to reproduce it later.
+
+### Randomize Seed
+If enabled, a new random seed is used each time you click **Generate** (or for each file in batch).
+
+**Use it when**:
+- You want to explore variations quickly.
+
+**Turn it off when**:
+- You want repeatable results and debugging.
+
+### Decimation Target
+Target triangle/face count for mesh simplification during **Extract GLB**.
+
+**What it changes**:
+- Lower target → smaller file, faster loading, but less geometric detail.
+- Higher target → more detail, larger file, heavier rendering.
+
+**Examples**:
+- Game/real‑time: try `100k–300k`.
+- DCC / offline: try `500k–1M` (default is high quality).
+
+### Remesh Method
+Controls how the surface is reconstructed before export.
+
+**dual_contouring** (default):
+- Fast, robust, works everywhere.
+
+**faithful_contouring** (optional):
+- Can preserve thin/open structures better, but needs extra dependencies (`faithcontour` + `atom3d`).
+- If not installed, the UI hides it or auto-falls back.
+
+### Simplify Method
+Controls which mesh simplifier is used during export.
+
+**cumesh**:
+- GPU‑accelerated (when available), generally fast.
+
+**meshlib**:
+- CPU‑based alternative (requires optional deps), can behave differently on some meshes.
+
+### Prune Invisible Faces
+Attempts to remove faces that are not visible / not contributing (can reduce mesh size).
+
+**Enable when**:
+- You want smaller exports and cleaner geometry.
+
+**Disable when**:
+- You see holes or missing parts after extraction.
+
+### Skip Texture Generation
+If enabled, the model will generate **shape only** and skip material/texture generation.
+
+**Why use it**:
+- Faster generation
+- Lower VRAM/time
+- Useful for clay/geometry workflows
+
+**Trade‑off**:
+- Exported GLB won’t have rich PBR textures.
+
+### Texture Size
+Controls baked texture resolution during extraction (typical values: 1024 / 2048 / 4096).
+
+**Examples**:
+- 1024: lightweight, faster, good for previews.
+- 2048: default sweet spot.
+- 4096: maximum crispness, heavy VRAM/disk.
+
+### Auto‑save export formats
+Select which formats are written under `./outputs/<run_id>/08_extract/`.
+
+**Notes**:
+- `glb` is always produced for the viewer/download.
+- Extra formats (obj/ply/stl/gltf) are best-effort and may fail for some meshes; failures won’t block GLB export.
+
+---
+
+## Preview panel controls (right side)
+
+### Generate
+Runs the **Image → 3D** pipeline and builds the preview.
+
+### Extract GLB
+Converts the generated latents into an exportable mesh + textures (GLB) and saves to `./outputs/<run_id>/08_extract/`.
+
+### View Extracted
+Switches the UI to show the extracted GLB in the 3D viewer (no re‑compute).
+
+### 📂 Open outputs folder
+Opens the `./outputs` folder in your OS file explorer:
+- Windows: File Explorer
+- Linux: default file manager via `xdg-open` / `gio open`
+- macOS: Finder via `open`
+
+### 🛑 Cancel processing (two‑step safety)
+This button uses a **two‑click confirmation** to avoid accidental cancels:
+
+1. First click → arms cancellation (no work is stopped yet).
+2. Second click within a few seconds → performs cancellation.
+
+**Actual cancel behavior**:
+- **If a subprocess stage is running**: cancels everything and terminates the active stage process immediately.
+- **If subprocess mode is OFF and no subprocess stage is running**: cancels **batch processing only**.
+
+---
+
+## Batch Processing (accordion)
+
+### Enable batch processing
+Must be enabled to unlock **Run Batch**.
+
+### Input folder (required)
+Folder that contains images to process.
+
+**Supported extensions**: `.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`, `.tif`, `.tiff`
+
+**Path examples**:
+- Relative (recommended): `./my_images`
+- Windows absolute: `D:\\datasets\\my_images`
+- Linux absolute: `/home/user/my_images`
+
+Tip: If your path contains spaces, you can wrap it in quotes.
+
+### Output folder (optional)
+Where batch results go.
+
+- Leave blank to use `./outputs`
+- Each input image is saved into its own subfolder named after the filename (safe‑sanitized).
+- If a target folder already exists, that file is **skipped** (safe for resume).
+
+### Run Batch
+Processes each image using the **same settings** as a single run (resolution, guidance, extraction options, etc.).
+
+**Seed behavior**:
+- If **Randomize Seed** is ON → each image gets a different seed.
+- If OFF → all images use the same seed (useful if you want consistent style).
+
+---
+
+## Advanced Settings (what “guidance” means)
+
+These parameters control diffusion sampling behavior. Think of them as “how strongly the model follows its conditioning” and “how the sampler behaves over time”.
+
+### Guidance Strength
+Higher values usually enforce the conditioning more strongly (often sharper/more literal), but too high can cause artifacts.
+
+**Example tuning**:
+- Too bland / not matching image: increase slightly (e.g. +0.5).
+- Too many artifacts / distortions: reduce slightly.
+
+### Guidance Rescale
+Helps reduce over-saturation / over-contrast artifacts at higher guidance.
+
+**Rule of thumb**:
+- If you raise guidance strength a lot, consider raising rescale a bit too.
+
+### Guidance Interval Start / End
+Limits guidance to only part of the sampling trajectory (0 → start, 1 → end).
+
+**Examples**:
+- `start=0.6, end=1.0` means “apply stronger guidance mostly later”.
+- Narrower interval can reduce early over-constraint artifacts.
+
+### Sampling Steps
+More steps can improve quality but increases time.
+
+**Examples**:
+- Fast test: 8–12 steps
+- Higher quality: 16–30 steps
+
+### Rescale T
+Sampler stability/temperature-like parameter used by this pipeline. Defaults are generally good.
+
+### Max Number of Tokens
+Mainly relevant for higher resolutions (cascade). It controls internal token budget / compute.
+
+**If you see OOM at high resolution**:
+- Reduce resolution first.
+- Then reduce `max_num_tokens`.
+
+---
+
+## Texturing tab settings
+
+### Upload Mesh
+Upload an existing mesh (`.ply`, `.obj`, `.glb`, `.gltf`) to texture.
+
+**Tip**: If you upload a scene file with multiple meshes, the app tries to convert it to a single mesh.
+
+### Reference Image
+Image that guides the texture appearance (color/material cues).
+
+### Resolution (Texturing)
+Controls which internal model path is used. Higher = more detail, more cost.
+
+### Seed / Randomize Seed
+Same meaning as Image → 3D: controls randomness and reproducibility.
+
+### Texture Size (Texturing)
+Baked texture resolution for the textured output GLB.
+
+### Texturing Advanced Settings
+Same concepts as “guidance” above but applied to texture generation.
+
+---
+
+## View 3D Files tab
+
+Upload a 3D file to preview it locally. This does not run the ML pipeline.
+
+---
+
+## Config Presets (Save / Load)
+
+Presets save **all settings** from **both tabs**, but do **not** include uploaded images/files.
+
+**Where presets are stored**: `./presets/<name>.json`
+
+**Typical workflow**:
+- Dial in settings you like → Save preset as `my_high_quality`
+- Later → Load preset to restore all sliders/checkboxes instantly
+"""
             )
 
     # ---------------------------- Preset Wiring ----------------------------
