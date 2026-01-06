@@ -291,17 +291,33 @@ css = """
     padding: 12px;
     z-index: 50;
     box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
 }
-#preview_status_overlay .wrap { height: 100%; }
-#preview_status_overlay .wrap > * { height: 100%; }
+#preview_status_overlay > label {
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+}
+#preview_status_overlay > label > .input-container {
+    flex: 1 1 auto;
+    height: 100%;
+    min-height: 0;
+    /* Gradio Textbox uses a row flex container; we need cross-axis stretching for full height */
+    align-items: stretch;
+}
 #preview_status_overlay textarea {
-    background: rgba(0, 0, 0, 0.66) !important;
+    background: rgba(0, 0, 0, 0.78) !important;
     color: #fff !important;
     border: 1px solid rgba(255, 255, 255, 0.18) !important;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
     font-size: 12px !important;
     line-height: 1.25 !important;
     height: 100% !important;
+    min-height: 0 !important;
+    overflow-y: auto !important;
 }
 
 /* ----------------------------- Model3D Fullscreen -------------------------- */
@@ -461,7 +477,7 @@ def _default_ui_config() -> dict:
             "decimation_target": 500000,
             "remesh_method": "dual_contouring",
             "simplify_method": "cumesh",
-            "prune_invisible_faces": True,
+            "prune_invisible_faces": False,
             "no_texture_gen": False,
             "texture_size": 2048,
             "export_formats": ["glb"],
@@ -2728,7 +2744,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                             "(`faithcontour` + `atom3d`). Not detected in this environment, so the option is hidden."
                         )
                     simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method", value="cumesh")
-                    prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces", value=True)
+                    prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces", value=False)
                     no_texture_gen = gr.Checkbox(label="Skip Texture Generation", value=False)
                     texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
                     export_formats = gr.CheckboxGroup(
@@ -2770,9 +2786,11 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 # Progress shown directly on top of the preview (no separate side panel).
                                 status_box = gr.Textbox(
                                     value="Select an image (upload or example), then click Generate.",
-                                    lines=10,
+                                    lines=20,
+                                    max_lines=20,
                                     interactive=False,
                                     show_label=False,
+                                    container=False,
                                     elem_id="preview_status_overlay",
                                 )
                             with gr.Row():
