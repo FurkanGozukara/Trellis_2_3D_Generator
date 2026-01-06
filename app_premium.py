@@ -287,11 +287,13 @@ css = """
 #preview_stack { position: relative; }
 #preview_status_overlay {
     position: absolute;
-    left: 12px;
-    top: 12px;
-    width: min(560px, 48%);
+    inset: 0;
+    padding: 12px;
     z-index: 50;
+    box-sizing: border-box;
 }
+#preview_status_overlay .wrap { height: 100%; }
+#preview_status_overlay .wrap > * { height: 100%; }
 #preview_status_overlay textarea {
     background: rgba(0, 0, 0, 0.66) !important;
     color: #fff !important;
@@ -299,6 +301,7 @@ css = """
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace !important;
     font-size: 12px !important;
     line-height: 1.25 !important;
+    height: 100% !important;
 }
 
 /* ----------------------------- Model3D Fullscreen -------------------------- */
@@ -1618,7 +1621,7 @@ def image_to_3d(
         pass
 
     _log("Starting Image → 3D generation…", 0.0)
-    yield None, empty_html, status
+    yield None, empty_html, gr.update(value=_trim_status(status), visible=True)
 
     if subprocess_mode:
         # Subprocess stage pipeline (zero VRAM kept by the UI process).
@@ -1897,7 +1900,8 @@ def image_to_3d(
             "preview_manifest_path": str(preview_manifest_path),
         }
         _log("Done. You can now click “Extract GLB”.", 1.0)
-        yield state, full_html, status
+        # Hide the overlay once preview is ready so users can see the render.
+        yield state, full_html, gr.update(value=_trim_status(status), visible=False)
         return
 
     _log("Loading TRELLIS.2 pipeline (first run can take a while)…", 0.01)
@@ -2195,7 +2199,8 @@ def image_to_3d(
         pass
 
     _log("Done. You can now click “Extract GLB”.", 1.0)
-    yield state, full_html, status
+    # Hide the overlay once preview is ready so users can see the render.
+    yield state, full_html, gr.update(value=_trim_status(status), visible=False)
 
 
 def extract_glb(
@@ -2247,7 +2252,8 @@ def extract_glb(
         out_dir = run_dir / "08_extract"
 
         _log("Starting GLB extraction (subprocess)…", 0.0)
-        yield None, None, status
+        # Show the overlay while extracting.
+        yield None, None, gr.update(value=_trim_status(status), visible=True)
 
         export_formats = export_formats or ["glb"]
         if "glb" not in export_formats:
@@ -2332,7 +2338,8 @@ def extract_glb(
         return status
 
     _log("Starting GLB extraction…", 0.0)
-    yield None, None, status
+    # Show the overlay while extracting.
+    yield None, None, gr.update(value=_trim_status(status), visible=True)
 
     _log("Loading TRELLIS.2 pipeline…", 0.05)
     pipe = get_image_pipeline()
@@ -2874,7 +2881,10 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     gr.Walkthrough(selected=0),  # walkthrough
                     None,  # glb_output
                     None,  # download_btn
-                    "Select an image (upload or example), then click Generate.",  # status_box
+                    gr.update(
+                        visible=True,
+                        value="Select an image (upload or example), then click Generate.",
+                    ),  # status_box
                 )
 
             # Note: We intentionally do not auto-preprocess on upload/example click.
