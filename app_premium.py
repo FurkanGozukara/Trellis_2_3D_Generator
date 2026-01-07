@@ -2766,21 +2766,21 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 with gr.Column(scale=1, min_width=380):
                     image_prompt = gr.Image(label="Image Prompt", format="png", image_mode="RGBA", type="pil", height=400)
 
-                    resolution = gr.Radio(["512", "1024", "1536", "2048"], label="Resolution", value="1024")
+                    resolution = gr.Radio(["512", "1024", "1536", "2048"], label="Resolution", value="1024", info="Output mesh resolution. Higher = finer detail but more VRAM. 512 uses direct sampling; 1024+ use cascade for quality. ⬆Quality ⬆VRAM")
                     with gr.Row():
-                        seed = gr.Slider(0, MAX_SEED, label="Seed", value=99, step=1, scale=4)
-                        randomize_seed = gr.Checkbox(label="Randomize Seed", value=False, scale=1)
-                    decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000)
-                    remesh_method = gr.Dropdown(REMESH_METHOD_CHOICES, label="Remesh Method", value="dual_contouring")
+                        seed = gr.Slider(0, MAX_SEED, label="Seed", value=99, step=1, scale=4, info="Random seed for reproducibility. Same seed + settings = same output.")
+                        randomize_seed = gr.Checkbox(label="Randomize Seed", value=False, scale=1, info="Generate random seed each run for variety.")
+                    decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000, info="Target polygon count during mesh simplification. Higher = more geometric detail preserved but larger files. ⬆Quality, minimal VRAM impact.")
+                    remesh_method = gr.Dropdown(REMESH_METHOD_CHOICES, label="Remesh Method", value="dual_contouring", info="Mesh reconstruction algorithm. dual_contouring: fast, good quality. faithful_contouring: higher fidelity (requires extra deps).")
                     if "faithful_contouring" not in REMESH_METHOD_CHOICES:
                         gr.Markdown(
                             "**Note:** `faithful_contouring` remeshing requires optional FaithC dependencies "
                             "(`faithcontour` + `atom3d`). Not detected in this environment, so the option is hidden."
                         )
-                    simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method", value="cumesh")
-                    prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces", value=False)
-                    no_texture_gen = gr.Checkbox(label="Skip Texture Generation", value=False)
-                    texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
+                    simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method", value="cumesh", info="Polygon reduction method. cumesh: GPU-accelerated, fast. meshlib: CPU-based alternative. cumesh uses some GPU VRAM.")
+                    prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces", value=False, info="Remove triangles not visible from outside. Reduces polygon count, may affect internal geometry. Slight ⬇VRAM.")
+                    no_texture_gen = gr.Checkbox(label="Skip Texture Generation", value=False, info="Output shape-only mesh without PBR textures. Faster processing, significantly ⬇VRAM usage.")
+                    texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024, info="Resolution of baked texture maps (albedo, normal, etc). Higher = sharper textures. ⬆Quality ⬆VRAM during baking.")
                     export_formats = gr.CheckboxGroup(
                         choices=["glb", "gltf", "obj", "ply", "stl"],
                         value=["glb", "gltf", "obj", "ply", "stl"],
@@ -2856,17 +2856,15 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                             with gr.Accordion(label="Advanced Settings", open=True):
                                 gr.Markdown("Stage 1: Sparse Structure Generation")
                                 with gr.Row():
-                                    ss_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1)
-                                    ss_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.7, step=0.01)
-                                    ss_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
+                                    ss_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1, info="CFG scale - how strongly model follows image. Higher = more faithful but can oversaturate. 7.5 default. Slight ⬆VRAM (2 forward passes).")
+                                    ss_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.7, step=0.01, info="Reduces over-exposure from high CFG by normalizing variance. 0.7 recommended. No VRAM impact.")
+                                    ss_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1, info="Denoising iterations. More = cleaner but slower. 12 is efficient. ⬆Quality, no per-step VRAM increase.")
                                 with gr.Row():
-                                    ss_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=5.0, step=0.1)
+                                    ss_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=5.0, step=0.1, info="Time schedule warping. Higher = more steps on coarse structure. 5.0 default improves structure. No VRAM impact.")
                                     ss_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01
-                                    )
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="Start of CFG application range [0-1]. Outside this range guidance=1. Narrowing saves compute.")
                                     ss_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01
-                                    )
+                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG application range [0-1]. Set to <1.0 to skip guidance on final steps.")
                                 with gr.Row():
                                     force_high_res_conditional = gr.Checkbox(
                                         label="Force High-Res Conditioning",
@@ -2886,38 +2884,33 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
 
                                 gr.Markdown("Stage 2: Shape Generation")
                                 with gr.Row():
-                                    shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1)
-                                    shape_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.5, step=0.01)
-                                    shape_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
+                                    shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1, info="CFG for shape latent. Higher = stronger image adherence. 7.5 default. Slight ⬆VRAM (2 passes).")
+                                    shape_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.5, step=0.01, info="Variance normalization to prevent CFG artifacts. 0.5 recommended. No VRAM impact.")
+                                    shape_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1, info="Denoising steps for shape. More = cleaner geometry. ⬆Quality, no per-step VRAM increase.")
                                 with gr.Row():
-                                    shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1)
+                                    shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1, info="Time warping for shape sampling. 3.0 default balances coarse/fine detail. No VRAM impact.")
                                     shape_slat_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01
-                                    )
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="Start of CFG range for shape. 0.6 skips early noisy steps.")
                                     shape_slat_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01
-                                    )
+                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG range for shape. 1.0 applies guidance through final step.")
                                     max_num_tokens = gr.Slider(
                                         10000, 200000,
                                         label="Max Tokens (VRAM vs Quality)",
                                         value=32768,
                                         step=1000,
-                                        info="Lower = less VRAM, higher = more detail. Reduce if OOM errors occur."
-                                    )
+                                        info="KEY VRAM CONTROL. Max voxel tokens in cascade. Lower = less VRAM but may auto-reduce resolution. 10K min, 32K-50K balanced, 100K+ max fidelity. ⬆Quality ⬆VRAM (linear).")
 
                                 gr.Markdown("Stage 3: Material Generation")
                                 with gr.Row():
-                                    tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1)
-                                    tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.0, step=0.01)
-                                    tex_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
+                                    tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1, info="CFG for texture. Low (1.0) works well since shape provides strong conditioning. Slight ⬆VRAM if >1.")
+                                    tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.0, step=0.01, info="Variance normalization. 0.0 = disabled (not needed at low guidance). No VRAM impact.")
+                                    tex_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1, info="Steps for texture generation. 12 is efficient. ⬆Quality, no per-step VRAM increase.")
                                 with gr.Row():
-                                    tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1)
+                                    tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1, info="Time warping for texture. 3.0 default. No VRAM impact.")
                                     tex_slat_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01
-                                    )
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="Start of CFG range for texture. 0.6 skips early noisy steps.")
                                     tex_slat_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=0.9, step=0.01
-                                    )
+                                        0.0, 1.0, label="Guidance Interval End", value=0.9, step=0.01, info="End of CFG range for texture. 0.9 avoids final step artifacts.")
                         with gr.Step("Extract", id=1):
                             with gr.Row():
                                 back_to_preview_btn = gr.Button("Back to Preview", variant="secondary")
