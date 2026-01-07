@@ -483,7 +483,7 @@ def _default_ui_config() -> dict:
             "export_formats": ["glb"],
             "ss_guidance_strength": 7.5,
             "ss_guidance_rescale": 0.7,
-            "ss_guidance_interval_start": 0.6,
+            "ss_guidance_interval_start": 0.0,
             "ss_guidance_interval_end": 1.0,
             "ss_sampling_steps": 12,
             "ss_rescale_t": 5.0,
@@ -494,15 +494,15 @@ def _default_ui_config() -> dict:
             "extract_use_tiled_extraction": False,
             "shape_slat_guidance_strength": 7.5,
             "shape_slat_guidance_rescale": 0.5,
-            "shape_slat_guidance_interval_start": 0.6,
+            "shape_slat_guidance_interval_start": 0.0,
             "shape_slat_guidance_interval_end": 1.0,
             "shape_slat_sampling_steps": 12,
             "shape_slat_rescale_t": 3.0,
-            "max_num_tokens": 32768,  # Reduced for VRAM safety (was 49152)
+            "max_num_tokens": 49152,  # Restored to original for quality (was 32768)
             "tex_slat_guidance_strength": 1.0,
             "tex_slat_guidance_rescale": 0.0,
-            "tex_slat_guidance_interval_start": 0.6,
-            "tex_slat_guidance_interval_end": 0.9,
+            "tex_slat_guidance_interval_start": 0.0,
+            "tex_slat_guidance_interval_end": 1.0,
             "tex_slat_sampling_steps": 12,
             "tex_slat_rescale_t": 3.0,
         },
@@ -1118,6 +1118,7 @@ def batch_process_folder(
     randomize_seed: bool,
     seed: int,
     resolution: str,
+    custom_resolution: int,
     ss_guidance_strength: float,
     ss_guidance_rescale: float,
     ss_guidance_interval_start: float,
@@ -1281,6 +1282,7 @@ def batch_process_folder(
                     pil_img,
                     int(run_seed),
                     resolution,
+                    custom_resolution,
                     ss_guidance_strength,
                     ss_guidance_rescale,
                     ss_guidance_interval_start,
@@ -1585,10 +1587,46 @@ def _render_preview_snapshots_incremental(
 
 # ------------------------------- Image -> 3D --------------------------------
 
+def _get_pipeline_type(resolution_str: str) -> tuple[str, int]:
+    """
+    Convert resolution string to pipeline type and target resolution.
+    
+    Returns:
+        (pipeline_type, target_resolution)
+        
+    Examples:
+        "512" -> ("512", 512)
+        "768" -> ("768_cascade", 768)
+        "1024" -> ("1024_cascade", 1024)
+        "1280" -> ("1280_cascade", 1280)
+        "1536" -> ("1536_cascade", 1536)
+        "2048" -> ("2048_cascade", 2048)
+    """
+    try:
+        res = int(resolution_str)
+    except (ValueError, TypeError):
+        raise ValueError(f"Resolution must be a number, got: {resolution_str}")
+    
+    if res < 512:
+        raise ValueError(f"Resolution must be >= 512, got: {res}")
+    
+    if res % 128 != 0:
+        raise ValueError(f"Resolution must be divisible by 128, got: {res}")
+    
+    if res == 512:
+        return "512", 512
+    elif res == 1024:
+        return "1024", 1024
+    else:
+        # Any other resolution uses cascade
+        return f"{res}_cascade", res
+
+
 def image_to_3d(
     image: Image.Image,
     seed: int,
     resolution: str,
+    custom_resolution: int,
     ss_guidance_strength: float,
     ss_guidance_rescale: float,
     ss_guidance_interval_start: float,
@@ -1644,6 +1682,17 @@ def image_to_3d(
     if image is None:
         raise gr.Error("Please provide an image (upload or pick an example).")
 
+    # Handle custom resolution override
+    if custom_resolution and custom_resolution > 0:
+        resolution = str(custom_resolution)
+        _log(f"Using custom resolution: {resolution}", 0.0)
+    
+    # Validate and get pipeline type
+    try:
+        pipeline_type, target_res = _get_pipeline_type(resolution)
+    except ValueError as e:
+        raise gr.Error(str(e))
+
     # Allocate an outputs run folder (never overwrites).
     run = allocate_run_dir(OUTPUTS_DIR, digits=4)
     run_dir = run.run_dir
@@ -1660,7 +1709,7 @@ def image_to_3d(
         # Don't fail the run just because saving failed; continue.
         pass
 
-    _log("Starting Image → 3D generation…", 0.0)
+    _log(f"Starting Image → 3D generation (resolution: {resolution}, pipeline: {pipeline_type})…", 0.0)
     yield None, empty_html, gr.update(value=_trim_status(status), visible=True)
 
     if subprocess_mode:
@@ -1670,13 +1719,6 @@ def image_to_3d(
 
         work_dir = Path(TMP_DIR) / str(req.session_hash) / "subprocess" / run_id
         work_dir.mkdir(parents=True, exist_ok=True)
-
-        pipeline_type = {
-            "512": "512",
-            "1024": "1024_cascade",
-            "1536": "1536_cascade",
-            "2048": "2048_cascade",
-        }[resolution]
 
         # Artifact paths (saved under outputs/<run_id>/)
         cond_512_path = run_dir / "02_cond_512.pt"
@@ -2029,13 +2071,6 @@ def image_to_3d(
     _ensure_mode_icons()
     yield None, empty_html, status
 
-    pipeline_type = {
-        "512": "512",
-        "1024": "1024_cascade",
-        "1536": "1536_cascade",
-        "2048": "2048_cascade",
-    }[resolution]
-
     # Persist per-stage artifacts for this run (even in in-process mode).
     cond_512_path = run_dir / "02_cond_512.pt"
     cond_1024_path = (run_dir / "03_cond_1024.pt") if pipeline_type != "512" else None
@@ -2100,7 +2135,8 @@ def image_to_3d(
                 pass
         yield None, empty_html, status
 
-    ss_res = {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32, "2048_cascade": 32}[pipeline_type]
+    # Sparse structure resolution: 32 for most cases, 64 for direct 1024 sampling
+    ss_res = 64 if pipeline_type == "1024" else 32
     _log("Stage 1/3: Sampling sparse structure…", 0.18)
     coords = pipe.sample_sparse_structure(cond_512, ss_res, 1, ss_params)
     try:
@@ -2137,8 +2173,8 @@ def image_to_3d(
             tex_slat = None
             yield None, empty_html, status
         res = 1024
-    elif pipeline_type in {"1024_cascade", "1536_cascade", "2048_cascade"}:
-        target_res = {"1024_cascade": 1024, "1536_cascade": 1536, "2048_cascade": 2048}[pipeline_type]
+    elif "_cascade" in pipeline_type:
+        # Any cascade resolution (768, 1024, 1280, 1536, 2048, custom)
         _log(f"Stage 2/3: Sampling shape latent (cascade → {target_res})…", 0.35)
         shape_slat, res = pipe.sample_shape_slat_cascade(
             cond_512,
@@ -2827,7 +2863,9 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 with gr.Column(scale=1, min_width=380):
                     image_prompt = gr.Image(label="Image Prompt", format="png", image_mode="RGBA", type="pil", height=400)
 
-                    resolution = gr.Radio(["512", "1024", "1536", "2048"], label="Resolution (Generate)", value="1024", info="Output mesh resolution. Higher = finer detail but more VRAM. 512 uses direct sampling; 1024+ use cascade for quality. ⬆Quality ⬆VRAM")
+                    with gr.Row():
+                        resolution = gr.Radio(["512", "768", "1024", "1280", "1536", "2048"], label="Resolution (Generate)", value="1024", info="Output mesh resolution. Higher = finer detail but more VRAM. 512 uses direct sampling; 768+ use cascade for quality. ⬆Quality ⬆VRAM", scale=3)
+                        custom_resolution = gr.Number(label="Custom Resolution", value=0, precision=0, minimum=0, maximum=4096, step=128, info="Set to 0 to use radio selection. Must be ≥512 and divisible by 128. Overrides radio if >0.", scale=1)
                     with gr.Row():
                         seed = gr.Slider(0, MAX_SEED, label="Seed (Generate)", value=99, step=1, scale=4, info="Random seed for reproducibility. Same seed + settings = same output.")
                         randomize_seed = gr.Checkbox(label="Randomize Seed (Generate)", value=False, scale=1, info="Generate random seed each run for variety.")
@@ -2923,9 +2961,9 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 with gr.Row():
                                     ss_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=5.0, step=0.1, info="Time schedule warping. Higher = more steps on coarse structure. 5.0 default improves structure. No VRAM impact.")
                                     ss_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="Start of CFG application range [0-1]. Outside this range guidance=1. Narrowing saves compute.")
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.0, step=0.01, info="Start of CFG application range [0-1]. 0.0 = original quality (full CFG). Higher values skip early steps.")
                                     ss_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG application range [0-1]. Set to <1.0 to skip guidance on final steps.")
+                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG application range [0-1]. 1.0 = original quality (full CFG). Lower values skip final steps.")
                                 with gr.Row():
                                     force_high_res_conditional = gr.Checkbox(
                                         label="Force High-Res Conditioning (Generate)",
@@ -2965,15 +3003,15 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 with gr.Row():
                                     shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1, info="Time warping for shape sampling. 3.0 default balances coarse/fine detail. No VRAM impact.")
                                     shape_slat_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="Start of CFG range for shape. 0.6 skips early noisy steps.")
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.0, step=0.01, info="Start of CFG range for shape. 0.0 = original quality (full CFG). Higher values skip early steps.")
                                     shape_slat_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG range for shape. 1.0 applies guidance through final step.")
+                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG range for shape. 1.0 = original quality (full CFG). Lower values skip final steps.")
                                     max_num_tokens = gr.Slider(
                                         10000, 200000,
                                         label="Max Tokens (Generate - VRAM vs Quality)",
-                                        value=32768,
+                                        value=49152,
                                         step=1000,
-                                        info="KEY VRAM CONTROL. Max voxel tokens in cascade. Lower = less VRAM but may auto-reduce resolution. 10K min, 32K-50K balanced, 100K+ max fidelity. ⬆Quality ⬆VRAM (linear).")
+                                        info="KEY VRAM CONTROL. Max voxel tokens in cascade. 49K = original quality. Lower = less VRAM but may auto-reduce resolution. 10K min, 49K default, 65K+ for 2048. ⬆Quality ⬆VRAM (linear).")
 
                                 gr.Markdown("**Stage 3: Material Generation (Generate)**")
                                 with gr.Row():
@@ -2983,9 +3021,9 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 with gr.Row():
                                     tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1, info="Time warping for texture. 3.0 default. No VRAM impact.")
                                     tex_slat_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="Start of CFG range for texture. 0.6 skips early noisy steps.")
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.0, step=0.01, info="Start of CFG range for texture. 0.0 = original quality (full CFG). Higher values skip early steps.")
                                     tex_slat_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=0.9, step=0.01, info="End of CFG range for texture. 0.9 avoids final step artifacts.")
+                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG range for texture. 1.0 = original quality (full CFG). Lower values skip final steps.")
                         with gr.Step("Extract", id=1):
                             with gr.Row():
                                 back_to_preview_btn = gr.Button("Back to Preview", variant="secondary")
@@ -3056,6 +3094,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     image_prompt,
                     seed,
                     resolution,
+                    custom_resolution,
                     ss_guidance_strength,
                     ss_guidance_rescale,
                     ss_guidance_interval_start,
@@ -3265,6 +3304,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     randomize_seed,
                     seed,
                     resolution,
+                    custom_resolution,
                     ss_guidance_strength,
                     ss_guidance_rescale,
                     ss_guidance_interval_start,

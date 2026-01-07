@@ -120,22 +120,46 @@ def _save_cond(path: Path, cond: Dict[str, "torch.Tensor"]) -> None:
     torch.save({k: v.detach().cpu() for k, v in cond.items()}, str(path))
 
 
-def _pipeline_type_from_resolution(resolution: str) -> str:
-    # Match app_premium mapping.
-    return {
-        "512": "512",
-        "1024": "1024_cascade",
-        "1536": "1536_cascade",
-        "2048": "2048_cascade",
-    }[resolution]
+def _pipeline_type_from_resolution(resolution: str) -> tuple[str, int]:
+    """
+    Convert resolution string to pipeline type and target resolution.
+    
+    Returns:
+        (pipeline_type, target_resolution)
+    
+    Supports any resolution >=512 and divisible by 128.
+    """
+    try:
+        res = int(resolution)
+    except (ValueError, TypeError):
+        raise ValueError(f"Resolution must be a number, got: {resolution}")
+    
+    if res < 512:
+        raise ValueError(f"Resolution must be >= 512, got: {res}")
+    
+    if res % 128 != 0:
+        raise ValueError(f"Resolution must be divisible by 128, got: {res}")
+    
+    if res == 512:
+        return "512", 512
+    elif res == 1024:
+        return "1024", 1024
+    else:
+        # Any other resolution uses cascade
+        return f"{res}_cascade", res
 
 
 def _ss_res_from_pipeline_type(pipeline_type: str) -> int:
-    return {"512": 32, "1024": 64, "1024_cascade": 32, "1536_cascade": 32, "2048_cascade": 32}[pipeline_type]
+    """Sparse structure resolution: 64 for direct 1024, 32 for all others."""
+    return 64 if pipeline_type == "1024" else 32
 
 
-def _target_res_from_pipeline_type(pipeline_type: str) -> int:
-    return {"1024_cascade": 1024, "1536_cascade": 1536, "2048_cascade": 2048}[pipeline_type]
+def _target_res_from_pipeline_type(pipeline_type: str, default_res: int) -> int:
+    """Extract target resolution from cascade pipeline type."""
+    if "_cascade" in pipeline_type:
+        # Extract number from "1024_cascade", "1536_cascade", etc.
+        return int(pipeline_type.split("_")[0])
+    return default_res
 
 
 def _ignore_all_image_models() -> List[str]:
@@ -194,7 +218,7 @@ def stage_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
     image_path = Path(payload["image_path"])
     resolution = str(payload["resolution"])
-    pipeline_type = _pipeline_type_from_resolution(resolution)
+    pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
     force_high_res_conditional = payload.get("force_high_res_conditional", False)
 
     cond_512_path = Path(payload["cond_512_path"])
@@ -241,7 +265,7 @@ def stage_sample_sparse_structure(payload: Dict[str, Any]) -> Dict[str, Any]:
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
-    pipeline_type = _pipeline_type_from_resolution(resolution)
+    pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
     ss_res = _ss_res_from_pipeline_type(pipeline_type)
 
     cond_512_path = Path(payload["cond_512_path"])
@@ -282,7 +306,7 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
-    pipeline_type = _pipeline_type_from_resolution(resolution)
+    pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
     shape_params = payload["shape_params"]
     max_num_tokens = int(payload.get("max_num_tokens", 49152))
 
@@ -335,10 +359,10 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
         slat = pipe.sample_shape_slat(cond, pipe.models["shape_slat_flow_model_1024"], coords, shape_params)
         res = 1024
 
-    elif pipeline_type in {"1024_cascade", "1536_cascade", "2048_cascade"}:
+    elif "_cascade" in pipeline_type:
+        # Any cascade resolution (768, 1024, 1280, 1536, 2048, custom)
         if cond_1024_path is None:
             raise ValueError("cond_1024_path is required for cascade pipeline types.")
-        target_res = _target_res_from_pipeline_type(pipeline_type)
 
         keep = ["shape_slat_flow_model_512", "shape_slat_flow_model_1024", "shape_slat_decoder"]
         pipe = Trellis2ImageTo3DPipeline.from_pretrained(
@@ -395,7 +419,7 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
-    pipeline_type = _pipeline_type_from_resolution(resolution)
+    pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
 
     cond_path = Path(payload["cond_path"])
     shape_slat_path = Path(payload["shape_slat_path"])
