@@ -1618,15 +1618,26 @@ def image_to_3d(
     status = ""
     session = _session_key(req)
 
+    # Mutable container for log file path (set after run_dir is allocated)
+    _log_file_path: List[Optional[Path]] = [None]
+
     def _log(msg: str, p: Optional[float] = None) -> str:
         nonlocal status
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         status = (status + "\n" if status else "") + line
         print(line, flush=True)
+        # Stream to log file in real-time if path is set
+        if _log_file_path[0] is not None:
+            try:
+                with open(_log_file_path[0], "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass  # Don't fail generation if logging fails
         if p is not None:
             progress(p, desc=msg)
         return status
+
 
     if image is None:
         raise gr.Error("Please provide an image (upload or pick an example).")
@@ -1636,6 +1647,7 @@ def image_to_3d(
     run_dir = run.run_dir
     run_id = run.run_id
     logs_dir = ensure_dir(run_dir / "logs")
+    _log_file_path[0] = run_dir / "running_logs.txt"  # Enable log file streaming
 
     # Persist the raw/preprocessed inputs so every run is inspectable.
     input_path = run_dir / "00_input.png"
@@ -1731,6 +1743,13 @@ def image_to_3d(
                     if line:
                         status = status + "\n" + line
                         status = _trim_status(status)
+                        # Also write to main generation log for consolidated view
+                        if _log_file_path[0] is not None:
+                            try:
+                                with open(_log_file_path[0], "a", encoding="utf-8") as f:
+                                    f.write(line + "\n")
+                            except Exception:
+                                pass
                     now = time.time()
                     if now - last_ui_update > 0.6:
                         last_ui_update = now
