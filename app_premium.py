@@ -482,9 +482,10 @@ def _default_ui_config() -> dict:
             "no_texture_gen": False,
             "texture_size": 2048,
             "export_formats": ["glb"],
+            "low_vram": False,  # Keep models in VRAM for best quality and speed
             "ss_guidance_strength": 7.5,
             "ss_guidance_rescale": 0.7,
-            "ss_guidance_interval_start": 0.0,
+            "ss_guidance_interval_start": 0.6,  # Model default: CFG only in last 40% of sampling
             "ss_guidance_interval_end": 1.0,
             "ss_sampling_steps": 12,
             "ss_rescale_t": 5.0,
@@ -495,15 +496,15 @@ def _default_ui_config() -> dict:
             "extract_use_tiled_extraction": False,
             "shape_slat_guidance_strength": 7.5,
             "shape_slat_guidance_rescale": 0.5,
-            "shape_slat_guidance_interval_start": 0.0,
+            "shape_slat_guidance_interval_start": 0.6,  # Model default: CFG only in last 40% of sampling
             "shape_slat_guidance_interval_end": 1.0,
             "shape_slat_sampling_steps": 12,
             "shape_slat_rescale_t": 3.0,
             "max_num_tokens": 49152,  # Restored to original for quality (was 32768)
             "tex_slat_guidance_strength": 1.0,
             "tex_slat_guidance_rescale": 0.0,
-            "tex_slat_guidance_interval_start": 0.0,
-            "tex_slat_guidance_interval_end": 1.0,
+            "tex_slat_guidance_interval_start": 0.6,  # Model default: CFG in middle 30% range
+            "tex_slat_guidance_interval_end": 0.9,
             "tex_slat_sampling_steps": 12,
             "tex_slat_rescale_t": 3.0,
         },
@@ -776,6 +777,7 @@ def get_image_pipeline():
     global _image_pipeline
     if _image_pipeline is None:
         _image_pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
+        _image_pipeline.low_vram = False  # Keep models in VRAM for best quality and speed
         _image_pipeline.cuda()
     return _image_pipeline
 
@@ -1127,6 +1129,7 @@ def batch_process_folder(
     ss_sampling_steps: int,
     ss_rescale_t: float,
     force_high_res_conditional: bool,
+    low_vram: bool,
     use_chunked_processing: bool,
     use_tiled_extraction: bool,
     shape_slat_guidance_strength: float,
@@ -1637,6 +1640,7 @@ def image_to_3d(
     ss_sampling_steps: int,
     ss_rescale_t: float,
     force_high_res_conditional: bool,
+    low_vram: bool,
     use_chunked_processing: bool,
     use_tiled_extraction: bool,
     shape_slat_guidance_strength: float,
@@ -1747,6 +1751,7 @@ def image_to_3d(
                 "no_texture_gen": bool(no_texture_gen),
                 "max_num_tokens": int(max_num_tokens),
                 "force_high_res_conditional": bool(force_high_res_conditional),
+                "low_vram": bool(low_vram),
                 "use_chunked_processing": bool(use_chunked_processing),
                 "use_tiled_extraction": bool(use_tiled_extraction),
                 "ss_params": {
@@ -2973,14 +2978,19 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 with gr.Row():
                                     ss_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=5.0, step=0.1, info="Time schedule warping. Higher = more steps on coarse structure. 5.0 default improves structure. No VRAM impact.")
                                     ss_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.0, step=0.01, info="Start of CFG application range [0-1]. 0.0 = original quality (full CFG). Higher values skip early steps.")
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="⚠️ ADVANCED: Model default is 0.6. Only apply CFG in final refinement phase. Changing may reduce quality!")
                                     ss_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG application range [0-1]. 1.0 = original quality (full CFG). Lower values skip final steps.")
+                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="⚠️ ADVANCED: Model default is 1.0. Keep at 1.0 unless you know what you're doing.")
                                 with gr.Row():
                                     force_high_res_conditional = gr.Checkbox(
                                         label="Force High-Res Conditioning (Generate)",
                                         value=False,
                                         info="Use 1024 resolution for sparse structure conditioning instead of 512. May improve stability but increases VRAM usage."
+                                    )
+                                    low_vram = gr.Checkbox(
+                                        label="Low VRAM Mode",
+                                        value=False,
+                                        info="Move models between CPU/GPU during generation. Reduces VRAM usage but slower and may reduce quality. Disable for best results."
                                     )
                                 gr.Markdown("**Mesh Extraction Optimizations (Generate)**")
                                 with gr.Row():
@@ -3015,9 +3025,9 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 with gr.Row():
                                     shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1, info="Time warping for shape sampling. 3.0 default balances coarse/fine detail. No VRAM impact.")
                                     shape_slat_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.0, step=0.01, info="Start of CFG range for shape. 0.0 = original quality (full CFG). Higher values skip early steps.")
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="⚠️ ADVANCED: Model default is 0.6. Only apply CFG in final refinement phase. Changing may reduce quality!")
                                     shape_slat_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG range for shape. 1.0 = original quality (full CFG). Lower values skip final steps.")
+                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="⚠️ ADVANCED: Model default is 1.0. Keep at 1.0 unless you know what you're doing.")
                                     max_num_tokens = gr.Slider(
                                         10000, 200000,
                                         label="Max Tokens (Generate - VRAM vs Quality)",
@@ -3033,9 +3043,9 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 with gr.Row():
                                     tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1, info="Time warping for texture. 3.0 default. No VRAM impact.")
                                     tex_slat_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.0, step=0.01, info="Start of CFG range for texture. 0.0 = original quality (full CFG). Higher values skip early steps.")
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="⚠️ ADVANCED: Model default is 0.6. Apply CFG in middle refinement phase. Changing may reduce quality!")
                                     tex_slat_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG range for texture. 1.0 = original quality (full CFG). Lower values skip final steps.")
+                                        0.0, 1.0, label="Guidance Interval End", value=0.9, step=0.01, info="⚠️ ADVANCED: Model default is 0.9. Texture uses 0.6-0.9 range. Changing may reduce quality!")
                         with gr.Step("Extract", id=1):
                             with gr.Row():
                                 back_to_preview_btn = gr.Button("Back to Preview", variant="secondary")
@@ -3114,6 +3124,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     ss_sampling_steps,
                     ss_rescale_t,
                     force_high_res_conditional,
+                    low_vram,
                     use_chunked_processing,
                     use_tiled_extraction,
                     shape_slat_guidance_strength,
@@ -3324,6 +3335,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     ss_sampling_steps,
                     ss_rescale_t,
                     force_high_res_conditional,
+                    low_vram,
                     use_chunked_processing,
                     use_tiled_extraction,
                     shape_slat_guidance_strength,
@@ -3829,6 +3841,7 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         ("image_to_3d", "ss_sampling_steps"),
         ("image_to_3d", "ss_rescale_t"),
         ("image_to_3d", "force_high_res_conditional"),
+        ("image_to_3d", "low_vram"),
         ("image_to_3d", "use_chunked_processing"),
         ("image_to_3d", "use_tiled_extraction"),
         ("image_to_3d", "extract_use_chunked_processing"),
@@ -3877,6 +3890,7 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         ss_sampling_steps,
         ss_rescale_t,
         force_high_res_conditional,
+        low_vram,
         use_chunked_processing,
         use_tiled_extraction,
         extract_use_chunked_processing,

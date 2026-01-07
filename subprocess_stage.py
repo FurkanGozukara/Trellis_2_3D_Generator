@@ -188,6 +188,7 @@ def stage_preprocess_image(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    low_vram = payload.get("low_vram", False)
     in_path = Path(payload["input_image_path"])
     out_path = Path(payload["output_image_path"])
 
@@ -202,6 +203,7 @@ def stage_preprocess_image(payload: Dict[str, Any]) -> Dict[str, Any]:
         load_image_cond_model=False,
         load_rembg_model=True,
     )
+    pipe.low_vram = low_vram
     pipe.cuda()
 
     print("[preprocess] removing background / cropping…", flush=True)
@@ -217,6 +219,7 @@ def stage_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    low_vram = payload.get("low_vram", False)
     image_path = Path(payload["image_path"])
     resolution = str(payload["resolution"])
     pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
@@ -234,6 +237,7 @@ def stage_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
         load_image_cond_model=True,
         load_rembg_model=False,
     )
+    pipe.low_vram = low_vram
     pipe.cuda()
 
     # Use 1024 resolution for sparse structure conditioning if force_high_res_conditional is enabled
@@ -268,6 +272,7 @@ def stage_sample_sparse_structure(payload: Dict[str, Any]) -> Dict[str, Any]:
     resolution = str(payload["resolution"])
     pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
     ss_res = _ss_res_from_pipeline_type(pipeline_type)
+    low_vram = payload.get("low_vram", False)
 
     cond_512_path = Path(payload["cond_512_path"])
     coords_path = Path(payload["coords_path"])
@@ -282,6 +287,7 @@ def stage_sample_sparse_structure(payload: Dict[str, Any]) -> Dict[str, Any]:
         load_image_cond_model=False,
         load_rembg_model=False,
     )
+    pipe.low_vram = low_vram
     pipe.cuda()
 
     print("[sparse] loading cond_512…", flush=True)
@@ -339,6 +345,7 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
     shape_params = payload["shape_params"]
     max_num_tokens = int(payload.get("max_num_tokens", 49152))
+    low_vram = payload.get("low_vram", False)
 
     cond_512_path = Path(payload["cond_512_path"])
     cond_1024_path = Path(payload["cond_1024_path"]) if payload.get("cond_1024_path") else None
@@ -475,6 +482,7 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
     pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
+    low_vram = payload.get("low_vram", False)
 
     cond_path = Path(payload["cond_path"])
     shape_slat_path = Path(payload["shape_slat_path"])
@@ -518,6 +526,7 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
         load_image_cond_model=False,
         load_rembg_model=False,
     )
+    pipe.low_vram = low_vram
     pipe.cuda()
 
     cond = _load_cond(cond_path, device=device)
@@ -582,6 +591,7 @@ def stage_render_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.utils import render_utils
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    low_vram = payload.get("low_vram", False)
     shape_slat_path = Path(payload["shape_slat_path"])
     tex_slat_path = Path(payload["tex_slat_path"]) if payload.get("tex_slat_path") else None
     res = int(payload["res"])
@@ -611,6 +621,7 @@ def stage_render_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
         load_image_cond_model=False,
         load_rembg_model=False,
     )
+    pipe.low_vram = low_vram
     pipe.cuda()
 
     # Clear memory before heavy decode operation
@@ -741,6 +752,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     from subprocess_utils import next_indexed_path
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    low_vram = payload.get("low_vram", False)
     shape_slat_path = Path(payload["shape_slat_path"])
     tex_slat_path = Path(payload["tex_slat_path"]) if payload.get("tex_slat_path") else None
     res = int(payload["res"])
@@ -785,6 +797,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
         load_image_cond_model=False,
         load_rembg_model=False,
     )
+    pipe.low_vram = low_vram
     pipe.cuda()
 
     # Clear memory before heavy decode operation
@@ -901,6 +914,7 @@ def stage_texture_generate(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
     config_file = payload.get("config_file", "texturing_pipeline.json")
+    low_vram = payload.get("low_vram", False)
 
     mesh_path = Path(payload["mesh_path"])
     image_path = Path(payload["image_path"])
