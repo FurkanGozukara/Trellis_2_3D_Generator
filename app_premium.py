@@ -488,8 +488,8 @@ def _default_ui_config() -> dict:
             "ss_sampling_steps": 12,
             "ss_rescale_t": 5.0,
             "force_high_res_conditional": False,
-            "use_chunked_processing": False,
-            "use_tiled_extraction": False,
+            "use_chunked_processing": True,
+            "use_tiled_extraction": True,
             "shape_slat_guidance_strength": 7.5,
             "shape_slat_guidance_rescale": 0.5,
             "shape_slat_guidance_interval_start": 0.6,
@@ -1874,6 +1874,8 @@ def image_to_3d(
             "res": int(res),
             "preview_dir": str(preview_dir),
             "preview_manifest_path": str(preview_manifest_path),
+            "use_chunked_processing": bool(use_chunked_processing),
+            "use_tiled_extraction": bool(use_tiled_extraction),
         }
         preview_failed = False
         preview_error_msg = ""
@@ -2175,7 +2177,7 @@ def image_to_3d(
         pass
 
     _log("Decoding latent to mesh…", 0.75)
-    mesh = pipe.decode_latent(shape_slat, tex_slat, res)[0]
+    mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
     yield None, empty_html, status
 
     _log("Simplifying mesh…", 0.82)
@@ -2312,6 +2314,8 @@ def extract_glb(
     no_texture_gen: bool,
     prune_invisible_faces: bool,
     export_formats: List[str],
+    use_chunked_processing: bool,
+    use_tiled_extraction: bool,
     subprocess_mode: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
@@ -2382,6 +2386,8 @@ def extract_glb(
             "out_dir": str(out_dir),
             "prefix": "glb",
             "export_formats": list(export_formats),
+            "use_chunked_processing": bool(use_chunked_processing),
+            "use_tiled_extraction": bool(use_tiled_extraction),
         }
 
         last_ui_update = 0.0
@@ -2446,7 +2452,7 @@ def extract_glb(
     yield None, None, status
 
     _log("Decoding latent to mesh…", 0.15)
-    mesh = pipe.decode_latent(shape_slat, tex_slat, res)[0]
+    mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
     yield None, None, status
 
     _log("Post-processing + baking GLB (this can take a while)…", 0.3)
@@ -2479,6 +2485,7 @@ def extract_glb(
         "remesh_method": remesh_method,
         "prune_invisible": prune_invisible_faces,
         "use_tqdm": True,
+        "use_chunked_processing": use_chunked_processing,
     }
     try:
         glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
@@ -2923,12 +2930,12 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                     )
                                     use_chunked_processing = gr.Checkbox(
                                         label="Chunked Triangle Processing",
-                                        value=False,
-                                        info="Process mesh triangles in chunks during extraction. May help with OOM on very large meshes, but can be slower. Try enabling if extraction fails."
+                                        value=True,
+                                        info="Process mesh triangles in chunks during extraction. Reduces VRAM usage on large meshes. Recommended: ON."
                                     )
                                     use_tiled_extraction = gr.Checkbox(
                                         label="Tiled Mesh Extraction",
-                                        value=False,
+                                        value=True,
                                         info="Extract mesh in spatial tiles. For extreme resolutions (256+) or complex meshes. Slower but prevents OOM."
                                     )
 
@@ -3078,6 +3085,8 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     no_texture_gen,
                     prune_invisible_faces,
                     export_formats,
+                    use_chunked_processing,
+                    use_tiled_extraction,
                     subprocess_mode,
                 ],
                 outputs=[glb_output, download_btn, status_box],

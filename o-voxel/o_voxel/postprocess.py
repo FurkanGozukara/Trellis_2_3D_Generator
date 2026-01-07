@@ -235,6 +235,8 @@ def to_glb(
     prune_invisible: bool = False,
     verbose: bool = False,
     use_tqdm: bool = False,
+    use_chunked_processing: bool = False,
+    use_tiled_extraction: bool = False,
 ):
     """
     Convert an extracted mesh to a GLB file.
@@ -250,10 +252,13 @@ def to_glb(
         voxel_size: (3,) tensor of size of each voxel
         grid_size: (3,) tensor of number of voxels in each dimension
         decimation_target: target number of vertices for mesh simplification
+        simplify_method: method for mesh simplification ('cumesh' or other)
+        texture_extraction: whether to extract textures
         texture_size: size of the texture for baking
         remesh: whether to perform remeshing
         remesh_band: size of the remeshing band
         remesh_project: projection factor for remeshing
+        remesh_method: method for remeshing
         mesh_cluster_threshold_cone_half_angle_rad: threshold for cone-based clustering in uv unwrapping
         mesh_cluster_refine_iterations: number of iterations for refining clusters in uv unwrapping
         mesh_cluster_global_iterations: number of global iterations for clustering in uv unwrapping
@@ -261,6 +266,8 @@ def to_glb(
         prune_invisible: whether to prune invisible faces (inner geometry) before texturing
         verbose: whether to print verbose messages
         use_tqdm: whether to use tqdm to display progress bar
+        use_chunked_processing: (NOTE: Not used in postprocessing stage; only applies during initial mesh extraction)
+        use_tiled_extraction: (NOTE: Not used in postprocessing stage; only applies during initial mesh extraction)
     """
     # --- Input Normalization (AABB, Voxel Size, Grid Size) ---
     if isinstance(aabb, (list, tuple)):

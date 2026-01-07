@@ -407,18 +407,25 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         self,
         slat: SparseTensor,
         resolution: int,
+        use_tiled_extraction: bool = False,
+        use_chunked_processing: bool = True,
     ) -> Tuple[List[Mesh], List[SparseTensor]]:
         """
         Decode the structured latent.
 
         Args:
             slat (SparseTensor): The structured latent.
+            resolution (int): The resolution of the output.
+            use_tiled_extraction (bool): Whether to use tiled extraction for reduced memory usage.
+            use_chunked_processing (bool): Whether to use chunked processing for reduced memory usage.
 
         Returns:
             List[Mesh]: The decoded meshes.
             List[SparseTensor]: The decoded substructures.
         """
         self.models['shape_slat_decoder'].set_resolution(resolution)
+        self.models['shape_slat_decoder'].set_tiled_extraction(use_tiled_extraction)
+        self.models['shape_slat_decoder'].set_chunked_processing(use_chunked_processing)
         if self.low_vram:
             self.models['shape_slat_decoder'].to(self.device)
             self.models['shape_slat_decoder'].low_vram = True
@@ -498,6 +505,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         shape_slat: SparseTensor,
         tex_slat: SparseTensor,
         resolution: int,
+        use_tiled_extraction: bool = False,
+        use_chunked_processing: bool = True,
     ) -> List[MeshWithVoxel]:
         """
         Decode the latent codes.
@@ -506,9 +515,11 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             shape_slat (SparseTensor): The structured latent for shape.
             tex_slat (SparseTensor): The structured latent for texture.
             resolution (int): The resolution of the output.
+            use_tiled_extraction (bool): Whether to use tiled extraction for reduced memory usage.
+            use_chunked_processing (bool): Whether to use chunked processing for reduced memory usage.
         """
 
-        meshes, subs = self.decode_shape_slat(shape_slat, resolution)
+        meshes, subs = self.decode_shape_slat(shape_slat, resolution, use_tiled_extraction, use_chunked_processing)
         if tex_slat is not None:
              tex_voxels = self.decode_tex_slat(tex_slat, subs)
         else:
@@ -555,6 +566,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
         no_texture_gen: bool = False,
+        use_tiled_extraction: bool = False,
+        use_chunked_processing: bool = True,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
@@ -570,6 +583,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return_latent (bool): Whether to return the latent codes.
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
+            no_texture_gen (bool): Whether to skip texture generation.
+            use_tiled_extraction (bool): Whether to use tiled extraction for reduced memory usage.
+            use_chunked_processing (bool): Whether to use chunked processing for reduced memory usage.
         """
         # Check pipeline type
         pipeline_type = pipeline_type or self.default_pipeline_type
@@ -684,7 +700,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             else:
                 tex_slat = None
         torch.cuda.empty_cache()
-        out_mesh = self.decode_latent(shape_slat, tex_slat, res)
+        out_mesh = self.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)
         if return_latent:
             return out_mesh, (shape_slat, tex_slat, res)
         else:

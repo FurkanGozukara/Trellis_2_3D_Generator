@@ -468,6 +468,8 @@ def stage_render_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     res = int(payload["res"])
     preview_dir = Path(payload["preview_dir"])
     manifest_path = Path(payload["preview_manifest_path"])
+    use_tiled_extraction = bool(payload.get("use_tiled_extraction", False))
+    use_chunked_processing = bool(payload.get("use_chunked_processing", True))
 
     device = "cuda"
 
@@ -499,7 +501,7 @@ def stage_render_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     _log_vram_usage("Before decode_latent")
 
     print("[preview] decoding latent to mesh…", flush=True)
-    mesh = pipe.decode_latent(shape_slat, tex_slat, res)[0]
+    mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
     
     # Clear memory after decode
     torch.cuda.empty_cache()
@@ -631,6 +633,8 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     simplify_method = str(payload["simplify_method"])
     prune_invisible_faces = bool(payload["prune_invisible_faces"])
     no_texture_gen = bool(payload["no_texture_gen"])
+    use_tiled_extraction = bool(payload.get("use_tiled_extraction", False))
+    use_chunked_processing = bool(payload.get("use_chunked_processing", True))
 
     out_dir = Path(payload["out_dir"])
     prefix = str(payload.get("prefix", "glb"))
@@ -669,7 +673,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     _log_vram_usage("Before extract decode_latent")
 
     print("[extract] decoding latent to mesh…", flush=True)
-    mesh = pipe.decode_latent(shape_slat, tex_slat, res)[0]
+    mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
     
     # Save values needed later before unloading pipeline
     pbr_attr_layout = pipe.pbr_attr_layout
@@ -722,6 +726,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
         "remesh_method": remesh_method,
         "prune_invisible": prune_invisible_faces,
         "use_tqdm": True,
+        "use_chunked_processing": use_chunked_processing,
     }
     try:
         glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
