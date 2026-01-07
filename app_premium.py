@@ -488,6 +488,8 @@ def _default_ui_config() -> dict:
             "ss_sampling_steps": 12,
             "ss_rescale_t": 5.0,
             "force_high_res_conditional": False,
+            "use_chunked_processing": False,
+            "use_tiled_extraction": False,
             "shape_slat_guidance_strength": 7.5,
             "shape_slat_guidance_rescale": 0.5,
             "shape_slat_guidance_interval_start": 0.6,
@@ -1121,6 +1123,8 @@ def batch_process_folder(
     ss_sampling_steps: int,
     ss_rescale_t: float,
     force_high_res_conditional: bool,
+    use_chunked_processing: bool,
+    use_tiled_extraction: bool,
     shape_slat_guidance_strength: float,
     shape_slat_guidance_rescale: float,
     shape_slat_guidance_interval_start: float,
@@ -1590,6 +1594,8 @@ def image_to_3d(
     ss_sampling_steps: int,
     ss_rescale_t: float,
     force_high_res_conditional: bool,
+    use_chunked_processing: bool,
+    use_tiled_extraction: bool,
     shape_slat_guidance_strength: float,
     shape_slat_guidance_rescale: float,
     shape_slat_guidance_interval_start: float,
@@ -1682,6 +1688,8 @@ def image_to_3d(
                 "no_texture_gen": bool(no_texture_gen),
                 "max_num_tokens": int(max_num_tokens),
                 "force_high_res_conditional": bool(force_high_res_conditional),
+                "use_chunked_processing": bool(use_chunked_processing),
+                "use_tiled_extraction": bool(use_tiled_extraction),
                 "ss_params": {
                     "steps": int(ss_sampling_steps),
                     "guidance_strength": float(ss_guidance_strength),
@@ -2846,6 +2854,16 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                         value=False,
                                         info="Use 1024 resolution for sparse structure conditioning instead of 512. May improve stability but increases VRAM usage."
                                     )
+                                    use_chunked_processing = gr.Checkbox(
+                                        label="Chunked Triangle Processing",
+                                        value=False,
+                                        info="Process mesh triangles in chunks during extraction. May help with OOM on very large meshes, but can be slower. Try enabling if extraction fails."
+                                    )
+                                    use_tiled_extraction = gr.Checkbox(
+                                        label="Tiled Mesh Extraction",
+                                        value=False,
+                                        info="Extract mesh in spatial tiles. For extreme resolutions (256+) or complex meshes. Slower but prevents OOM."
+                                    )
 
                                 gr.Markdown("Stage 2: Shape Generation")
                                 with gr.Row():
@@ -2952,6 +2970,8 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     ss_sampling_steps,
                     ss_rescale_t,
                     force_high_res_conditional,
+                    use_chunked_processing,
+                    use_tiled_extraction,
                     shape_slat_guidance_strength,
                     shape_slat_guidance_rescale,
                     shape_slat_guidance_interval_start,
@@ -3152,6 +3172,8 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     ss_sampling_steps,
                     ss_rescale_t,
                     force_high_res_conditional,
+                    use_chunked_processing,
+                    use_tiled_extraction,
                     shape_slat_guidance_strength,
                     shape_slat_guidance_rescale,
                     shape_slat_guidance_interval_start,
@@ -3655,6 +3677,8 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         ("image_to_3d", "ss_sampling_steps"),
         ("image_to_3d", "ss_rescale_t"),
         ("image_to_3d", "force_high_res_conditional"),
+        ("image_to_3d", "use_chunked_processing"),
+        ("image_to_3d", "use_tiled_extraction"),
         ("image_to_3d", "shape_slat_guidance_strength"),
         ("image_to_3d", "shape_slat_guidance_rescale"),
         ("image_to_3d", "shape_slat_guidance_interval_start"),
@@ -3699,6 +3723,8 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         ss_sampling_steps,
         ss_rescale_t,
         force_high_res_conditional,
+        use_chunked_processing,
+        use_tiled_extraction,
         shape_slat_guidance_strength,
         shape_slat_guidance_rescale,
         shape_slat_guidance_interval_start,

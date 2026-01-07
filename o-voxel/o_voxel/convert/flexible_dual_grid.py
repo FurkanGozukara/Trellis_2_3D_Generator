@@ -3,10 +3,95 @@ import numpy as np
 import torch
 from .. import _C
 
+from tqdm import tqdm
+
 __all__ = [
     "mesh_to_flexible_dual_grid",
     "flexible_dual_grid_to_mesh",
+    "tiled_flexible_dual_grid_to_mesh",
 ]
+
+@torch.no_grad()
+def tiled_flexible_dual_grid_to_mesh(
+    coords, dual_vertices, intersected_flag, split_weight, 
+    aabb, grid_size, tile_size=128, overlap=1, train=False
+    ):
+    """
+    Extract mesh from sparse voxel structures using tiled flexible dual grid.
+    This version processes the mesh in smaller tiles to reduce memory usage.
+    
+    Args:
+        coords (torch.Tensor): The coordinates of the voxels.
+        dual_vertices (torch.Tensor): The dual vertices.
+        intersected_flag (torch.Tensor): The intersected flag.
+        split_weight (torch.Tensor): The split weight of each dual quad.
+        aabb (list, tuple, np.ndarray, torch.Tensor): The axis-aligned bounding box of the mesh.
+        grid_size (int, list, tuple, np.ndarray, torch.Tensor): The size of the grid.
+        tile_size (int): Size of each tile (default: 128).
+        overlap (int): Overlap between tiles (default: 1).
+        train (bool): Whether to use training mode.
+        
+    Returns:
+        vertices (torch.Tensor): The vertices of the mesh.
+        faces (torch.Tensor): The faces of the mesh.
+    """
+    device = coords.device
+    
+    # Keep everything on GPU
+    min_coord = coords.min(dim=0).values
+    max_coord = coords.max(dim=0).values
+    
+    # Calculate ranges on CPU just for the loop logic
+    x_range = range(min_coord[0].item(), max_coord[0].item() + 1, tile_size)
+    y_range = range(min_coord[1].item(), max_coord[1].item() + 1, tile_size)
+    z_range = range(min_coord[2].item(), max_coord[2].item() + 1, tile_size)
+    
+    all_vertices, all_faces = [], []
+    vertex_count = 0
+
+    pbar = tqdm(total=len(x_range)*len(y_range)*len(z_range), desc="Fast Tiled Decoding")
+
+    for x in x_range:
+        for y in y_range:
+            for z in z_range:
+                # 1. Masking directly on GPU
+                lower = torch.tensor([x, y, z], device=device)
+                upper = lower + tile_size
+                mask = torch.all((coords >= lower - overlap) & (coords < upper + overlap), dim=1)
+                
+                if mask.any():
+                    # 2. CRITICAL: .contiguous() ensures the memory layout is 
+                    # exactly what the custom CUDA kernel expects.
+                    t_coords = coords[mask].contiguous()
+                    t_dual = dual_vertices[mask].contiguous()
+                    t_inter = intersected_flag[mask].contiguous()
+                    t_weight = split_weight[mask].contiguous()
+                    
+                    if not t_inter.any():
+                        pbar.update(1)
+                        continue
+
+                    try:
+                        t_verts, t_faces = flexible_dual_grid_to_mesh(
+                            t_coords, t_dual, t_inter, t_weight,
+                            aabb=aabb, grid_size=grid_size, train=train
+                        )
+                        
+                        if t_verts is not None and t_verts.shape[0] > 0:
+                            all_vertices.append(t_verts)
+                            all_faces.append(t_faces + vertex_count)
+                            vertex_count += t_verts.shape[0]
+                    except RuntimeError:
+                        continue
+                
+                pbar.update(1)
+    
+    pbar.close()
+    if not all_vertices: return None, None
+
+    # Final Merge and Deduplication
+    unique_v, inverse = torch.unique(torch.cat(all_vertices, dim=0), dim=0, return_inverse=True)
+    return unique_v, inverse[torch.cat(all_faces, dim=0)]
 
 
 def _init_hashmap(grid_size, capacity, device):
@@ -20,7 +105,7 @@ def _init_hashmap(grid_size, capacity, device):
     else:
         raise ValueError(f"The spatial size is too large to fit in a hashmap. Get volumn {VOL} > 2^64.")
 
-    hashmap_vals = torch.empty((capacity,), dtype=torch.uint32, device=device)
+    hashmap_vals = torch.zeros((capacity,), dtype=torch.uint32, device=device)
     
     return hashmap_keys, hashmap_vals
 
@@ -148,6 +233,7 @@ def flexible_dual_grid_to_mesh(
     voxel_size: Union[float, list, tuple, np.ndarray, torch.Tensor] = None,
     grid_size: Union[int, list, tuple, np.ndarray, torch.Tensor] = None,
     train: bool = False,
+    use_chunked_processing: bool = True,
 ):
     """
     Extract mesh from sparse voxel structures using flexible dual grid.
@@ -219,7 +305,7 @@ def flexible_dual_grid_to_mesh(
 
     # Extract mesh
     N = dual_vertices.shape[0]
-    mesh_vertices = (coords.float() + dual_vertices) / (2 * N) - 0.5
+    mesh_vertices = (coords.float() + dual_vertices * 0.5) / grid_size - 0.5
 
     # Store active voxels into hashmap
     hashmap = _init_hashmap(grid_size, 2 * N, device=coords.device)
@@ -241,28 +327,75 @@ def flexible_dual_grid_to_mesh(
     # Construct triangles
     if not train:
         mesh_vertices = (coords.float() + dual_vertices) * voxel_size + aabb[0].reshape(1, 3)
-        if split_weight is None:
-            # if split 1
-            atempt_triangles_0 = quad_indices[:, flexible_dual_grid_to_mesh.quad_split_1]
-            normals0 = torch.cross(mesh_vertices[atempt_triangles_0[:, 1]] - mesh_vertices[atempt_triangles_0[:, 0]], mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 0]])
-            normals1 = torch.cross(mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 1]], mesh_vertices[atempt_triangles_0[:, 3]] - mesh_vertices[atempt_triangles_0[:, 1]])
-            align0 = (normals0 * normals1).sum(dim=1, keepdim=True).abs()
-            # if split 2
-            atempt_triangles_1 = quad_indices[:, flexible_dual_grid_to_mesh.quad_split_2]
-            normals0 = torch.cross(mesh_vertices[atempt_triangles_1[:, 1]] - mesh_vertices[atempt_triangles_1[:, 0]], mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 0]])
-            normals1 = torch.cross(mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 1]], mesh_vertices[atempt_triangles_1[:, 3]] - mesh_vertices[atempt_triangles_1[:, 1]])
-            align1 = (normals0 * normals1).sum(dim=1, keepdim=True).abs()
-            # select split
-            mesh_triangles = torch.where(align0 > align1, atempt_triangles_0, atempt_triangles_1).reshape(-1, 3)
+        
+        if use_chunked_processing:
+            # Process triangles in chunks to reduce peak memory usage
+            # Build triangles incrementally instead of pre-allocating
+            chunk_size = 1048576  # 2^20
+            triangle_chunks = []
+            
+            for i in range(0, L, chunk_size):
+                end = min(i + chunk_size, L)
+                quad_indices_chunk = quad_indices[i:end]
+                
+                if split_weight is None:
+                    # if split 1
+                    atempt_triangles_0 = quad_indices_chunk[:, flexible_dual_grid_to_mesh.quad_split_1]
+                    # split_1: [0, 1, 2, 0, 2, 3] -> triangles (0,1,2) and (0,2,3)
+                    t0 = atempt_triangles_0[:, :3]
+                    t1 = atempt_triangles_0[:, 3:]
+                    normals0 = torch.cross(mesh_vertices[t0[:, 1]] - mesh_vertices[t0[:, 0]], mesh_vertices[t0[:, 2]] - mesh_vertices[t0[:, 0]])
+                    normals1 = torch.cross(mesh_vertices[t1[:, 1]] - mesh_vertices[t1[:, 0]], mesh_vertices[t1[:, 2]] - mesh_vertices[t1[:, 0]])
+                    align0 = (normals0 * normals1).sum(dim=1, keepdim=True).abs()
+                    
+                    # if split 2
+                    atempt_triangles_1 = quad_indices_chunk[:, flexible_dual_grid_to_mesh.quad_split_2]
+                    t0 = atempt_triangles_1[:, :3]
+                    t1 = atempt_triangles_1[:, 3:]
+                    normals0 = torch.cross(mesh_vertices[t0[:, 1]] - mesh_vertices[t0[:, 0]], mesh_vertices[t0[:, 2]] - mesh_vertices[t0[:, 0]])
+                    normals1 = torch.cross(mesh_vertices[t1[:, 1]] - mesh_vertices[t1[:, 0]], mesh_vertices[t1[:, 2]] - mesh_vertices[t1[:, 0]])
+                    align1 = (normals0 * normals1).sum(dim=1, keepdim=True).abs()
+                    
+                    # select split
+                    chunk_triangles = torch.where(align0 > align1, atempt_triangles_0, atempt_triangles_1).reshape(-1, 3)
+                else:
+                    split_weight_ws = split_weight[quad_indices_chunk]
+                    split_weight_ws_02 = split_weight_ws[:, 0] * split_weight_ws[:, 2]
+                    split_weight_ws_13 = split_weight_ws[:, 1] * split_weight_ws[:, 3]
+                    chunk_triangles = torch.where(
+                        split_weight_ws_02 > split_weight_ws_13,
+                        quad_indices_chunk[:, flexible_dual_grid_to_mesh.quad_split_1],
+                        quad_indices_chunk[:, flexible_dual_grid_to_mesh.quad_split_2]
+                    ).reshape(-1, 3)
+                
+                triangle_chunks.append(chunk_triangles)
+            
+            # Concatenate all chunks at the end
+            mesh_triangles = torch.cat(triangle_chunks, dim=0)
         else:
-            split_weight_ws = split_weight[quad_indices]
-            split_weight_ws_02 = split_weight_ws[:, 0] * split_weight_ws[:, 2]
-            split_weight_ws_13 = split_weight_ws[:, 1] * split_weight_ws[:, 3]
-            mesh_triangles = torch.where(
-                split_weight_ws_02 > split_weight_ws_13,
-                quad_indices[:, flexible_dual_grid_to_mesh.quad_split_1],
-                quad_indices[:, flexible_dual_grid_to_mesh.quad_split_2]
-            ).reshape(-1, 3)
+            # Original non-chunked processing (processes all at once)
+            if split_weight is None:
+                # if split 1
+                atempt_triangles_0 = quad_indices[:, flexible_dual_grid_to_mesh.quad_split_1]
+                normals0 = torch.cross(mesh_vertices[atempt_triangles_0[:, 1]] - mesh_vertices[atempt_triangles_0[:, 0]], mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 0]])
+                normals1 = torch.cross(mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 1]], mesh_vertices[atempt_triangles_0[:, 3]] - mesh_vertices[atempt_triangles_0[:, 1]])
+                align0 = (normals0 * normals1).sum(dim=1, keepdim=True).abs()
+                # if split 2
+                atempt_triangles_1 = quad_indices[:, flexible_dual_grid_to_mesh.quad_split_2]
+                normals0 = torch.cross(mesh_vertices[atempt_triangles_1[:, 1]] - mesh_vertices[atempt_triangles_1[:, 0]], mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 0]])
+                normals1 = torch.cross(mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 1]], mesh_vertices[atempt_triangles_1[:, 3]] - mesh_vertices[atempt_triangles_1[:, 1]])
+                align1 = (normals0 * normals1).sum(dim=1, keepdim=True).abs()
+                # select split
+                mesh_triangles = torch.where(align0 > align1, atempt_triangles_0, atempt_triangles_1).reshape(-1, 3)
+            else:
+                split_weight_ws = split_weight[quad_indices]
+                split_weight_ws_02 = split_weight_ws[:, 0] * split_weight_ws[:, 2]
+                split_weight_ws_13 = split_weight_ws[:, 1] * split_weight_ws[:, 3]
+                mesh_triangles = torch.where(
+                    split_weight_ws_02 > split_weight_ws_13,
+                    quad_indices[:, flexible_dual_grid_to_mesh.quad_split_1],
+                    quad_indices[:, flexible_dual_grid_to_mesh.quad_split_2]
+                ).reshape(-1, 3)
     else:
         assert split_weight is not None, "split_weight must be provided in training mode"
         mesh_vertices = (coords.float() + dual_vertices) * voxel_size + aabb[0].reshape(1, 3)
