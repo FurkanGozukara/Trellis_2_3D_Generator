@@ -496,7 +496,7 @@ def _default_ui_config() -> dict:
             "shape_slat_guidance_interval_end": 1.0,
             "shape_slat_sampling_steps": 12,
             "shape_slat_rescale_t": 3.0,
-            "max_num_tokens": 49152,
+            "max_num_tokens": 32768,  # Reduced for VRAM safety (was 49152)
             "tex_slat_guidance_strength": 1.0,
             "tex_slat_guidance_rescale": 0.0,
             "tex_slat_guidance_interval_start": 0.6,
@@ -2897,7 +2897,13 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                     shape_slat_guidance_interval_end = gr.Slider(
                                         0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01
                                     )
-                                    max_num_tokens = gr.Slider(10000, 200000, label="Max Number of Tokens", value=49152, step=1000)
+                                    max_num_tokens = gr.Slider(
+                                        10000, 200000,
+                                        label="Max Tokens (VRAM vs Quality)",
+                                        value=32768,
+                                        step=1000,
+                                        info="Lower = less VRAM, higher = more detail. Reduce if OOM errors occur."
+                                    )
 
                                 gr.Markdown("Stage 3: Material Generation")
                                 with gr.Row():

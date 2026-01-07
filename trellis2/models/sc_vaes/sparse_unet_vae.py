@@ -511,12 +511,29 @@ class SparseUnetVaeDecoder(nn.Module):
         
         h = self.from_latent(x)
         h = h.type(self.dtype)
+        
+        # Clear input tensor's caches to save memory
+        if hasattr(x, '_spatial_cache'):
+            x._spatial_cache = {}
+        
         for i, res in enumerate(self.blocks):
             if i == upsample_times:
+                # Clear intermediate caches before returning
+                if hasattr(h, '_spatial_cache'):
+                    h._spatial_cache = {}
                 return h.coords
+            
+            # Clear CUDA cache at the start of each resolution level
+            torch.cuda.empty_cache()
+            
             for j, block in enumerate(res):
                 if i < len(self.blocks) - 1 and j == len(res) - 1:
                     h, sub = block(h)
+                    del sub  # Immediately free subdivision tensor
                 else:
                     h = block(h)
+            
+            # Clear h's spatial cache after each resolution level
+            if hasattr(h, '_spatial_cache'):
+                h._spatial_cache = {}
        

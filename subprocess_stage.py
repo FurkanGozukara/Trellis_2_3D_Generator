@@ -32,6 +32,18 @@ O_VOXEL_SRC_DIR = APP_DIR / "o-voxel"
 os.environ.setdefault("TRELLIS_MODELS_DIR", str(MODELS_DIR))
 
 
+def _log_vram_usage(label: str) -> None:
+    """Log current VRAM usage for debugging OOM issues."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"[VRAM] {label}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved", flush=True)
+    except Exception:
+        pass  # Silently ignore if torch not imported yet
+
+
 def _ensure_o_voxel_available() -> None:
     """
     TRELLIS.2 depends on the CUDA extension package `o_voxel`.
@@ -332,6 +344,13 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
         cond = _load_cond(cond_1024_path, device=device)
 
         print(f"[shape] sampling shape SLat (cascade → {target_res})…", flush=True)
+        
+        # Clear any leftover tensors before heavy operation
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        _log_vram_usage("Before cascade sampling")
+        
         slat, res = pipe.sample_shape_slat_cascade(
             lr_cond,
             cond,
@@ -343,6 +362,9 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
             shape_params,
             max_num_tokens,
         )
+        
+        # Immediate cleanup after cascade
+        torch.cuda.empty_cache()
     else:
         raise ValueError(f"Unsupported pipeline type: {pipeline_type}")
 
@@ -470,8 +492,17 @@ def stage_render_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     pipe.cuda()
 
+    # Clear memory before heavy decode operation
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    _log_vram_usage("Before decode_latent")
+
     print("[preview] decoding latent to mesh…", flush=True)
     mesh = pipe.decode_latent(shape_slat, tex_slat, res)[0]
+    
+    # Clear memory after decode
+    torch.cuda.empty_cache()
 
     print("[preview] simplifying mesh…", flush=True)
     try:
@@ -631,8 +662,27 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     pipe.cuda()
 
+    # Clear memory before heavy decode operation
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    _log_vram_usage("Before extract decode_latent")
+
     print("[extract] decoding latent to mesh…", flush=True)
     mesh = pipe.decode_latent(shape_slat, tex_slat, res)[0]
+    
+    # Save values needed later before unloading pipeline
+    pbr_attr_layout = pipe.pbr_attr_layout
+    
+    # CRITICAL: Unload pipeline entirely to free VRAM for mesh operations
+    # The pipeline holds GBs of decoder weights that must be freed before to_glb
+    print("[extract] freeing decoder memory…", flush=True)
+    del shape_slat, tex_slat
+    pipe.cpu()  # Move all models to CPU
+    del pipe
+    gc.collect()
+    torch.cuda.empty_cache()
+    _log_vram_usage("After pipeline unload, before to_glb")
 
     print("[extract] converting to GLB…", flush=True)
     # NOTE: `faithful_contouring` remeshing depends on optional FaithC packages
@@ -659,7 +709,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
         "faces": mesh.faces,
         "attr_volume": mesh.attrs,
         "coords": mesh.coords,
-        "attr_layout": pipe.pbr_attr_layout,
+        "attr_layout": pbr_attr_layout,
         "grid_size": res,
         "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         "decimation_target": decimation_target,

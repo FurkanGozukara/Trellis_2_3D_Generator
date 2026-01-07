@@ -343,9 +343,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         ).samples
         if self.low_vram:
             flow_model_lr.cpu()
+        # Always clear cache after LR model, not just in low_vram mode - needed for 32GB GPUs
+        torch.cuda.empty_cache()
+        
         std = torch.tensor(self.shape_slat_normalization['std'])[None].to(slat.device)
         mean = torch.tensor(self.shape_slat_normalization['mean'])[None].to(slat.device)
         slat = slat * std + mean
+        
+        # Clear spatial caches from sampling to free memory before decoder
+        if hasattr(slat, '_spatial_cache'):
+            slat._spatial_cache = {}
         
         # Upsample
         if self.low_vram:
@@ -355,6 +362,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if self.low_vram:
             self.models['shape_slat_decoder'].cpu()
             self.models['shape_slat_decoder'].low_vram = False
+        # Always clear cache after upsample
+        torch.cuda.empty_cache()
         hr_resolution = resolution
         while True:
             quant_coords = torch.cat([
@@ -516,6 +525,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
 
         out_mesh = []
         for m, v in zip(meshes, tex_voxels):
+            # Clear CUDA cache before memory-intensive mesh operations
+            torch.cuda.empty_cache()
             m.fill_holes()
             out_mesh.append(
                 MeshWithVoxel(
