@@ -474,7 +474,7 @@ def _default_ui_config() -> dict:
             "resolution": "1024",
             "seed": 99,
             "randomize_seed": False,
-            "decimation_target": 500000,
+            "decimation_target": 1000000,
             "remesh_method": "dual_contouring",
             "simplify_method": "cumesh",
             "prune_invisible_faces": False,
@@ -1865,6 +1865,8 @@ def image_to_3d(
                 return
 
         # Stage: preview render (writes JPEGs + manifest)
+        # NOTE: render_preview is optional for GLB extraction. If it fails (e.g., OOM),
+        # we can still proceed to GLB extraction as long as the latents are saved.
         preview_payload = {
             "model_repo": "microsoft/TRELLIS.2-4B",
             "shape_slat_path": str(shape_slat_path),
@@ -1873,10 +1875,58 @@ def image_to_3d(
             "preview_dir": str(preview_dir),
             "preview_manifest_path": str(preview_manifest_path),
         }
+        preview_failed = False
+        preview_error_msg = ""
         try:
             _ = yield from _stage("render_preview", preview_payload, 0.82)
         except UserCancelled:
             yield from _cancelled_exit()
+            return
+        except Exception as e:
+            # Check if we have enough latents to proceed without preview
+            has_shape = shape_slat_path.exists()
+            has_tex = (tex_slat_path is not None and tex_slat_path.exists()) or no_texture_gen
+            if has_shape and has_tex:
+                preview_failed = True
+                preview_error_msg = f"{type(e).__name__}: {e}"
+                _log(f"⚠️ Preview rendering failed: {preview_error_msg}", 0.85)
+                _log("Latents saved successfully. You can still extract GLB!", 0.86)
+            else:
+                # No latents, re-raise the error
+                raise
+
+        # Handle preview failure - return minimal state that allows GLB extraction
+        if preview_failed:
+            state = {
+                "_mode": "subprocess",
+                "_run_id": run_id,
+                "_run_dir": str(run_dir),
+                "_pipeline_type": pipeline_type,
+                "res": int(res),
+                "shape_slat_path": str(shape_slat_path),
+                "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
+                "preview_manifest_path": None,  # No preview available
+                "_preview_failed": True,
+                "_preview_error": preview_error_msg,
+            }
+            # Create an error HTML that shows the logs and allows extraction
+            error_html = f"""
+            <div class="previewer-container" style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 400px; padding: 20px;">
+                <div style="background: rgba(255, 100, 100, 0.15); border: 1px solid rgba(255, 100, 100, 0.4); border-radius: 8px; padding: 20px; max-width: 600px; text-align: center;">
+                    <h3 style="color: #ff6b6b; margin: 0 0 10px 0;">⚠️ Preview Rendering Failed</h3>
+                    <p style="color: #ccc; margin: 0 0 15px 0; font-size: 14px;">
+                        {preview_error_msg[:200]}{'...' if len(preview_error_msg) > 200 else ''}
+                    </p>
+                    <p style="color: #8f8; margin: 0; font-size: 14px;">
+                        <strong>Good news:</strong> Latents were saved successfully!<br>
+                        Click <strong>"Extract GLB"</strong> to generate your 3D model.
+                    </p>
+                </div>
+            </div>
+            """
+            _log('Done (preview skipped). Click "Extract GLB" to generate model.', 1.0)
+            # Keep status visible so user can see what happened
+            yield state, error_html, gr.update(value=_trim_status(status), visible=True)
             return
 
         # Build the HTML preview from the saved JPEGs (CPU-only).
@@ -2766,25 +2816,25 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 with gr.Column(scale=1, min_width=380):
                     image_prompt = gr.Image(label="Image Prompt", format="png", image_mode="RGBA", type="pil", height=400)
 
-                    resolution = gr.Radio(["512", "1024", "1536", "2048"], label="Resolution", value="1024", info="Output mesh resolution. Higher = finer detail but more VRAM. 512 uses direct sampling; 1024+ use cascade for quality. ⬆Quality ⬆VRAM")
+                    resolution = gr.Radio(["512", "1024", "1536", "2048"], label="Resolution (Generate)", value="1024", info="Output mesh resolution. Higher = finer detail but more VRAM. 512 uses direct sampling; 1024+ use cascade for quality. ⬆Quality ⬆VRAM")
                     with gr.Row():
-                        seed = gr.Slider(0, MAX_SEED, label="Seed", value=99, step=1, scale=4, info="Random seed for reproducibility. Same seed + settings = same output.")
-                        randomize_seed = gr.Checkbox(label="Randomize Seed", value=False, scale=1, info="Generate random seed each run for variety.")
-                    decimation_target = gr.Slider(100000, 1000000, label="Decimation Target", value=500000, step=10000, info="Target polygon count during mesh simplification. Higher = more geometric detail preserved but larger files. ⬆Quality, minimal VRAM impact.")
-                    remesh_method = gr.Dropdown(REMESH_METHOD_CHOICES, label="Remesh Method", value="dual_contouring", info="Mesh reconstruction algorithm. dual_contouring: fast, good quality. faithful_contouring: higher fidelity (requires extra deps).")
+                        seed = gr.Slider(0, MAX_SEED, label="Seed (Generate)", value=99, step=1, scale=4, info="Random seed for reproducibility. Same seed + settings = same output.")
+                        randomize_seed = gr.Checkbox(label="Randomize Seed (Generate)", value=False, scale=1, info="Generate random seed each run for variety.")
+                    decimation_target = gr.Slider(100000, 9000000, label="Decimation Target (Extract GLB)", value=1000000, step=10000, info="Target polygon count during mesh simplification. Higher = more geometric detail preserved but larger files. ⬆Quality, minimal VRAM impact.")
+                    remesh_method = gr.Dropdown(REMESH_METHOD_CHOICES, label="Remesh Method (Extract GLB)", value="dual_contouring", info="Mesh reconstruction algorithm. dual_contouring: fast, good quality. faithful_contouring: higher fidelity (requires extra deps).")
                     if "faithful_contouring" not in REMESH_METHOD_CHOICES:
                         gr.Markdown(
                             "**Note:** `faithful_contouring` remeshing requires optional FaithC dependencies "
                             "(`faithcontour` + `atom3d`). Not detected in this environment, so the option is hidden."
                         )
-                    simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method", value="cumesh", info="Polygon reduction method. cumesh: GPU-accelerated, fast. meshlib: CPU-based alternative. cumesh uses some GPU VRAM.")
-                    prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces", value=False, info="Remove triangles not visible from outside. Reduces polygon count, may affect internal geometry. Slight ⬇VRAM.")
-                    no_texture_gen = gr.Checkbox(label="Skip Texture Generation", value=False, info="Output shape-only mesh without PBR textures. Faster processing, significantly ⬇VRAM usage.")
-                    texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024, info="Resolution of baked texture maps (albedo, normal, etc). Higher = sharper textures. ⬆Quality ⬆VRAM during baking.")
+                    simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method (Extract GLB)", value="cumesh", info="Polygon reduction method. cumesh: GPU-accelerated, fast. meshlib: CPU-based alternative. cumesh uses some GPU VRAM.")
+                    prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces (Extract GLB)", value=False, info="Remove triangles not visible from outside. Reduces polygon count, may affect internal geometry. Slight ⬇VRAM.")
+                    no_texture_gen = gr.Checkbox(label="Skip Texture Generation (Generate + Extract GLB)", value=False, info="Output shape-only mesh without PBR textures. Faster processing, significantly ⬇VRAM usage.")
+                    texture_size = gr.Slider(1024, 4096, label="Texture Size (Extract GLB)", value=2048, step=1024, info="Resolution of baked texture maps (albedo, normal, etc). Higher = sharper textures. ⬆Quality ⬆VRAM during baking.")
                     export_formats = gr.CheckboxGroup(
                         choices=["glb", "gltf", "obj", "ply", "stl"],
                         value=["glb", "gltf", "obj", "ply", "stl"],
-                        label="Auto-save export formats (saved into outputs/<run>/08_extract/)",
+                        label="Export Formats (Extract GLB)",
                     )
 
                     with gr.Accordion("⚙️ Config Presets (Save / Load)", open=True):
@@ -2853,8 +2903,8 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                     lines=12,
                                     interactive=False,
                                 )
-                            with gr.Accordion(label="Advanced Settings", open=True):
-                                gr.Markdown("Stage 1: Sparse Structure Generation")
+                            with gr.Accordion(label="Advanced Settings (Generate)", open=True):
+                                gr.Markdown("**Stage 1: Sparse Structure Generation (Generate)**")
                                 with gr.Row():
                                     ss_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1, info="CFG scale - how strongly model follows image. Higher = more faithful but can oversaturate. 7.5 default. Slight ⬆VRAM (2 forward passes).")
                                     ss_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.7, step=0.01, info="Reduces over-exposure from high CFG by normalizing variance. 0.7 recommended. No VRAM impact.")
@@ -2882,7 +2932,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                         info="Extract mesh in spatial tiles. For extreme resolutions (256+) or complex meshes. Slower but prevents OOM."
                                     )
 
-                                gr.Markdown("Stage 2: Shape Generation")
+                                gr.Markdown("**Stage 2: Shape Generation (Generate)**")
                                 with gr.Row():
                                     shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1, info="CFG for shape latent. Higher = stronger image adherence. 7.5 default. Slight ⬆VRAM (2 passes).")
                                     shape_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.5, step=0.01, info="Variance normalization to prevent CFG artifacts. 0.5 recommended. No VRAM impact.")
@@ -2895,12 +2945,12 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                         0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG range for shape. 1.0 applies guidance through final step.")
                                     max_num_tokens = gr.Slider(
                                         10000, 200000,
-                                        label="Max Tokens (VRAM vs Quality)",
+                                        label="Max Tokens (Generate - VRAM vs Quality)",
                                         value=32768,
                                         step=1000,
                                         info="KEY VRAM CONTROL. Max voxel tokens in cascade. Lower = less VRAM but may auto-reduce resolution. 10K min, 32K-50K balanced, 100K+ max fidelity. ⬆Quality ⬆VRAM (linear).")
 
-                                gr.Markdown("Stage 3: Material Generation")
+                                gr.Markdown("**Stage 3: Material Generation (Generate)**")
                                 with gr.Row():
                                     tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1, info="CFG for texture. Low (1.0) works well since shape provides strong conditioning. Slight ⬆VRAM if >1.")
                                     tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.0, step=0.01, info="Variance normalization. 0.0 = disabled (not needed at low guidance). No VRAM impact.")
@@ -3008,7 +3058,12 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 ],
                 outputs=[output_buf, preview_output, status_box],
             ).then(
-                lambda: gr.update(interactive=True), outputs=extract_btn
+                # Enable extract button only if we have valid latent paths (even if preview failed)
+                lambda state: gr.update(interactive=True) if (
+                    isinstance(state, dict) and state.get("shape_slat_path")
+                ) else gr.update(interactive=False),
+                inputs=[output_buf],
+                outputs=extract_btn
             )
 
             # Keep users on the Preview step while extracting so progress stays visible on the preview.
