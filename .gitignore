@@ -25,6 +25,8 @@ share/python-wheels/
 org_trellis/
 .installed.cfg
 visualbruno/
+trellis_org2
+trellis_org
 *.egg
 MANIFEST
 

@@ -143,7 +143,8 @@ def _pipeline_type_from_resolution(resolution: str) -> tuple[str, int]:
     if res == 512:
         return "512", 512
     elif res == 1024:
-        return "1024", 1024
+        # Match reference pipeline: 1024 uses the cascade path.
+        return "1024_cascade", 1024
     else:
         # Any other resolution uses cascade
         return f"{res}_cascade", res
@@ -286,15 +287,44 @@ def stage_sample_sparse_structure(payload: Dict[str, Any]) -> Dict[str, Any]:
     print("[sparse] loading cond_512…", flush=True)
     cond = _load_cond(cond_512_path, device=device)
 
-    # Set seed for reproducibility
-    print(f"[sparse] setting random seed: {seed}", flush=True)
-    torch.manual_seed(seed)
+    # RNG handling:
+    # - If an RNG state is provided, restore it so subprocess stages match the single-process
+    #   reference pipeline noise sequence.
+    # - Otherwise, seed once here (first sampling stage).
+    rng_in = payload.get("rng_state_in_path")
+    rng_out = payload.get("rng_state_out_path")
+    if rng_in:
+        state = torch.load(str(rng_in), map_location="cpu")
+        if isinstance(state, dict) and "cpu" in state:
+            torch.set_rng_state(state["cpu"])
+            if torch.cuda.is_available() and state.get("cuda") is not None:
+                try:
+                    torch.cuda.set_rng_state_all(state["cuda"])
+                except Exception:
+                    pass
+        else:
+            torch.set_rng_state(state)
+        print(f"[sparse] restored RNG state: {rng_in}", flush=True)
+    else:
+        print(f"[sparse] setting random seed: {seed}", flush=True)
+        torch.manual_seed(seed)
     
     print(f"[sparse] sampling sparse structure (ss_res={ss_res})…", flush=True)
     coords = pipe.sample_sparse_structure(cond, ss_res, 1, ss_params)
     coords_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(coords.detach().cpu(), str(coords_path))
     print(f"[sparse] saved coords: {coords_path}", flush=True)
+
+    # Persist RNG state after sampling so the next stage continues the same sequence.
+    if rng_out:
+        out_state = {"cpu": torch.get_rng_state()}
+        if torch.cuda.is_available():
+            try:
+                out_state["cuda"] = torch.cuda.get_rng_state_all()
+            except Exception:
+                out_state["cuda"] = None
+        torch.save(out_state, str(rng_out))
+        print(f"[sparse] saved RNG state: {rng_out}", flush=True)
     return {"coords_path": str(coords_path)}
 
 
@@ -318,9 +348,24 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     device = "cuda"
 
-    # Set seed for reproducibility
-    print(f"[shape] setting random seed: {seed}", flush=True)
-    torch.manual_seed(seed)
+    rng_in = payload.get("rng_state_in_path")
+    rng_out = payload.get("rng_state_out_path")
+    if rng_in:
+        state = torch.load(str(rng_in), map_location="cpu")
+        if isinstance(state, dict) and "cpu" in state:
+            torch.set_rng_state(state["cpu"])
+            if torch.cuda.is_available() and state.get("cuda") is not None:
+                try:
+                    torch.cuda.set_rng_state_all(state["cuda"])
+                except Exception:
+                    pass
+        else:
+            torch.set_rng_state(state)
+        print(f"[shape] restored RNG state: {rng_in}", flush=True)
+    else:
+        # Backward-compatible fallback: deterministic but does NOT match single-process ordering.
+        print(f"[shape] setting random seed: {seed}", flush=True)
+        torch.manual_seed(seed)
 
     print("[shape] loading coords…", flush=True)
     coords = torch.load(str(coords_path), map_location="cpu").to(device)
@@ -408,6 +453,16 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     print(f"[shape] saved: {shape_slat_path}", flush=True)
     print(f"[shape] saved: {out_res_path} (res={res})", flush=True)
 
+    if rng_out:
+        out_state = {"cpu": torch.get_rng_state()}
+        if torch.cuda.is_available():
+            try:
+                out_state["cuda"] = torch.cuda.get_rng_state_all()
+            except Exception:
+                out_state["cuda"] = None
+        torch.save(out_state, str(rng_out))
+        print(f"[shape] saved RNG state: {rng_out}", flush=True)
+
     return {"shape_slat_path": str(shape_slat_path), "res": int(res), "pipeline_type": pipeline_type}
 
 
@@ -428,9 +483,23 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     device = "cuda"
 
-    # Set seed for reproducibility
-    print(f"[tex] setting random seed: {seed}", flush=True)
-    torch.manual_seed(seed)
+    rng_in = payload.get("rng_state_in_path")
+    rng_out = payload.get("rng_state_out_path")
+    if rng_in:
+        state = torch.load(str(rng_in), map_location="cpu")
+        if isinstance(state, dict) and "cpu" in state:
+            torch.set_rng_state(state["cpu"])
+            if torch.cuda.is_available() and state.get("cuda") is not None:
+                try:
+                    torch.cuda.set_rng_state_all(state["cuda"])
+                except Exception:
+                    pass
+        else:
+            torch.set_rng_state(state)
+        print(f"[tex] restored RNG state: {rng_in}", flush=True)
+    else:
+        print(f"[tex] setting random seed: {seed}", flush=True)
+        torch.manual_seed(seed)
 
     feats, coords = _load_npz_sparse(shape_slat_path)
     shape_slat = SparseTensor(feats=feats.to(device), coords=coords.to(device))
@@ -457,6 +526,16 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     tex_slat = pipe.sample_tex_slat(cond, pipe.models[flow_key], shape_slat, tex_params)
     _save_npz_sparse(tex_slat_path, tex_slat.feats, tex_slat.coords)
     print(f"[tex] saved: {tex_slat_path}", flush=True)
+
+    if rng_out:
+        out_state = {"cpu": torch.get_rng_state()}
+        if torch.cuda.is_available():
+            try:
+                out_state["cuda"] = torch.cuda.get_rng_state_all()
+            except Exception:
+                out_state["cuda"] = None
+        torch.save(out_state, str(rng_out))
+        print(f"[tex] saved RNG state: {rng_out}", flush=True)
     return {"tex_slat_path": str(tex_slat_path)}
 
 

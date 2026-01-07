@@ -472,6 +472,7 @@ def _default_ui_config() -> dict:
         },
         "image_to_3d": {
             "resolution": "1024",
+            # Keep deterministic defaults (users can enable randomize for exploration).
             "seed": 99,
             "randomize_seed": False,
             "decimation_target": 1000000,
@@ -1616,7 +1617,9 @@ def _get_pipeline_type(resolution_str: str) -> tuple[str, int]:
     if res == 512:
         return "512", 512
     elif res == 1024:
-        return "1024", 1024
+        # IMPORTANT: Use the cascade pipeline at 1024 to match the reference app (trellis_org2),
+        # which generally yields higher-fidelity shapes/textures than the direct 1024 path.
+        return "1024_cascade", 1024
     else:
         # Any other resolution uses cascade
         return f"{res}_cascade", res
@@ -1839,6 +1842,11 @@ def image_to_3d(
             yield from _cancelled_exit()
             return
 
+        # Track RNG across subprocess stages so results match the single-process reference pipeline
+        # for a given seed (instead of re-seeding each stage and changing the noise sequence).
+        rng_after_sparse_path = run_dir / "04_rng_after_sparse.pt"
+        rng_after_shape_path = run_dir / "05_rng_after_shape.pt"
+
         # Stage: sparse structure
         sparse_payload = {
             "model_repo": "microsoft/TRELLIS.2-4B",
@@ -1847,6 +1855,7 @@ def image_to_3d(
             "cond_512_path": str(cond_512_path),
             "coords_path": str(coords_path),
             "force_high_res_conditional": bool(force_high_res_conditional),
+            "rng_state_out_path": str(rng_after_sparse_path),
             "ss_params": {
                 "steps": int(ss_sampling_steps),
                 "guidance_strength": float(ss_guidance_strength),
@@ -1871,6 +1880,8 @@ def image_to_3d(
             "coords_path": str(coords_path),
             "shape_slat_path": str(shape_slat_path),
             "out_res_path": str(shape_res_path),
+            "rng_state_in_path": str(rng_after_sparse_path),
+            "rng_state_out_path": str(rng_after_shape_path),
             "shape_params": {
                 "steps": int(shape_slat_sampling_steps),
                 "guidance_strength": float(shape_slat_guidance_strength),
@@ -1897,6 +1908,7 @@ def image_to_3d(
                 "cond_path": tex_cond_path,
                 "shape_slat_path": str(shape_slat_path),
                 "tex_slat_path": str(tex_slat_path),
+                "rng_state_in_path": str(rng_after_shape_path),
                 "tex_params": {
                     "steps": int(tex_slat_sampling_steps),
                     "guidance_strength": float(tex_slat_guidance_strength),
