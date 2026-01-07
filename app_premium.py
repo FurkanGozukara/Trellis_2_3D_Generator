@@ -488,8 +488,10 @@ def _default_ui_config() -> dict:
             "ss_sampling_steps": 12,
             "ss_rescale_t": 5.0,
             "force_high_res_conditional": False,
-            "use_chunked_processing": True,
-            "use_tiled_extraction": True,
+            "use_chunked_processing": False,
+            "use_tiled_extraction": False,
+            "extract_use_chunked_processing": False,
+            "extract_use_tiled_extraction": False,
             "shape_slat_guidance_strength": 7.5,
             "shape_slat_guidance_rescale": 0.5,
             "shape_slat_guidance_interval_start": 0.6,
@@ -1798,6 +1800,7 @@ def image_to_3d(
         # Stage: sparse structure
         sparse_payload = {
             "model_repo": "microsoft/TRELLIS.2-4B",
+            "seed": int(seed),
             "resolution": resolution,
             "cond_512_path": str(cond_512_path),
             "coords_path": str(coords_path),
@@ -1819,6 +1822,7 @@ def image_to_3d(
         # Stage: shape latent
         shape_payload = {
             "model_repo": "microsoft/TRELLIS.2-4B",
+            "seed": int(seed),
             "resolution": resolution,
             "cond_512_path": str(cond_512_path),
             "cond_1024_path": str(cond_1024_path) if cond_1024_path is not None else None,
@@ -1846,6 +1850,7 @@ def image_to_3d(
             tex_cond_path = str(cond_512_path if pipeline_type == "512" else cond_1024_path)
             tex_payload = {
                 "model_repo": "microsoft/TRELLIS.2-4B",
+                "seed": int(seed),
                 "resolution": resolution,
                 "cond_path": tex_cond_path,
                 "shape_slat_path": str(shape_slat_path),
@@ -2314,8 +2319,8 @@ def extract_glb(
     no_texture_gen: bool,
     prune_invisible_faces: bool,
     export_formats: List[str],
-    use_chunked_processing: bool,
-    use_tiled_extraction: bool,
+    extract_use_chunked_processing: bool,
+    extract_use_tiled_extraction: bool,
     subprocess_mode: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
@@ -2386,8 +2391,8 @@ def extract_glb(
             "out_dir": str(out_dir),
             "prefix": "glb",
             "export_formats": list(export_formats),
-            "use_chunked_processing": bool(use_chunked_processing),
-            "use_tiled_extraction": bool(use_tiled_extraction),
+            "extract_use_chunked_processing": bool(extract_use_chunked_processing),
+            "extract_use_tiled_extraction": bool(extract_use_tiled_extraction),
         }
 
         last_ui_update = 0.0
@@ -2450,9 +2455,9 @@ def extract_glb(
     _log("Loading TRELLIS.2 pipeline…", 0.05)
     pipe = get_image_pipeline()
     yield None, None, status
-
+    
     _log("Decoding latent to mesh…", 0.15)
-    mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
+    mesh = pipe.decode_latent(shape_slat, tex_slat, res, extract_use_tiled_extraction, extract_use_chunked_processing)[0]
     yield None, None, status
 
     _log("Post-processing + baking GLB (this can take a while)…", 0.3)
@@ -2485,7 +2490,6 @@ def extract_glb(
         "remesh_method": remesh_method,
         "prune_invisible": prune_invisible_faces,
         "use_tqdm": True,
-        "use_chunked_processing": use_chunked_processing,
     }
     try:
         glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
@@ -2924,19 +2928,33 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                         0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="End of CFG application range [0-1]. Set to <1.0 to skip guidance on final steps.")
                                 with gr.Row():
                                     force_high_res_conditional = gr.Checkbox(
-                                        label="Force High-Res Conditioning",
+                                        label="Force High-Res Conditioning (Generate)",
                                         value=False,
                                         info="Use 1024 resolution for sparse structure conditioning instead of 512. May improve stability but increases VRAM usage."
                                     )
+                                gr.Markdown("**Mesh Extraction Optimizations (Generate)**")
+                                with gr.Row():
                                     use_chunked_processing = gr.Checkbox(
-                                        label="Chunked Triangle Processing",
-                                        value=True,
-                                        info="Process mesh triangles in chunks during extraction. Reduces VRAM usage on large meshes. Recommended: ON."
+                                        label="Chunked Triangle Processing (Generate)",
+                                        value=False,
+                                        info="Process mesh triangles in chunks during Generate preview. Reduces VRAM spikes, no quality impact. Enable if you get OOM."
                                     )
                                     use_tiled_extraction = gr.Checkbox(
-                                        label="Tiled Mesh Extraction",
-                                        value=True,
-                                        info="Extract mesh in spatial tiles. For extreme resolutions (256+) or complex meshes. Slower but prevents OOM."
+                                        label="Tiled Mesh Extraction (Generate)",
+                                        value=False,
+                                        info="Extract mesh in spatial tiles during Generate preview. Only enable if you get OOM during Generate. May degrade quality."
+                                    )
+                                gr.Markdown("**Mesh Extraction Optimizations (Extract GLB)**")
+                                with gr.Row():
+                                    extract_use_chunked_processing = gr.Checkbox(
+                                        label="Chunked Triangle Processing (Extract GLB)",
+                                        value=False,
+                                        info="Process mesh triangles in chunks during Extract GLB. Reduces VRAM spikes, no quality impact. Enable if you get OOM."
+                                    )
+                                    extract_use_tiled_extraction = gr.Checkbox(
+                                        label="Tiled Mesh Extraction (Extract GLB)",
+                                        value=False,
+                                        info="Extract mesh in spatial tiles during Extract GLB. Only enable if you get OOM during extraction. May degrade quality."
                                     )
 
                                 gr.Markdown("**Stage 2: Shape Generation (Generate)**")
@@ -3085,8 +3103,8 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     no_texture_gen,
                     prune_invisible_faces,
                     export_formats,
-                    use_chunked_processing,
-                    use_tiled_extraction,
+                    extract_use_chunked_processing,
+                    extract_use_tiled_extraction,
                     subprocess_mode,
                 ],
                 outputs=[glb_output, download_btn, status_box],
@@ -3761,6 +3779,8 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         ("image_to_3d", "force_high_res_conditional"),
         ("image_to_3d", "use_chunked_processing"),
         ("image_to_3d", "use_tiled_extraction"),
+        ("image_to_3d", "extract_use_chunked_processing"),
+        ("image_to_3d", "extract_use_tiled_extraction"),
         ("image_to_3d", "shape_slat_guidance_strength"),
         ("image_to_3d", "shape_slat_guidance_rescale"),
         ("image_to_3d", "shape_slat_guidance_interval_start"),
@@ -3807,6 +3827,8 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         force_high_res_conditional,
         use_chunked_processing,
         use_tiled_extraction,
+        extract_use_chunked_processing,
+        extract_use_tiled_extraction,
         shape_slat_guidance_strength,
         shape_slat_guidance_rescale,
         shape_slat_guidance_interval_start,

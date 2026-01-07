@@ -235,8 +235,6 @@ def to_glb(
     prune_invisible: bool = False,
     verbose: bool = False,
     use_tqdm: bool = False,
-    use_chunked_processing: bool = False,
-    use_tiled_extraction: bool = False,
 ):
     """
     Convert an extracted mesh to a GLB file.
@@ -266,8 +264,6 @@ def to_glb(
         prune_invisible: whether to prune invisible faces (inner geometry) before texturing
         verbose: whether to print verbose messages
         use_tqdm: whether to use tqdm to display progress bar
-        use_chunked_processing: (NOTE: Not used in postprocessing stage; only applies during initial mesh extraction)
-        use_tiled_extraction: (NOTE: Not used in postprocessing stage; only applies during initial mesh extraction)
     """
     # --- Input Normalization (AABB, Voxel Size, Grid Size) ---
     if isinstance(aabb, (list, tuple)):

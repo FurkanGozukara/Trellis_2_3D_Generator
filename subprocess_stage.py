@@ -239,6 +239,7 @@ def stage_sample_sparse_structure(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
     pipeline_type = _pipeline_type_from_resolution(resolution)
     ss_res = _ss_res_from_pipeline_type(pipeline_type)
@@ -261,6 +262,10 @@ def stage_sample_sparse_structure(payload: Dict[str, Any]) -> Dict[str, Any]:
     print("[sparse] loading cond_512…", flush=True)
     cond = _load_cond(cond_512_path, device=device)
 
+    # Set seed for reproducibility
+    print(f"[sparse] setting random seed: {seed}", flush=True)
+    torch.manual_seed(seed)
+    
     print(f"[sparse] sampling sparse structure (ss_res={ss_res})…", flush=True)
     coords = pipe.sample_sparse_structure(cond, ss_res, 1, ss_params)
     coords_path.parent.mkdir(parents=True, exist_ok=True)
@@ -275,6 +280,7 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
     pipeline_type = _pipeline_type_from_resolution(resolution)
     shape_params = payload["shape_params"]
@@ -287,6 +293,10 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     out_res_path = Path(payload["out_res_path"])
 
     device = "cuda"
+
+    # Set seed for reproducibility
+    print(f"[shape] setting random seed: {seed}", flush=True)
+    torch.manual_seed(seed)
 
     print("[shape] loading coords…", flush=True)
     coords = torch.load(str(coords_path), map_location="cpu").to(device)
@@ -378,10 +388,12 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import torch
     from trellis2.modules.sparse import SparseTensor
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
     pipeline_type = _pipeline_type_from_resolution(resolution)
 
@@ -391,6 +403,10 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     tex_params = payload["tex_params"]
 
     device = "cuda"
+
+    # Set seed for reproducibility
+    print(f"[tex] setting random seed: {seed}", flush=True)
+    torch.manual_seed(seed)
 
     feats, coords = _load_npz_sparse(shape_slat_path)
     shape_slat = SparseTensor(feats=feats.to(device), coords=coords.to(device))
@@ -469,7 +485,7 @@ def stage_render_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     preview_dir = Path(payload["preview_dir"])
     manifest_path = Path(payload["preview_manifest_path"])
     use_tiled_extraction = bool(payload.get("use_tiled_extraction", False))
-    use_chunked_processing = bool(payload.get("use_chunked_processing", True))
+    use_chunked_processing = bool(payload.get("use_chunked_processing", False))
 
     device = "cuda"
 
@@ -633,8 +649,10 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     simplify_method = str(payload["simplify_method"])
     prune_invisible_faces = bool(payload["prune_invisible_faces"])
     no_texture_gen = bool(payload["no_texture_gen"])
-    use_tiled_extraction = bool(payload.get("use_tiled_extraction", False))
-    use_chunked_processing = bool(payload.get("use_chunked_processing", True))
+    
+    # Extract GLB mesh extraction settings (user-configurable)
+    extract_use_tiled_extraction = bool(payload.get("extract_use_tiled_extraction", False))
+    extract_use_chunked_processing = bool(payload.get("extract_use_chunked_processing", False))
 
     out_dir = Path(payload["out_dir"])
     prefix = str(payload.get("prefix", "glb"))
@@ -673,7 +691,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     _log_vram_usage("Before extract decode_latent")
 
     print("[extract] decoding latent to mesh…", flush=True)
-    mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
+    mesh = pipe.decode_latent(shape_slat, tex_slat, res, extract_use_tiled_extraction, extract_use_chunked_processing)[0]
     
     # Save values needed later before unloading pipeline
     pbr_attr_layout = pipe.pbr_attr_layout
@@ -726,7 +744,6 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
         "remesh_method": remesh_method,
         "prune_invisible": prune_invisible_faces,
         "use_tqdm": True,
-        "use_chunked_processing": use_chunked_processing,
     }
     try:
         glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)

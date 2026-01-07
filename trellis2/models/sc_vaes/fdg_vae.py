@@ -66,7 +66,7 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
         self.resolution = resolution
         self.voxel_margin = voxel_margin
         self.use_tiled_extraction = False
-        self.use_chunked_processing = True
+        self.use_chunked_processing = False
         
         super().__init__(
             7,
