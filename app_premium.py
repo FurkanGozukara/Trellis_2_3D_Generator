@@ -2950,6 +2950,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                             cancel_confirm_state = gr.State({"armed": False, "armed_at": 0.0, "scope": ""})
                             with gr.Row():
                                 open_outputs_top_btn = gr.Button("📂 Open outputs folder", variant="secondary")
+                                view_logs_btn = gr.Button("📄 View Logs", variant="secondary")
                                 cancel_processing_btn = gr.Button("🛑 Cancel processing", variant="stop")
                             with gr.Accordion(label="📦 Batch Processing", open=False):
                                 batch_enabled = gr.Checkbox(label="Enable batch processing", value=False)
@@ -3073,6 +3074,8 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
             )
 
             output_buf = gr.State()
+            # State to track logs visibility (starts as visible during generation)
+            logs_visible_state = gr.State(True)
 
             def _reset_image_to_3d_ui():
                 return (
@@ -3087,6 +3090,8 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                         visible=True,
                         value="Select an image (upload or example), then click Generate.",
                     ),  # status_box
+                    True,  # logs_visible_state
+                    gr.update(value="📄 Hide Logs"),  # view_logs_btn
                 )
 
             # Note: We intentionally do not auto-preprocess on upload/example click.
@@ -3097,7 +3102,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
             image_prompt.change(
                 _reset_image_to_3d_ui,
                 inputs=[],
-                outputs=[output_buf, preview_output, extract_btn, view_extract_btn, walkthrough, glb_output, download_btn, status_box],
+                outputs=[output_buf, preview_output, extract_btn, view_extract_btn, walkthrough, glb_output, download_btn, status_box, logs_visible_state, view_logs_btn],
             )
 
             generate_btn.click(
@@ -3109,7 +3114,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
             ).then(
                 _reset_image_to_3d_ui,
                 inputs=[],
-                outputs=[output_buf, preview_output, extract_btn, view_extract_btn, walkthrough, glb_output, download_btn, status_box],
+                outputs=[output_buf, preview_output, extract_btn, view_extract_btn, walkthrough, glb_output, download_btn, status_box, logs_visible_state, view_logs_btn],
             ).then(
                 image_to_3d,
                 inputs=[
@@ -3178,7 +3183,10 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
 
             # Navigation-only controls (do NOT re-run extraction)
             view_extract_btn.click(lambda: gr.Walkthrough(selected=1), outputs=walkthrough)
-            back_to_preview_btn.click(lambda: gr.Walkthrough(selected=0), outputs=walkthrough)
+            back_to_preview_btn.click(
+                lambda: (gr.Walkthrough(selected=0), gr.update(visible=False), False, gr.update(value="📄 View Logs")),
+                outputs=[walkthrough, status_box, logs_visible_state, view_logs_btn]
+            )
 
             # Fullscreen toggle for the extracted 3D viewer (client-side only)
             fullscreen_glb_btn.click(
@@ -3236,6 +3244,20 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 fn=_open_outputs_from_main_controls,
                 inputs=[status_box, batch_status_box],
                 outputs=[status_box, batch_status_box],
+                queue=False,
+                show_progress="hidden",
+            )
+            
+            def _toggle_logs(current_visible: bool) -> tuple:
+                """Toggle visibility of status logs."""
+                new_visible = not current_visible
+                btn_text = "📄 Hide Logs" if new_visible else "📄 View Logs"
+                return gr.update(visible=new_visible), new_visible, gr.update(value=btn_text)
+            
+            view_logs_btn.click(
+                fn=_toggle_logs,
+                inputs=[logs_visible_state],
+                outputs=[status_box, logs_visible_state, view_logs_btn],
                 queue=False,
                 show_progress="hidden",
             )
