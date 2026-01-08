@@ -104,6 +104,95 @@ def _save_npz_sparse(path: Path, feats: "torch.Tensor", coords: "torch.Tensor") 
     np.savez_compressed(str(path), feats=feats.detach().cpu().numpy(), coords=coords.detach().cpu().numpy())
 
 
+def _filter_spatial_cache_for_save(cache: dict) -> dict:
+    """Filter out SubMConv3dNeighborCache entries which can't be properly serialized/moved.
+    These caches will be regenerated automatically by the convolution operations."""
+    filtered = {}
+    for key, value in cache.items():
+        if isinstance(value, dict):
+            # Recursively filter nested dicts (scale-keyed cache structure)
+            filtered_sub = {}
+            for k, v in value.items():
+                # Skip neighbor cache entries (contain SubMConv3dNeighborCache)
+                if 'neighbor' in str(k).lower():
+                    continue
+                # Check if value is a SubMConv3dNeighborCache object
+                if hasattr(v, '__class__') and 'NeighborCache' in v.__class__.__name__:
+                    continue
+                filtered_sub[k] = v
+            if filtered_sub:
+                filtered[key] = filtered_sub
+        else:
+            # Skip if it's a NeighborCache object
+            if hasattr(value, '__class__') and 'NeighborCache' in value.__class__.__name__:
+                continue
+            filtered[key] = value
+    return filtered
+
+
+def _save_sparse_tensor_full(path: Path, tensor: "SparseTensor") -> None:
+    """Save a SparseTensor including its spatial cache using torch.save."""
+    import torch
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Move to CPU before saving
+    tensor_cpu = tensor.cpu()
+    # Filter out NeighborCache entries that can't be properly moved between devices
+    filtered_cache = _filter_spatial_cache_for_save(tensor_cpu._spatial_cache)
+    data = {
+        "feats": tensor_cpu.feats,
+        "coords": tensor_cpu.coords,
+        "_spatial_cache": filtered_cache,
+        "_scale": tensor_cpu._scale if hasattr(tensor_cpu, '_scale') else None,
+        "_shape": tensor_cpu._shape if hasattr(tensor_cpu, '_shape') else None,
+    }
+    torch.save(data, str(path))
+
+
+def _move_cache_to_device(cache: dict, device: str) -> dict:
+    """Recursively move all tensors in a nested dict/tuple structure to device."""
+    import torch
+
+    if isinstance(cache, dict):
+        return {k: _move_cache_to_device(v, device) for k, v in cache.items()}
+    elif isinstance(cache, tuple):
+        return tuple(_move_cache_to_device(v, device) for v in cache)
+    elif isinstance(cache, list):
+        return [_move_cache_to_device(v, device) for v in cache]
+    elif isinstance(cache, torch.Tensor):
+        return cache.to(device)
+    else:
+        # For custom objects like SubMConv3dNeighborCache, try to move if possible
+        if hasattr(cache, 'to'):
+            return cache.to(device)
+        return cache
+
+
+def _load_sparse_tensor_full(path: Path, device: str = "cpu") -> "SparseTensor":
+    """Load a SparseTensor including its spatial cache."""
+    import torch
+    from trellis2.modules.sparse import SparseTensor
+
+    # weights_only=False needed because spatial cache contains custom flex_gemm objects
+    data = torch.load(str(path), map_location="cpu", weights_only=False)
+
+    # Move spatial cache tensors to target device
+    spatial_cache = data.get("_spatial_cache", {})
+    if device != "cpu":
+        spatial_cache = _move_cache_to_device(spatial_cache, device)
+
+    tensor = SparseTensor(
+        feats=data["feats"],
+        coords=data["coords"],
+        spatial_cache=spatial_cache,
+    )
+    if data.get("_scale") is not None:
+        tensor._scale = data["_scale"]
+    if data.get("_shape") is not None:
+        tensor._shape = data["_shape"]
+    return tensor.to(device)
+
+
 def _load_cond(path: Path, device: str) -> Dict[str, "torch.Tensor"]:
     import torch
 
@@ -904,68 +993,247 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"glb_path": str(glb_path)}
 
 
-def stage_texture_generate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    import trimesh
+def stage_tex_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Stage 1: Load image conditioning model, compute embeddings, save, exit."""
     import torch
     from PIL import Image
     from trellis2.pipelines import Trellis2TexturingPipeline
 
-    from subprocess_utils import next_indexed_path
+    model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "texturing_pipeline.json")
+    
+    image_path = Path(payload["image_path"])
+    preprocessed_image_path = Path(payload["preprocessed_image_path"])
+    cond_path = Path(payload["cond_path"])
+    resolution = int(payload["resolution"])
+    seed = int(payload["seed"])
+
+    device = "cuda"
+    
+    print("[tex_cond] loading texturing pipeline (image_cond_model only)...", flush=True)
+    _log_vram_usage("Before loading")
+    
+    # Load ONLY image conditioning model
+    pipe = Trellis2TexturingPipeline.from_pretrained(
+        model_repo,
+        config_file=config_file,
+        ignore_models=_ignore_except_texturing_models([])  # Load base + image_cond_model
+    )
+    pipe.cuda()
+    
+    _log_vram_usage("After loading")
+    
+    print("[tex_cond] loading and preprocessing image...", flush=True)
+    img = Image.open(str(image_path))
+    img = pipe.preprocess_image(img)
+    
+    # Save preprocessed image
+    preprocessed_image_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(str(preprocessed_image_path))
+    print(f"[tex_cond] saved preprocessed image: {preprocessed_image_path}", flush=True)
+    
+    torch.manual_seed(seed)
+    cond_res = 512 if resolution == 512 else 1024
+    print(f"[tex_cond] computing image embeddings ({cond_res}px)...", flush=True)
+    cond = pipe.get_cond([img], cond_res)
+    
+    # Save conditioning
+    cond_path.parent.mkdir(parents=True, exist_ok=True)
+    _save_cond(cond_path, cond)
+    print(f"[tex_cond] saved: {cond_path}", flush=True)
+    
+    torch.cuda.empty_cache()
+    _log_vram_usage("After save (before exit)")
+    
+    return {"cond_path": str(cond_path), "preprocessed_image_path": str(preprocessed_image_path)}
+
+
+def stage_tex_encode_shape(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Stage 2: Load Texturing pipeline, encode mesh, save, exit."""
+    import trimesh
+    import torch
+    from trellis2.pipelines import Trellis2TexturingPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
     config_file = payload.get("config_file", "texturing_pipeline.json")
-    low_vram = payload.get("low_vram", False)
 
     mesh_path = Path(payload["mesh_path"])
-    image_path = Path(payload["image_path"])
-    seed = int(payload["seed"])
+    shape_slat_path = Path(payload["shape_slat_path"])
     resolution = int(payload["resolution"])
-    texture_size = int(payload["texture_size"])
-    tex_params = payload["tex_params"]
 
-    out_dir = Path(payload["out_dir"])
-    prefix = str(payload.get("prefix", "textured"))
+    device = "cuda"
 
-    print("[texturing] loading texturing pipeline…", flush=True)
-    pipe = Trellis2TexturingPipeline.from_pretrained(model_repo, config_file=config_file)
+    print("[tex_shape] loading Texturing pipeline (shape_slat_encoder only)...", flush=True)
+    _log_vram_usage("Before loading")
+
+    # Use Texturing pipeline which has encode_shape_slat and preprocess_mesh
+    # Only load shape_slat_encoder to save memory
+    pipe = Trellis2TexturingPipeline.from_pretrained(
+        model_repo,
+        config_file=config_file,
+        ignore_models=_ignore_except_texturing_models(["shape_slat_encoder"])
+    )
     pipe.cuda()
 
-    print("[texturing] loading mesh…", flush=True)
+    _log_vram_usage("After loading")
+
+    print("[tex_shape] loading mesh...", flush=True)
     mesh = trimesh.load(str(mesh_path))
     if isinstance(mesh, trimesh.Scene):
         mesh = mesh.to_mesh()
 
-    print("[texturing] loading reference image…", flush=True)
-    img = Image.open(str(image_path))
-
-    print("[texturing] preprocessing image…", flush=True)
-    img = pipe.preprocess_image(img)
-
-    print("[texturing] preprocessing mesh…", flush=True)
+    # Use the pipeline's preprocessing method
+    print("[tex_shape] preprocessing mesh...", flush=True)
     mesh = pipe.preprocess_mesh(mesh)
+    
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    _log_vram_usage("Before encoding")
+
+    print("[tex_shape] encoding mesh to shape latent...", flush=True)
+    # Use inference mode to avoid gradient memory allocation
+    with torch.inference_mode():
+        shape_slat = pipe.encode_shape_slat(mesh, resolution)
+
+    # Save shape latent with spatial cache (needed for decoding)
+    _save_sparse_tensor_full(shape_slat_path, shape_slat)
+    print(f"[tex_shape] saved: {shape_slat_path}", flush=True)
+    
+    torch.cuda.empty_cache()
+    _log_vram_usage("After save (before exit)")
+    
+    return {"shape_slat_path": str(shape_slat_path)}
+
+
+def stage_tex_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Stage 3: Load texture flow model, sample texture latent, save, exit."""
+    import torch
+    from trellis2.pipelines import Trellis2TexturingPipeline
+
+    model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "texturing_pipeline.json")
+    
+    cond_path = Path(payload["cond_path"])
+    shape_slat_path = Path(payload["shape_slat_path"])
+    tex_slat_path = Path(payload["tex_slat_path"])
+    resolution = int(payload["resolution"])
+    tex_params = payload["tex_params"]
+    seed = int(payload["seed"])
+
+    device = "cuda"
+    
+    # Determine which model to load
+    tex_model_key = "tex_slat_flow_model_512" if resolution == 512 else "tex_slat_flow_model_1024"
+    
+    print(f"[tex_sample] loading texturing pipeline ({tex_model_key} only)...", flush=True)
+    _log_vram_usage("Before loading")
+    
+    # Load ONLY texture flow model
+    pipe = Trellis2TexturingPipeline.from_pretrained(
+        model_repo,
+        config_file=config_file,
+        ignore_models=_ignore_except_texturing_models([tex_model_key])
+    )
+    pipe.cuda()
+    
+    _log_vram_usage("After loading")
+    
+    print("[tex_sample] loading conditioning...", flush=True)
+    cond = _load_cond(cond_path, device=device)
+
+    print("[tex_sample] loading shape latent (with spatial cache)...", flush=True)
+    shape_slat = _load_sparse_tensor_full(shape_slat_path, device=device)
+
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    _log_vram_usage("Before sampling")
 
     torch.manual_seed(seed)
-    print(f"[texturing] computing image embeddings ({512 if resolution == 512 else 1024}px)…", flush=True)
-    cond = pipe.get_cond([img], 512) if resolution == 512 else pipe.get_cond([img], 1024)
-
-    print("[texturing] encoding mesh to shape latent…", flush=True)
-    shape_slat = pipe.encode_shape_slat(mesh, resolution)
-
-    tex_model_key = "tex_slat_flow_model_512" if resolution == 512 else "tex_slat_flow_model_1024"
-    print("[texturing] sampling texture latent…", flush=True)
+    print(f"[tex_sample] sampling texture latent ({tex_model_key})...", flush=True)
     tex_slat = pipe.sample_tex_slat(cond, pipe.models[tex_model_key], shape_slat, tex_params)
 
-    print("[texturing] decoding texture latent…", flush=True)
-    pbr_voxel = pipe.decode_tex_slat(tex_slat)
+    # Save texture latent with spatial cache (needed for decoding)
+    _save_sparse_tensor_full(tex_slat_path, tex_slat)
+    print(f"[tex_sample] saved: {tex_slat_path}", flush=True)
+    
+    torch.cuda.empty_cache()
+    _log_vram_usage("After save (before exit)")
+    
+    return {"tex_slat_path": str(tex_slat_path)}
 
-    print("[texturing] baking textures onto mesh…", flush=True)
-    out_mesh = pipe.postprocess_mesh(mesh, pbr_voxel, resolution, texture_size)
 
+def stage_tex_decode_and_bake(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Stage 4: Load decoder, decode texture, bake onto mesh, save GLB, exit."""
+    import trimesh
+    import torch
+    from trellis2.pipelines import Trellis2TexturingPipeline
+    from subprocess_utils import next_indexed_path
+
+    model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "texturing_pipeline.json")
+    
+    mesh_path = Path(payload["mesh_path"])
+    tex_slat_path = Path(payload["tex_slat_path"])
+    resolution = int(payload["resolution"])
+    texture_size = int(payload["texture_size"])
+    out_dir = Path(payload["out_dir"])
+    prefix = str(payload.get("prefix", "textured"))
+
+    device = "cuda"
+    
+    print("[tex_bake] loading texturing pipeline (tex_slat_decoder only)...", flush=True)
+    _log_vram_usage("Before loading")
+    
+    # Load ONLY texture decoder
+    pipe = Trellis2TexturingPipeline.from_pretrained(
+        model_repo,
+        config_file=config_file,
+        ignore_models=_ignore_except_texturing_models(["tex_slat_decoder"])
+    )
+    pipe.cuda()
+    
+    _log_vram_usage("After loading")
+    
+    print("[tex_bake] loading mesh...", flush=True)
+    mesh = trimesh.load(str(mesh_path))
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.to_mesh()
+    mesh = pipe.preprocess_mesh(mesh)
+    
+    print("[tex_bake] loading texture latent (with spatial cache)...", flush=True)
+    tex_slat = _load_sparse_tensor_full(tex_slat_path, device=device)
+
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    _log_vram_usage("Before decoding")
+
+    print("[tex_bake] decoding texture latent...", flush=True)
+    # Use inference mode to reduce memory usage
+    with torch.inference_mode():
+        pbr_voxel = pipe.decode_tex_slat(tex_slat)
+
+    # Free tex_slat memory before postprocessing
+    del tex_slat
+    gc.collect()
+    torch.cuda.empty_cache()
+    _log_vram_usage("After decoding")
+
+    print("[tex_bake] baking textures onto mesh...", flush=True)
+    with torch.inference_mode():
+        out_mesh = pipe.postprocess_mesh(mesh, pbr_voxel, resolution, texture_size)
+    
     _, out_path = next_indexed_path(out_dir, prefix=prefix, ext="glb", digits=4, start=1)
     out_mesh.export(str(out_path), extension_webp=False)
+    
     torch.cuda.empty_cache()
-    print(f"[texturing] saved: {out_path}", flush=True)
+    _log_vram_usage("After export (before exit)")
+    
+    print(f"[tex_bake] saved: {out_path}", flush=True)
     return {"glb_path": str(out_path)}
+
 
 
 def main() -> int:
@@ -999,8 +1267,14 @@ def main() -> int:
             result = stage_render_preview(payload)
         elif stage == "extract_glb":
             result = stage_extract_glb(payload)
-        elif stage == "texture_generate":
-            result = stage_texture_generate(payload)
+        elif stage == "tex_encode_cond":
+            result = stage_tex_encode_cond(payload)
+        elif stage == "tex_encode_shape":
+            result = stage_tex_encode_shape(payload)
+        elif stage == "tex_sample_tex_slat":
+            result = stage_tex_sample_tex_slat(payload)
+        elif stage == "tex_decode_and_bake":
+            result = stage_tex_decode_and_bake(payload)
         else:
             raise ValueError(f"Unknown stage: {stage}")
 

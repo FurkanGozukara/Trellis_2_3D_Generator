@@ -196,15 +196,17 @@ class Trellis2TexturingPipeline(Pipeline):
         Args:
             mesh (trimesh.Trimesh): The mesh to encode.
             resolution (int): The resolution of mesh
-        
+
         Returns:
             SparseTensor: The encoded structured latent.
         """
-        vertices = torch.from_numpy(mesh.vertices).float()
-        faces = torch.from_numpy(mesh.faces).long()
-        
-        voxel_indices, dual_vertices, intersected = o_voxel.convert.mesh_to_flexible_dual_grid(
-            vertices.cpu(), faces.cpu(),
+        import gc
+
+        mesh_vertices = torch.from_numpy(mesh.vertices).float()
+        mesh_faces = torch.from_numpy(mesh.faces).long()
+
+        voxel_indices, dual_vertices, intersected_cpu = o_voxel.convert.mesh_to_flexible_dual_grid(
+            mesh_vertices.cpu(), mesh_faces.cpu(),
             grid_size=resolution,
             aabb=[[-0.5,-0.5,-0.5],[0.5,0.5,0.5]],
             face_weight=1.0,
@@ -212,18 +214,48 @@ class Trellis2TexturingPipeline(Pipeline):
             regularization_weight=1e-2,
             timing=True,
         )
-            
-        vertices = SparseTensor(
-            feats=dual_vertices * resolution - voxel_indices,
-            coords=torch.cat([torch.zeros_like(voxel_indices[:, 0:1]), voxel_indices], dim=-1)
-        ).to(self.device)
-        intersected = vertices.replace(intersected).to(self.device)
-            
+
+        # Free CPU tensors no longer needed
+        del mesh_vertices, mesh_faces
+        gc.collect()
+
+        # Create sparse tensor features and coords on CPU first
+        feats = dual_vertices * resolution - voxel_indices
+        coords = torch.cat([torch.zeros_like(voxel_indices[:, 0:1]), voxel_indices], dim=-1)
+
+        # Free intermediate CPU tensors
+        del dual_vertices, voxel_indices
+        gc.collect()
+
+        # Create SparseTensor on CPU first, then move to GPU
+        vertices = SparseTensor(feats=feats, coords=coords)
+        num_voxels = vertices.feats.shape[0]
+        print(f"[encode_shape_slat] Number of voxels: {num_voxels:,} (resolution={resolution})", flush=True)
+        del feats, coords
+        gc.collect()
+
+        # Move to GPU
+        vertices = vertices.to(self.device)
+        torch.cuda.empty_cache()
+
+        # Create intersected SparseTensor and move to GPU
+        intersected = vertices.replace(intersected_cpu).to(self.device)
+        del intersected_cpu
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Log memory before encoder
+        if torch.cuda.is_available():
+            alloc_gb = torch.cuda.memory_allocated() / 1e9
+            reserved_gb = torch.cuda.memory_reserved() / 1e9
+            print(f"[encode_shape_slat] GPU memory before encoder: {alloc_gb:.2f}GB allocated, {reserved_gb:.2f}GB reserved", flush=True)
+
         if self.low_vram:
             self.models['shape_slat_encoder'].to(self.device)
         shape_slat = self.models['shape_slat_encoder'](vertices, intersected)
         if self.low_vram:
             self.models['shape_slat_encoder'].cpu()
+            torch.cuda.empty_cache()
         return shape_slat
 
     def sample_tex_slat(

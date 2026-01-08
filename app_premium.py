@@ -513,6 +513,7 @@ def _default_ui_config() -> dict:
             "seed": 99,
             "randomize_seed": False,
             "texture_size": 2048,
+            "low_vram": True,  # Default True for memory safety
             "guidance_strength": 1.0,
             "guidance_rescale": 0.0,
             "guidance_interval_start": 0.6,
@@ -791,6 +792,27 @@ def get_texturing_pipeline():
         )
         _texturing_pipeline.cuda()
     return _texturing_pipeline
+
+
+def unload_global_pipelines():
+    """Unload any global pipelines to free VRAM before subprocess mode."""
+    global _image_pipeline, _texturing_pipeline
+    import gc
+
+    if _image_pipeline is not None:
+        print("[main] Unloading global image pipeline to free VRAM...", flush=True)
+        _image_pipeline.cpu()
+        del _image_pipeline
+        _image_pipeline = None
+
+    if _texturing_pipeline is not None:
+        print("[main] Unloading global texturing pipeline to free VRAM...", flush=True)
+        _texturing_pipeline.cpu()
+        del _texturing_pipeline
+        _texturing_pipeline = None
+
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 # ------------------------------- Session Utils ------------------------------
@@ -1727,6 +1749,9 @@ def image_to_3d(
     yield None, empty_html, gr.update(value=_trim_status(status), visible=True)
 
     if subprocess_mode:
+        # Unload any global pipelines to free VRAM for subprocess
+        unload_global_pipelines()
+
         # Subprocess stage pipeline (zero VRAM kept by the UI process).
         _log(f"Subprocess mode ON. Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.01)
         yield None, empty_html, status
@@ -2619,6 +2644,7 @@ def shapeimage_to_tex(
     tex_slat_guidance_interval_end: float,
     tex_slat_sampling_steps: int,
     tex_slat_rescale_t: float,
+    low_vram: bool,
     subprocess_mode: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
@@ -2642,10 +2668,12 @@ def shapeimage_to_tex(
         raise gr.Error("Please provide a reference image (or use the example).")
 
     if subprocess_mode:
+        # Unload any global pipelines to free VRAM for subprocess
+        unload_global_pipelines()
+
         run = allocate_run_dir(OUTPUTS_DIR, digits=4)
         run_dir = run.run_dir
         run_id = run.run_id
-        logs_dir = ensure_dir(run_dir / "logs")
         work_dir = Path(TMP_DIR) / str(req.session_hash) / "subprocess" / run_id
         work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2684,30 +2712,113 @@ def shapeimage_to_tex(
         _log(f"Subprocess mode ON. Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.02)
         yield None, None, status
 
-        payload = {
+        # Define intermediate paths
+        preprocessed_image_path = run_dir / "02_reference_preprocessed.png"
+        cond_path = run_dir / "03_cond.npz"
+        shape_slat_path = run_dir / "04_shape_slat.pt"  # Use .pt to preserve spatial cache
+        tex_slat_path = run_dir / "05_tex_slat.pt"  # Use .pt to preserve spatial cache
+        out_dir = run_dir / "08_texturing"
+
+        tex_params = {
+            "steps": int(tex_slat_sampling_steps),
+            "guidance_strength": float(tex_slat_guidance_strength),
+            "guidance_rescale": float(tex_slat_guidance_rescale),
+            "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
+            "rescale_t": float(tex_slat_rescale_t),
+        }
+
+        common_payload = {
             "model_repo": "microsoft/TRELLIS.2-4B",
             "config_file": "texturing_pipeline.json",
-            "mesh_path": str(mesh_copy),
-            "image_path": str(img_path),
             "seed": int(seed),
             "resolution": int(resolution),
-            "texture_size": int(texture_size),
-            "tex_params": {
-                "steps": int(tex_slat_sampling_steps),
-                "guidance_strength": float(tex_slat_guidance_strength),
-                "guidance_rescale": float(tex_slat_guidance_rescale),
-                "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
-                "rescale_t": float(tex_slat_rescale_t),
-            },
-            "out_dir": str(run_dir / "08_texturing"),
-            "prefix": "textured",
         }
 
         last_ui_update = 0.0
-        log_path = Path(logs_dir) / "texture_generate.log"
-        result = None
+        
+        # Single unified log file for all texturing stages
+        unified_log_path = run_dir / "texture_tab_run_logs.txt"
+
         try:
-            for ev in _iter_subprocess_stage("texture_generate", payload, work_dir, log_path, session=session):
+            # Stage 1: Encode conditioning (image embeddings)
+            _log("Computing image embeddings...", 0.1)
+            yield None, None, status
+            payload1 = {
+                **common_payload,
+                "image_path": str(img_path),
+                "preprocessed_image_path": str(preprocessed_image_path),
+                "cond_path": str(cond_path),
+            }
+            for ev in _iter_subprocess_stage("tex_encode_cond", payload1, work_dir, unified_log_path, session=session):
+                if ev["type"] == "log":
+                    line = ev["text"]
+                    if line:
+                        status = status + "\n" + line
+                        status = _trim_status(status)
+                    now = time.time()
+                    if now - last_ui_update > 0.6:
+                        last_ui_update = now
+                        yield None, None, status
+                else:
+                    result1 = ev["result"]
+
+            # Stage 2: Encode shape
+            _log("Encoding mesh to shape latent...", 0.3)
+            yield None, None, status
+            payload2 = {
+                **common_payload,
+                "mesh_path": str(mesh_copy),
+                "shape_slat_path": str(shape_slat_path),
+            }
+            for ev in _iter_subprocess_stage("tex_encode_shape", payload2, work_dir, unified_log_path, session=session):
+                if ev["type"] == "log":
+                    line = ev["text"]
+                    if line:
+                        status = status + "\n" + line
+                        status = _trim_status(status)
+                    now = time.time()
+                    if now - last_ui_update > 0.6:
+                        last_ui_update = now
+                        yield None, None, status
+                else:
+                    result2 = ev["result"]
+
+            # Stage 3: Sample texture latent
+            _log("Sampling texture latent...", 0.5)
+            yield None, None, status
+            payload3 = {
+                **common_payload,
+                "cond_path": str(cond_path),
+                "shape_slat_path": str(shape_slat_path),
+                "tex_slat_path": str(tex_slat_path),
+                "tex_params": tex_params,
+            }
+            for ev in _iter_subprocess_stage("tex_sample_tex_slat", payload3, work_dir, unified_log_path, session=session):
+                if ev["type"] == "log":
+                    line = ev["text"]
+                    if line:
+                        status = status + "\n" + line
+                        status = _trim_status(status)
+                    now = time.time()
+                    if now - last_ui_update > 0.6:
+                        last_ui_update = now
+                        yield None, None, status
+                else:
+                    result3 = ev["result"]
+
+            # Stage 4: Decode and bake
+            _log("Decoding and baking textures...", 0.7)
+            yield None, None, status
+            payload4 = {
+                **common_payload,
+                "mesh_path": str(mesh_copy),
+                "tex_slat_path": str(tex_slat_path),
+                "texture_size": int(texture_size),
+                "out_dir": str(out_dir),
+                "prefix": "textured",
+            }
+            result = None
+            for ev in _iter_subprocess_stage("tex_decode_and_bake", payload4, work_dir, unified_log_path, session=session):
                 if ev["type"] == "log":
                     line = ev["text"]
                     if line:
@@ -2719,6 +2830,7 @@ def shapeimage_to_tex(
                         yield None, None, status
                 else:
                     result = ev["result"]
+
         except UserCancelled:
             _log("CANCELLED by user.", 0.0)
             yield None, None, status
@@ -2776,6 +2888,7 @@ def shapeimage_to_tex(
 
     _log("Loading texturing pipeline (first run can take a while)…", 0.05)
     pipe = get_texturing_pipeline()
+    pipe.low_vram = low_vram  # Respect user's low VRAM setting
     yield None, None, status
 
     _log("Loading mesh…", 0.1)
@@ -3419,6 +3532,11 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     )
 
                     with gr.Accordion(label="Advanced Settings", open=False):
+                        tex_low_vram = gr.Checkbox(
+                            label="Low VRAM Mode",
+                            value=True,
+                            info="Move models between CPU/GPU during generation. Reduces VRAM usage. Recommended enabled for texturing to avoid OOM errors."
+                        )
                         with gr.Row():
                             t_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1)
                             t_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.0, step=0.01)
@@ -3442,8 +3560,8 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
             tex_examples = gr.Examples(
                 examples=[
                     [
-                        os.path.join(APP_DIR, "assets", "example_texturing", "the_forgotten_knight.ply"),
-                        os.path.join(APP_DIR, "assets", "example_texturing", "image.webp"),
+                        os.path.join(APP_DIR, "assets", "example_texturing", "knight_helmet.glb"),
+                        os.path.join(APP_DIR, "assets", "example_texturing", "knight_helmet.webp"),
                     ]
                 ],
                 inputs=[mesh_file, tex_image],
@@ -3468,6 +3586,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     t_guidance_interval_end,
                     t_sampling_steps,
                     t_rescale_t,
+                    tex_low_vram,
                     subprocess_mode,
                 ],
                 outputs=[textured_glb_output, textured_download_btn, tex_status_box],
