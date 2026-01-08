@@ -2871,7 +2871,7 @@ with gr.Blocks(
 ) as demo:
     gr.Markdown(
         """
-## Trellis 2 SECourses Premium App V1.1 : https://www.patreon.com/posts/147686623
+## Trellis 2 SECourses Premium App V1.2 : https://www.patreon.com/posts/147686623
 Generate a 3D asset from an image, export as GLB, and optionally texture an existing mesh.
 """
     )
@@ -2905,7 +2905,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                             "**Note:** `faithful_contouring` remeshing requires optional FaithC dependencies "
                             "(`faithcontour` + `atom3d`). Not detected in this environment, so the option is hidden."
                         )
-                    simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method (Extract GLB)", value="cumesh", info="Polygon reduction method. cumesh: GPU-accelerated, fast. meshlib: CPU-based alternative. cumesh uses some GPU VRAM.")
+                    simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method (Extract GLB)", value="meshlib", info="Polygon reduction method. cumesh: GPU-accelerated, fast. meshlib: CPU-based alternative. cumesh uses some GPU VRAM.")
                     prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces (Extract GLB)", value=False, info="Remove triangles not visible from outside. Reduces polygon count, may affect internal geometry. Slight ⬇VRAM.")
                     no_texture_gen = gr.Checkbox(label="Skip Texture Generation (Generate + Extract GLB)", value=False, info="Output shape-only mesh without PBR textures. Faster processing, significantly ⬇VRAM usage.")
                     texture_size = gr.Slider(1024, 4096, label="Texture Size (Extract GLB)", value=2048, step=1024, info="Resolution of baked texture maps (albedo, normal, etc). Higher = sharper textures. ⬆Quality ⬆VRAM during baking.")
