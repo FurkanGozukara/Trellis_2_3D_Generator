@@ -2984,7 +2984,7 @@ with gr.Blocks(
 ) as demo:
     gr.Markdown(
         """
-## Trellis 2 SECourses Premium App V1.2 : https://www.patreon.com/posts/147686623
+## Trellis 2 SECourses Premium App V1.3 : https://www.patreon.com/posts/147686623
 Generate a 3D asset from an image, export as GLB, and optionally texture an existing mesh.
 """
     )
@@ -3514,7 +3514,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
         with gr.Tab("Texturing"):
             with gr.Row():
                 with gr.Column(scale=1, min_width=380):
-                    mesh_file = gr.File(label="Upload Mesh", file_types=[".ply", ".obj", ".glb", ".gltf"], file_count="single")
+                    mesh_file = gr.File(label="Upload Mesh", file_types=[".glb", ".gltf", ".obj", ".ply", ".stl"], file_count="single")
                     tex_image = gr.Image(label="Reference Image", format="png", image_mode="RGBA", type="pil", height=400)
 
                     tex_resolution = gr.Radio(["512", "1024", "1536"], label="Resolution", value="1024")
@@ -3523,26 +3523,20 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                         tex_randomize_seed = gr.Checkbox(label="Randomize Seed", value=False, scale=1)
                     tex_texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
 
-                    tex_generate_btn = gr.Button("Generate Textured GLB", variant="primary")
-                    tex_status_box = gr.Textbox(
-                        label="Progress",
-                        value="Upload a mesh + reference image (or use the example), then click Generate.",
-                        lines=10,
-                        interactive=False,
-                    )
-
-                    with gr.Accordion(label="Advanced Settings", open=False):
-                        tex_low_vram = gr.Checkbox(
-                            label="Low VRAM Mode",
-                            value=True,
-                            info="Move models between CPU/GPU during generation. Reduces VRAM usage. Recommended enabled for texturing to avoid OOM errors."
-                        )
+                    with gr.Accordion(label="Advanced Settings", open=True):
+                        with gr.Row():
+                            tex_low_vram = gr.Checkbox(
+                                label="Low VRAM Mode",
+                                value=True,
+                                info="Move models between CPU/GPU during generation. Reduces VRAM usage. Recommended enabled for texturing to avoid OOM errors."
+                            )
                         with gr.Row():
                             t_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1)
                             t_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.0, step=0.01)
-                            t_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
                         with gr.Row():
+                            t_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1)
                             t_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1)
+                        with gr.Row():
                             t_guidance_interval_start = gr.Slider(
                                 0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01
                             )
@@ -3550,28 +3544,144 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 0.0, 1.0, label="Guidance Interval End", value=0.9, step=0.01
                             )
 
-                with gr.Column(scale=2, min_width=520):
-                    textured_glb_output = gr.Model3D(label="Textured GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
-                    with gr.Row():
-                        textured_download_btn = gr.DownloadButton(label="Download Textured GLB", variant="primary")
-                        tex_open_outputs_btn = gr.Button("Open outputs folder", variant="secondary")
+                    gr.Markdown("### Examples")
+                    tex_examples = gr.Examples(
+                        examples=[
+                            [
+                                os.path.join(APP_DIR, "assets", "example_texturing", "knight_helmet.glb"),
+                                os.path.join(APP_DIR, "assets", "example_texturing", "knight_helmet.webp"),
+                            ]
+                        ],
+                        inputs=[mesh_file, tex_image],
+                        examples_per_page=6,
+                    )
 
-            gr.Markdown("### Examples")
-            tex_examples = gr.Examples(
-                examples=[
-                    [
-                        os.path.join(APP_DIR, "assets", "example_texturing", "knight_helmet.glb"),
-                        os.path.join(APP_DIR, "assets", "example_texturing", "knight_helmet.webp"),
-                    ]
-                ],
-                inputs=[mesh_file, tex_image],
-                examples_per_page=6,
+                with gr.Column(scale=2, min_width=520):
+                    textured_glb_output = gr.Model3D(
+                        label="Textured GLB",
+                        height=724,
+                        show_label=True,
+                        display_mode="solid",
+                        clear_color=(0.25, 0.25, 0.25, 1.0),
+                        elem_id="textured_glb_viewer",
+                    )
+                    tex_status_box = gr.Textbox(
+                        value="Upload a mesh + reference image (or use the example), then click Generate.",
+                        lines=20,
+                        max_lines=20,
+                        interactive=False,
+                        show_label=False,
+                        container=False,
+                        visible=False,
+                    )
+                    with gr.Row():
+                        tex_generate_btn = gr.Button("Generate Textured GLB", variant="primary")
+                        textured_download_btn = gr.DownloadButton(label="Download Textured GLB", variant="primary")
+                    tex_cancel_confirm_state = gr.State({"armed": False, "armed_at": 0.0, "scope": ""})
+                    with gr.Row():
+                        tex_cancel_btn = gr.Button("Cancel processing", variant="stop")
+                        tex_open_outputs_btn = gr.Button("Open outputs folder", variant="secondary")
+                        tex_view_logs_btn = gr.Button("View Logs", variant="secondary")
+
+            # State to track logs visibility for texturing tab
+            tex_logs_visible_state = gr.State(False)
+
+            def _tex_coerce_file_to_path(f):
+                """Convert file object to path string for Model3D display."""
+                if f is None:
+                    return None
+                if isinstance(f, str):
+                    return f
+                if isinstance(f, dict):
+                    return f.get("name") or f.get("path")
+                return getattr(f, "name", None) or str(f)
+
+            # Display uploaded mesh in viewer when uploaded
+            mesh_file.change(
+                fn=_tex_coerce_file_to_path,
+                inputs=[mesh_file],
+                outputs=[textured_glb_output],
+                queue=False,
+                show_progress="hidden",
+            )
+
+            def _tex_toggle_logs(current_visible: bool) -> tuple:
+                """Toggle visibility of status logs for texturing tab."""
+                new_visible = not current_visible
+                btn_text = "Hide Logs" if new_visible else "View Logs"
+                return gr.update(visible=new_visible), new_visible, gr.update(value=btn_text)
+
+            tex_view_logs_btn.click(
+                fn=_tex_toggle_logs,
+                inputs=[tex_logs_visible_state],
+                outputs=[tex_status_box, tex_logs_visible_state, tex_view_logs_btn],
+                queue=False,
+                show_progress="hidden",
+            )
+
+            def _tex_cancel_processing_click(
+                confirm_state: dict,
+                subprocess_mode: bool,
+                current_status: str,
+                req: gr.Request,
+            ) -> Tuple[dict, Any, str]:
+                """Two-step cancel for texturing tab."""
+                confirm_state = confirm_state if isinstance(confirm_state, dict) else {}
+                now = time.time()
+                session = _session_key(req)
+                scope = "all" if subprocess_mode else "batch"
+                proc, _stage = _get_active_subproc(session)
+                if proc is not None:
+                    scope = "all"
+
+                armed = bool(confirm_state.get("armed", False))
+                armed_at = float(confirm_state.get("armed_at", 0.0) or 0.0)
+                armed_scope = str(confirm_state.get("scope", ""))
+
+                ts = datetime.now().strftime("%H:%M:%S")
+                confirm_window_s = 7.0
+
+                if armed and armed_scope == scope and (now - armed_at) <= confirm_window_s:
+                    msg = _cancel_now(session, scope=scope)
+                    new_state = {"armed": False, "armed_at": 0.0, "scope": ""}
+                    btn_update = gr.update(value="Cancel processing")
+                    line = f"[{ts}] {msg}"
+                    return (
+                        new_state,
+                        btn_update,
+                        _append_status(current_status, line),
+                    )
+
+                # Arm (no cancellation yet)
+                label = "CONFIRM cancel (click again)"
+                if scope == "batch":
+                    hint = f"[{ts}] Cancel armed. Click again to confirm (subprocess mode is OFF)."
+                else:
+                    hint = f"[{ts}] Cancel armed. Click again to confirm (this will stop processing)."
+
+                new_state = {"armed": True, "armed_at": now, "scope": scope}
+                return (
+                    new_state,
+                    gr.update(value=label),
+                    _append_status(current_status, hint),
+                )
+
+            tex_cancel_btn.click(
+                fn=_tex_cancel_processing_click,
+                inputs=[tex_cancel_confirm_state, subprocess_mode, tex_status_box],
+                outputs=[tex_cancel_confirm_state, tex_cancel_btn, tex_status_box],
+                queue=False,
+                show_progress="hidden",
             )
 
             tex_generate_btn.click(
                 get_seed,
                 inputs=[tex_randomize_seed, tex_seed],
                 outputs=[tex_seed],
+            ).then(
+                # Show logs during generation
+                lambda: (gr.update(visible=True), True, gr.update(value="Hide Logs")),
+                outputs=[tex_status_box, tex_logs_visible_state, tex_view_logs_btn],
             ).then(
                 shapeimage_to_tex,
                 inputs=[
@@ -3590,6 +3700,10 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     subprocess_mode,
                 ],
                 outputs=[textured_glb_output, textured_download_btn, tex_status_box],
+            ).then(
+                # Hide logs after generation completes
+                lambda: (gr.update(visible=False), False, gr.update(value="View Logs")),
+                outputs=[tex_status_box, tex_logs_visible_state, tex_view_logs_btn],
             )
 
             def _open_outputs_from_texturing_tab(current_status: str) -> str:
@@ -4022,6 +4136,7 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         ("texturing", "guidance_interval_end"),
         ("texturing", "sampling_steps"),
         ("texturing", "rescale_t"),
+        ("texturing", "low_vram"),
     ]
 
     _CONFIG_COMPONENTS = [
@@ -4071,6 +4186,7 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         t_guidance_interval_end,
         t_sampling_steps,
         t_rescale_t,
+        tex_low_vram,
     ]
 
     def _values_to_ui_config(*values) -> dict:
