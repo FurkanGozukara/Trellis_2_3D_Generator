@@ -149,7 +149,7 @@ def main():
     )
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    glb.export(args.output, extension_webp=True)
+    glb.export(args.output, extension_webp=False)
     print(f"Saved GLB to {args.output}")
 
 if __name__ == "__main__":

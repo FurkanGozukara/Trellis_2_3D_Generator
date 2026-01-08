@@ -878,7 +878,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
             raise
 
     idx, glb_path = next_indexed_path(out_dir, prefix=prefix, ext="glb", digits=4, start=1)
-    glb.export(str(glb_path), extension_webp=True)
+    glb.export(str(glb_path), extension_webp=False)
 
     # Optional extra exports (best effort; never fail the main GLB export).
     for fmt in export_formats:
@@ -962,7 +962,7 @@ def stage_texture_generate(payload: Dict[str, Any]) -> Dict[str, Any]:
     out_mesh = pipe.postprocess_mesh(mesh, pbr_voxel, resolution, texture_size)
 
     _, out_path = next_indexed_path(out_dir, prefix=prefix, ext="glb", digits=4, start=1)
-    out_mesh.export(str(out_path), extension_webp=True)
+    out_mesh.export(str(out_path), extension_webp=False)
     torch.cuda.empty_cache()
     print(f"[texturing] saved: {out_path}", flush=True)
     return {"glb_path": str(out_path)}

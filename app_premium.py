@@ -2576,7 +2576,7 @@ def extract_glb(
         export_formats = ["glb"] + list(export_formats)
 
     idx, glb_path_p = next_indexed_path(out_dir, prefix="glb", ext="glb", digits=4, start=1)
-    glb.export(str(glb_path_p), extension_webp=True)
+    glb.export(str(glb_path_p), extension_webp=False)
     glb_path = str(glb_path_p)
 
     # Optional extra exports (best effort; never fail the main GLB export).
@@ -2831,7 +2831,7 @@ def shapeimage_to_tex(
     _log("Saving textured GLB…", 0.9)
     out_dir = run_dir / "08_texturing"
     _, glb_path_p = next_indexed_path(out_dir, prefix="textured", ext="glb", digits=4, start=1)
-    output.export(str(glb_path_p), extension_webp=True)
+    output.export(str(glb_path_p), extension_webp=False)
     glb_path = str(glb_path_p)
     torch.cuda.empty_cache()
     _log("Done.", 1.0)
@@ -2871,7 +2871,7 @@ with gr.Blocks(
 ) as demo:
     gr.Markdown(
         """
-## Trellis 2 SECourses Premium App V1.0 : https://www.patreon.com/posts/147686623
+## Trellis 2 SECourses Premium App V1.1 : https://www.patreon.com/posts/147686623
 Generate a 3D asset from an image, export as GLB, and optionally texture an existing mesh.
 """
     )
