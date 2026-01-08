@@ -1294,6 +1294,9 @@ def batch_process_folder(
                     ss_sampling_steps,
                     ss_rescale_t,
                     force_high_res_conditional,
+                    low_vram,
+                    use_chunked_processing,
+                    use_tiled_extraction,
                     shape_slat_guidance_strength,
                     shape_slat_guidance_rescale,
                     shape_slat_guidance_interval_start,
@@ -1309,7 +1312,8 @@ def batch_process_folder(
                     no_texture_gen,
                     max_num_tokens,
                     subprocess_mode,
-                    req=req,
+                    req,
+                    skip_preview=True,
                     progress=_scaled_progress,
                 ):
                     if s is not None:
@@ -1336,6 +1340,8 @@ def batch_process_folder(
                     bool(no_texture_gen),
                     bool(prune_invisible_faces),
                     export_formats,
+                    use_chunked_processing,
+                    use_tiled_extraction,
                     subprocess_mode,
                     req=req,
                     progress=_scaled_progress,
@@ -1659,6 +1665,7 @@ def image_to_3d(
     max_num_tokens: int,
     subprocess_mode: bool,
     req: gr.Request,
+    skip_preview: bool = False,
     progress=gr.Progress(track_tqdm=True),
 ) -> Tuple[Optional[dict], str, str]:
     # Stream step-by-step status so users aren't "in the dark" during long runs.
@@ -1931,35 +1938,40 @@ def image_to_3d(
         # Stage: preview render (writes JPEGs + manifest)
         # NOTE: render_preview is optional for GLB extraction. If it fails (e.g., OOM),
         # we can still proceed to GLB extraction as long as the latents are saved.
-        preview_payload = {
-            "model_repo": "microsoft/TRELLIS.2-4B",
-            "shape_slat_path": str(shape_slat_path),
-            "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
-            "res": int(res),
-            "preview_dir": str(preview_dir),
-            "preview_manifest_path": str(preview_manifest_path),
-            "use_chunked_processing": bool(use_chunked_processing),
-            "use_tiled_extraction": bool(use_tiled_extraction),
-        }
-        preview_failed = False
-        preview_error_msg = ""
-        try:
-            _ = yield from _stage("render_preview", preview_payload, 0.82)
-        except UserCancelled:
-            yield from _cancelled_exit()
-            return
-        except Exception as e:
-            # Check if we have enough latents to proceed without preview
-            has_shape = shape_slat_path.exists()
-            has_tex = (tex_slat_path is not None and tex_slat_path.exists()) or no_texture_gen
-            if has_shape and has_tex:
-                preview_failed = True
-                preview_error_msg = f"{type(e).__name__}: {e}"
-                _log(f"⚠️ Preview rendering failed: {preview_error_msg}", 0.85)
-                _log("Latents saved successfully. You can still extract GLB!", 0.86)
-            else:
-                # No latents, re-raise the error
-                raise
+        # In batch mode, we skip preview generation entirely to save time and memory.
+        preview_failed = skip_preview
+        preview_error_msg = "Preview skipped (batch mode)" if skip_preview else ""
+        
+        if not skip_preview:
+            preview_payload = {
+                "model_repo": "microsoft/TRELLIS.2-4B",
+                "shape_slat_path": str(shape_slat_path),
+                "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
+                "res": int(res),
+                "preview_dir": str(preview_dir),
+                "preview_manifest_path": str(preview_manifest_path),
+                "use_chunked_processing": bool(use_chunked_processing),
+                "use_tiled_extraction": bool(use_tiled_extraction),
+            }
+            try:
+                _ = yield from _stage("render_preview", preview_payload, 0.82)
+            except UserCancelled:
+                yield from _cancelled_exit()
+                return
+            except Exception as e:
+                # Check if we have enough latents to proceed without preview
+                has_shape = shape_slat_path.exists()
+                has_tex = (tex_slat_path is not None and tex_slat_path.exists()) or no_texture_gen
+                if has_shape and has_tex:
+                    preview_failed = True
+                    preview_error_msg = f"{type(e).__name__}: {e}"
+                    _log(f"⚠️ Preview rendering failed: {preview_error_msg}", 0.85)
+                    _log("Latents saved successfully. You can still extract GLB!", 0.86)
+                else:
+                    # No latents, re-raise the error
+                    raise
+        else:
+            _log("Skipping preview generation (batch mode)", 0.82)
 
         # Handle preview failure - return minimal state that allows GLB extraction
         if preview_failed:
@@ -2859,7 +2871,7 @@ with gr.Blocks(
 ) as demo:
     gr.Markdown(
         """
-## TRELLIS.2 Premium
+## Trellis 2 SECourses Premium App V1.0 : https://www.patreon.com/posts/147686623
 Generate a 3D asset from an image, export as GLB, and optionally texture an existing mesh.
 """
     )
