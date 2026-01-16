@@ -61,7 +61,7 @@ def _ensure_o_voxel_available() -> None:
     import o_voxel  # noqa: F401
 
 
-_ensure_o_voxel_available()
+# _ensure_o_voxel_available()  # Disabled - use pre-installed o_voxel from pip
 
 from datetime import datetime
 import shutil
