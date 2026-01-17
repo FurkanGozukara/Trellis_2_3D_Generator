@@ -2984,7 +2984,7 @@ with gr.Blocks(
 ) as demo:
     gr.Markdown(
         """
-## Trellis 2 SECourses Premium App V1.3 : https://www.patreon.com/posts/147686623
+## Trellis 2 SECourses Premium App V3 : https://www.patreon.com/posts/147686623
 Generate a 3D asset from an image, export as GLB, and optionally texture an existing mesh.
 """
     )
