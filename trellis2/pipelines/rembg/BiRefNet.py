@@ -23,9 +23,16 @@ class BiRefNet:
                 if os.path.isdir(local_repo_dir):
                     resolved_name = local_repo_dir
 
-        self.model = AutoModelForImageSegmentation.from_pretrained(
-            resolved_name, trust_remote_code=True
-        )
+        # Some environments can leave torch's default device set to "meta" during
+        # model construction (e.g. low-memory loading contexts). The remote BiRefNet
+        # code calls `Tensor.item()` in `__init__`, which is invalid on meta tensors.
+        # Force CPU init and disable low-cpu-memory meta initialization for this model.
+        with torch.device("cpu"):
+            self.model = AutoModelForImageSegmentation.from_pretrained(
+                resolved_name,
+                trust_remote_code=True,
+                low_cpu_mem_usage=False,
+            )
         self.model.eval()
         self.transform_image = transforms.Compose(
             [
