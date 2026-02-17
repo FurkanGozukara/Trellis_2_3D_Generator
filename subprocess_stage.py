@@ -1236,6 +1236,363 @@ def stage_tex_decode_and_bake(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+# ================================ UniRig Stages ================================
+
+
+_UNIRIG_PREDICT_IMPORT_TO_PACKAGE = {
+    "box": "python-box",
+    "bpy": "bpy",
+    "torch": "torch",
+    "lightning": "lightning",
+    "pytorch_lightning": "pytorch-lightning",
+    "omegaconf": "omegaconf",
+    "yaml": "PyYAML",
+    "fast_simplification": "fast-simplification",
+    "trimesh": "trimesh",
+    "tqdm": "tqdm",
+}
+
+_UNIRIG_MERGE_IMPORT_TO_PACKAGE = {
+    "box": "python-box",
+    "bpy": "bpy",
+    "open3d": "open3d",
+}
+
+
+def _resolve_unirig_python(payload: Dict[str, Any]) -> str:
+    def _validate_candidate(candidate: str, source: str) -> Optional[str]:
+        c = str(candidate or "").strip().strip('"').strip("'")
+        if not c:
+            return None
+        # If this looks like a path, require it to exist to avoid cryptic failures later.
+        looks_like_path = ("/" in c) or ("\\" in c) or c.lower().endswith(".exe")
+        if looks_like_path and not Path(c).exists():
+            raise FileNotFoundError(f"{source} points to a missing Python executable: {c}")
+        return c
+
+    payload_candidate = _validate_candidate(payload.get("unirig_python", ""), "payload.unirig_python")
+    if payload_candidate:
+        return payload_candidate
+
+    env_candidate = _validate_candidate(os.environ.get("UNIRIG_PYTHON", ""), "UNIRIG_PYTHON")
+    if env_candidate:
+        return env_candidate
+
+    py_name = "python.exe" if os.name == "nt" else "python"
+    py_dir = "Scripts" if os.name == "nt" else "bin"
+    local_candidates = [
+        APP_DIR / "UniRig" / ".venv" / py_dir / py_name,
+        APP_DIR / "UniRig" / "venv" / py_dir / py_name,
+        APP_DIR / ".venv" / py_dir / py_name,
+        APP_DIR / "venv" / py_dir / py_name,
+    ]
+    for candidate in local_candidates:
+        if candidate.exists():
+            return str(candidate)
+
+    return sys.executable
+
+
+def _missing_modules_for_interpreter(python_exe: str, imports: List[str]) -> List[str]:
+    import subprocess
+
+    probe_code = (
+        "import importlib.util, json; "
+        f"mods={json.dumps(imports)}; "
+        "missing=[m for m in mods if importlib.util.find_spec(m) is None]; "
+        "print(json.dumps(missing))"
+    )
+
+    try:
+        proc = subprocess.run(
+            [python_exe, "-c", probe_code],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except FileNotFoundError as e:
+        raise RuntimeError(f"Unable to execute UniRig Python interpreter: {python_exe}") from e
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(
+            f"Failed to verify UniRig dependencies with interpreter '{python_exe}'.\n{detail}"
+        )
+
+    raw = (proc.stdout or "").strip()
+    try:
+        missing = json.loads(raw or "[]")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"Dependency probe returned invalid JSON for interpreter '{python_exe}': {raw!r}"
+        ) from e
+
+    if not isinstance(missing, list):
+        raise RuntimeError(
+            f"Dependency probe returned unexpected payload for interpreter '{python_exe}': {raw!r}"
+        )
+
+    return [str(m) for m in missing]
+
+
+def _ensure_unirig_runtime_ready(
+    *,
+    python_exe: str,
+    import_to_package: Dict[str, str],
+    stage_label: str,
+) -> None:
+    imports = list(import_to_package.keys())
+    missing_imports = _missing_modules_for_interpreter(python_exe, imports)
+    if not missing_imports:
+        return
+
+    missing_packages = [import_to_package.get(m, m) for m in missing_imports]
+    missing_packages = list(dict.fromkeys(missing_packages))
+    req_path = APP_DIR / "UniRig" / "requirements.txt"
+
+    raise RuntimeError(
+        f"UniRig environment is missing dependencies for stage '{stage_label}'.\n"
+        f"Interpreter: {python_exe}\n"
+        f"Missing imports: {', '.join(missing_imports)}\n"
+        f"Suggested packages: {', '.join(missing_packages)}\n"
+        f"Install with:\n  \"{python_exe}\" -m pip install -r \"{req_path}\"\n"
+        "Or set UNIRIG_PYTHON to a Python executable where UniRig is already installed."
+    )
+
+
+def _run_logged_subprocess(cmd: List[str], *, cwd: Path, label: str) -> None:
+    import subprocess
+
+    print(f"[{label}] Running: {' '.join(cmd)}", flush=True)
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    tail: List[str] = []
+    if proc.stdout:
+        for line in proc.stdout:
+            clean = line.rstrip("\n")
+            print(clean, flush=True)
+            if clean:
+                tail.append(clean)
+                if len(tail) > 40:
+                    tail = tail[-40:]
+
+    rc = proc.wait()
+    if rc != 0:
+        msg = f"{label} failed with exit code {rc}"
+        if tail:
+            msg += "\nLast UniRig log lines:\n" + "\n".join(tail[-20:])
+        raise RuntimeError(msg)
+
+
+def stage_unirig_skeleton(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Generate skeleton for a 3D mesh using UniRig.
+    
+    Payload:
+        input_mesh_path: Path to input mesh (.obj, .fbx, .glb, .vrm)
+        output_fbx_path: Path to output skeleton FBX
+        npz_dir: Temporary directory for intermediate NPZ files
+        seed: Random seed for skeleton generation
+        skeleton_task: UniRig config path (default: configs/task/quick_inference_skeleton_articulationxl_ar_256.yaml)
+        faces_target_count: Target face count for mesh simplification (default: 50000)
+    """
+    input_mesh = Path(payload["input_mesh_path"])
+    output_fbx = Path(payload["output_fbx_path"])
+    npz_dir = Path(payload["npz_dir"])
+    seed = int(payload.get("seed", 12345))
+    skeleton_task = payload.get("skeleton_task", "configs/task/quick_inference_skeleton_articulationxl_ar_256.yaml")
+    faces_target_count = int(payload.get("faces_target_count", 50000))
+    
+    unirig_dir = APP_DIR / "UniRig"
+    run_py = unirig_dir / "run.py"
+    
+    if not run_py.exists():
+        raise FileNotFoundError(f"UniRig run.py not found at: {run_py}")
+
+    unirig_python = _resolve_unirig_python(payload)
+    _ensure_unirig_runtime_ready(
+        python_exe=unirig_python,
+        import_to_package=_UNIRIG_PREDICT_IMPORT_TO_PACKAGE,
+        stage_label="unirig_skeleton",
+    )
+    
+    output_fbx.parent.mkdir(parents=True, exist_ok=True)
+    npz_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"[unirig_skeleton] Input: {input_mesh}", flush=True)
+    print(f"[unirig_skeleton] Output: {output_fbx}", flush=True)
+    print(f"[unirig_skeleton] Seed: {seed}", flush=True)
+    print(f"[unirig_skeleton] Python: {unirig_python}", flush=True)
+    
+    # Build the command to call UniRig's run.py
+    cmd = [
+        unirig_python,
+        str(run_py),
+        f"--task={skeleton_task}",
+        f"--seed={seed}",
+        f"--input={input_mesh}",
+        f"--output={output_fbx}",
+        f"--npz_dir={npz_dir}",
+    ]
+
+    _run_logged_subprocess(cmd, cwd=unirig_dir, label="unirig_skeleton")
+    
+    if not output_fbx.exists():
+        raise RuntimeError(f"UniRig did not produce expected output: {output_fbx}")
+    
+    print(f"[unirig_skeleton] Success! Skeleton saved to: {output_fbx}", flush=True)
+    
+    return {
+        "output_fbx_path": str(output_fbx),
+        "seed": seed,
+    }
+
+
+def stage_unirig_skinning(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Predict skinning weights for a skeleton using UniRig.
+    
+    Payload:
+        input_skeleton_path: Path to skeleton FBX from skeleton stage
+        output_fbx_path: Path to output skinned FBX
+        npz_dir: Temporary directory for intermediate NPZ files
+        seed: Random seed
+        skin_task: UniRig config path (default: configs/task/quick_inference_unirig_skin.yaml)
+        data_name: NPZ data name (default: raw_data.npz)
+    """
+    input_skeleton = Path(payload["input_skeleton_path"])
+    output_fbx = Path(payload["output_fbx_path"])
+    npz_dir = Path(payload["npz_dir"])
+    seed = int(payload.get("seed", 12345))
+    skin_task = payload.get("skin_task", "configs/task/quick_inference_unirig_skin.yaml")
+    data_name = payload.get("data_name", "raw_data.npz")
+    
+    unirig_dir = APP_DIR / "UniRig"
+    run_py = unirig_dir / "run.py"
+    
+    if not run_py.exists():
+        raise FileNotFoundError(f"UniRig run.py not found at: {run_py}")
+
+    unirig_python = _resolve_unirig_python(payload)
+    _ensure_unirig_runtime_ready(
+        python_exe=unirig_python,
+        import_to_package=_UNIRIG_PREDICT_IMPORT_TO_PACKAGE,
+        stage_label="unirig_skinning",
+    )
+    
+    if not input_skeleton.exists():
+        raise FileNotFoundError(f"Input skeleton not found: {input_skeleton}")
+    
+    output_fbx.parent.mkdir(parents=True, exist_ok=True)
+    
+    print(f"[unirig_skinning] Input skeleton: {input_skeleton}", flush=True)
+    print(f"[unirig_skinning] Output: {output_fbx}", flush=True)
+    print(f"[unirig_skinning] Seed: {seed}", flush=True)
+    print(f"[unirig_skinning] Python: {unirig_python}", flush=True)
+    
+    cmd = [
+        unirig_python,
+        str(run_py),
+        f"--task={skin_task}",
+        f"--seed={seed}",
+        f"--input={input_skeleton}",
+        f"--output={output_fbx}",
+        f"--npz_dir={npz_dir}",
+        f"--data_name={data_name}",
+    ]
+
+    _run_logged_subprocess(cmd, cwd=unirig_dir, label="unirig_skinning")
+    
+    if not output_fbx.exists():
+        raise RuntimeError(f"UniRig did not produce expected output: {output_fbx}")
+    
+    print(f"[unirig_skinning] Success! Skinned model saved to: {output_fbx}", flush=True)
+    
+    return {
+        "output_fbx_path": str(output_fbx),
+        "seed": seed,
+    }
+
+
+def stage_unirig_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge skeleton/skinning with original mesh using UniRig.
+    
+    Payload:
+        source_path: Path to skeleton or skinned FBX
+        target_path: Path to original mesh
+        output_path: Path to final rigged output
+        export_format: Export format ('fbx' or 'glb')
+    """
+    source = Path(payload["source_path"])
+    target = Path(payload["target_path"])
+    output = Path(payload["output_path"])
+    export_format = payload.get("export_format", "fbx")
+    
+    unirig_dir = APP_DIR / "UniRig"
+    merge_script = unirig_dir / "src" / "inference" / "merge.py"
+    
+    if not merge_script.exists():
+        raise FileNotFoundError(f"UniRig merge script not found at: {merge_script}")
+
+    unirig_python = _resolve_unirig_python(payload)
+    _ensure_unirig_runtime_ready(
+        python_exe=unirig_python,
+        import_to_package=_UNIRIG_MERGE_IMPORT_TO_PACKAGE,
+        stage_label="unirig_merge",
+    )
+    
+    if not source.exists():
+        raise FileNotFoundError(f"Source file not found: {source}")
+    
+    if not target.exists():
+        raise FileNotFoundError(f"Target file not found: {target}")
+    
+    output.parent.mkdir(parents=True, exist_ok=True)
+    
+    print(f"[unirig_merge] Source: {source}", flush=True)
+    print(f"[unirig_merge] Target: {target}", flush=True)
+    print(f"[unirig_merge] Output: {output}", flush=True)
+    print(f"[unirig_merge] Python: {unirig_python}", flush=True)
+    
+    cmd = [
+        unirig_python,
+        "-m", "src.inference.merge",
+        f"--source={source}",
+        f"--target={target}",
+        f"--output={output}",
+        "--num_runs=1",
+        "--id=0",
+    ]
+
+    _run_logged_subprocess(cmd, cwd=unirig_dir, label="unirig_merge")
+    
+    if not output.exists():
+        raise RuntimeError(f"UniRig did not produce expected output: {output}")
+    
+    print(f"[unirig_merge] Success! Rigged model saved to: {output}", flush=True)
+    
+    return {
+        "output_path": str(output),
+        "export_format": export_format,
+    }
+
+
+# ================================ Main ================================
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="TRELLIS.2 subprocess stage runner")
     parser.add_argument("--stage", required=True, type=str)
@@ -1244,9 +1601,10 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        _ensure_o_voxel_available()
-
         stage = args.stage.strip()
+        if stage not in {"unirig_skeleton", "unirig_skinning", "unirig_merge"}:
+            _ensure_o_voxel_available()
+
         payload_path = Path(args.payload)
         result_path = Path(args.result)
         payload = _read_json(payload_path)
@@ -1275,6 +1633,12 @@ def main() -> int:
             result = stage_tex_sample_tex_slat(payload)
         elif stage == "tex_decode_and_bake":
             result = stage_tex_decode_and_bake(payload)
+        elif stage == "unirig_skeleton":
+            result = stage_unirig_skeleton(payload)
+        elif stage == "unirig_skinning":
+            result = stage_unirig_skinning(payload)
+        elif stage == "unirig_merge":
+            result = stage_unirig_merge(payload)
         else:
             raise ValueError(f"Unknown stage: {stage}")
 

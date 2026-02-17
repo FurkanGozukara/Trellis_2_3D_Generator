@@ -21,6 +21,9 @@ parts/
 sdist/
 var/
 wheels/
+SECourses_Musubi_Trainer
+UniRig
+blender
 share/python-wheels/
 *.egg-info/
 org_trellis/

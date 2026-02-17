@@ -120,11 +120,21 @@ OUTPUTS_DIR = os.path.join(APP_DIR, "outputs")
 PRESETS_DIR = os.path.join(APP_DIR, "presets")
 SUBPROCESS_STAGE_SCRIPT = os.path.join(APP_DIR, "subprocess_stage.py")
 
+# UniRig paths
+UNIRIG_DIR = os.path.join(APP_DIR, "UniRig")
+UNIRIG_RUN_PY = os.path.join(UNIRIG_DIR, "run.py")
+RIGGING_OUTPUTS_DIR = os.path.join(OUTPUTS_DIR, "rigged_models")
+
+
 # Ensure TRELLIS_MODELS_DIR is set (trellis2 code also falls back to ../models).
 os.environ.setdefault("TRELLIS_MODELS_DIR", MODELS_DIR)
 
 # Local helpers (not the stdlib `subprocess` module)
 from subprocess_utils import allocate_run_dir, next_indexed_path, ensure_dir, safe_relpath  # noqa: E402
+
+# Trellis UI modules
+from trellis_ui.rigging_tab import rigging_tab
+from trellis_ui.animation_player_tab import animation_player_tab
 
 MAX_SEED = np.iinfo(np.int32).max
 
@@ -521,6 +531,16 @@ def _default_ui_config() -> dict:
             "sampling_steps": 12,
             "rescale_t": 3.0,
         },
+        "rigging": {
+            "seed": 12345,
+            "randomize_seed": False,
+            "skeleton_task": "configs/task/quick_inference_skeleton_articulationxl_ar_256.yaml",
+            "skin_task": "configs/task/quick_inference_unirig_skin.yaml",
+            "export_format": "fbx",  # or "glb"
+            "faces_target_count": 50000,
+            "enable_skinning": True,
+            "auto_merge": True,
+        },
     }
 
 
@@ -536,7 +556,7 @@ def _merge_ui_config(cfg: Optional[dict]) -> dict:
     if isinstance(meta, dict):
         base["_meta"].update(meta)
 
-    for section in ("global", "image_to_3d", "texturing"):
+    for section in ("global", "image_to_3d", "texturing", "rigging"):
         section_data = cfg.get(section)
         if isinstance(section_data, dict):
             base[section].update(section_data)
@@ -840,6 +860,182 @@ def end_session(req: gr.Request):
         _ACTIVE_SUBPROCS.pop(session, None)
         _ACTIVE_SUBPROCS_STAGE.pop(session, None)
     shutil.rmtree(user_dir, ignore_errors=True)
+
+
+# ------------------------------- UniRig Helpers ------------------------------
+
+
+def _list_rigged_models() -> List[str]:
+    """List previously rigged models from outputs directory."""
+    rigged_dir = Path(RIGGING_OUTPUTS_DIR)
+    if not rigged_dir.exists():
+        return []
+    
+    models = []
+    for item in rigged_dir.rglob("*"):
+        if item.is_file() and item.suffix.lower() in (".fbx", ".glb"):
+            # Store relative paths from rigging outputs dir
+            rel_path = item.relative_to(rigged_dir)
+            models.append(str(rel_path))
+    
+    return sorted(models)
+
+
+def _run_unirig_skeleton(input_mesh_path: str, seed: int, req: gr.Request):
+    """
+    Generate skeleton for uploaded mesh using UniRig via subprocess.
+    Yields status updates as processing proceeds.
+    """
+    session = str(req.session_hash)
+    
+    try:
+        # Validate input
+        if not input_mesh_path or not os.path.exists(input_mesh_path):
+            yield (None, None, "❌ Please upload a valid mesh file.")
+            return
+        
+        # Create output directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        work_dir = Path(RIGGING_OUTPUTS_DIR) / f"skeleton_{timestamp}"
+        work_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Prepare output paths
+        input_path = Path(input_mesh_path)
+        skeleton_fbx = work_dir / f"{input_path.stem}_skeleton.fbx"
+        npz_dir = work_dir / "tmp_npz"
+        log_path = work_dir / "skeleton_log.txt"
+        
+        yield (None, None, f"🔄 Starting skeleton generation...\\nInput: {input_path.name}\\nSeed: {seed}")
+        
+        # Build payload for subprocess
+        payload = {
+            "input_mesh_path": str(input_path),
+            "output_fbx_path": str(skeleton_fbx),
+            "npz_dir": str(npz_dir),
+            "seed": seed,
+        }
+        
+        status = ""
+        result = None
+        
+        # Run skeleton generation subprocess
+        for event in _iter_subprocess_stage("unirig_skeleton", payload, work_dir, log_path, session=session):
+            if event["type"] == "log":
+                status = _append_status(status, event["text"])
+                status = _trim_status(status)
+                yield (None, None, status)
+            elif event["type"] == "result":
+                result = event["result"]
+        
+        if result and skeleton_fbx.exists():
+            final_status = _append_status(status, f"\\n✅ Skeleton generated successfully!\\nOutput: {skeleton_fbx}")
+            yield (str(skeleton_fbx), str(skeleton_fbx), final_status)
+        else:
+            yield (None, None, _append_status(status, "\\n❌ Skeleton generation failed."))
+    
+    except Exception as e:
+        yield (None, None, f"❌ Error: {type(e).__name__}: {e}")
+
+
+def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
+    """
+    Add skinning weights to skeleton using UniRig via subprocess.
+    """
+    session = str(req.session_hash)
+    
+    try:
+        if not skeleton_fbx_path or not os.path.exists(skeleton_fbx_path):
+            yield (None, None, "❌ Please generate or upload a skeleton first.")
+            return
+        
+        skeleton_path = Path(skeleton_fbx_path)
+        work_dir = skeleton_path.parent
+        skinned_fbx = work_dir / f"{skeleton_path.stem.replace('_skeleton', '')}_skinned.fbx"
+        log_path = work_dir / "skinning_log.txt"
+        npz_dir = work_dir / "tmp_npz"
+        
+        yield (None, None, f"🔄 Starting skinning prediction...\\nSkeleton: {skeleton_path.name}\\nSeed: {seed}")
+        
+        payload = {
+            "input_skeleton_path": str(skeleton_path),
+            "output_fbx_path": str(skinned_fbx),
+            "npz_dir": str(npz_dir),
+            "seed": seed,
+            "data_name": "raw_data.npz",
+        }
+        
+        status = ""
+        result = None
+        
+        for event in _iter_subprocess_stage("unirig_skinning", payload, work_dir, log_path, session=session):
+            if event["type"] == "log":
+                status = _append_status(status, event["text"])
+                status = _trim_status(status)
+                yield (None, None, status)
+            elif event["type"] == "result":
+                result = event["result"]
+        
+        if result and skinned_fbx.exists():
+            final_status = _append_status(status, f"\\n✅ Skinning completed!\\nOutput: {skinned_fbx}")
+            yield (str(skinned_fbx), str(skinned_fbx), final_status)
+        else:
+            yield (None, None, _append_status(status, "\\n❌ Skinning failed."))
+    
+    except Exception as e:
+        yield (None, None, f"❌ Error: {type(e).__name__}: {e}")
+
+
+def _run_unirig_merge(source_fbx_path: str, target_mesh_path: str, export_format: str, req: gr.Request):
+    """
+    Merge rigged skeleton with original mesh using UniRig via subprocess.
+    """
+    session = str(req.session_hash)
+    
+    try:
+        if not source_fbx_path or not os.path.exists(source_fbx_path):
+            yield (None, None, "❌ Please generate skeleton/skinning first.")
+            return
+        
+        if not target_mesh_path or not os.path.exists(target_mesh_path):
+            yield (None, None, "❌ Please upload target mesh.")
+            return
+        
+        source_path = Path(source_fbx_path)
+        target_path = Path(target_mesh_path)
+        work_dir = source_path.parent
+        
+        ext = ".fbx" if export_format == "fbx" else ".glb"
+        final_output = work_dir / f"{target_path.stem}_rigged{ext}"
+        log_path = work_dir / "merge_log.txt"
+        
+        yield (None, None, f"🔄 Merging rig with mesh...\\nSource: {source_path.name}\\nTarget: {target_path.name}")
+        
+        payload = {
+            "source_path": str(source_path),
+            "target_path": str(target_path),
+            "output_path": str(final_output),
+            "export_format": export_format,
+        }
+        
+        status = ""
+        result = None
+        
+        for event in _iter_subprocess_stage("unirig_merge", payload, work_dir, log_path, session=session):
+            if event["type"] == "log":
+                status = _append_status(status, event["text"])
+                status = _trim_status(status)
+                yield (None, None, status)
+            elif event["type"] == "result":
+                result = event["result"]
+        
+        if result and final_output.exists():
+            final_status = _append_status(status, f"\\n✅ Rigged model created!\\nOutput: {final_output}")
+            yield (str(final_output), str(final_output), final_status)
+        else:
+            yield (None, None, _append_status(status, "\\n❌ Merge failed."))
+    
+    except Exception as e:
+        yield (None, None, f"❌ Error: {type(e).__name__}: {e}")
 
 
 # ------------------------------- Cancellation -------------------------------
@@ -4086,6 +4282,24 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
 - Dial in settings you like → Save preset as `my_high_quality`
 - Later → Load preset to restore all sliders/checkboxes instantly
 """
+            )
+
+        # ---------------------------- Tab 5: Rigging (UniRig) ----------------------------
+        with gr.Tab("🦴 Rigging"):
+            rigging_tab(
+                run_skeleton_fn=_run_unirig_skeleton,
+                run_skinning_fn=_run_unirig_skinning,
+                run_merge_fn=_run_unirig_merge,
+                rigging_outputs_dir=RIGGING_OUTPUTS_DIR,
+                open_folder_fn=_open_folder,
+            )
+
+        # ---------------------------- Tab 6: Animation Player ----------------------------
+        with gr.Tab("🎬 Animation Player"):
+            animation_player_tab(
+                list_models_fn=_list_rigged_models,
+                rigging_outputs_dir=RIGGING_OUTPUTS_DIR,
+                open_folder_fn=_open_folder,
             )
 
     # ---------------------------- Preset Wiring ----------------------------
