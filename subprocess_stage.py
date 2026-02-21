@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,6 +23,9 @@ except Exception:
 # Keep env consistent with the Gradio app.
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# UniRig checkpoints are trusted local files but may include custom objects.
+# PyTorch 2.6+ defaults torch.load(weights_only=True), which can fail on these ckpts.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
 
 APP_DIR = Path(__file__).resolve().parent
 MODELS_DIR = APP_DIR / "models"
@@ -1435,8 +1439,33 @@ def stage_unirig_skeleton(payload: Dict[str, Any]) -> Dict[str, Any]:
     print(f"[unirig_skeleton] Output: {output_fbx}", flush=True)
     print(f"[unirig_skeleton] Seed: {seed}", flush=True)
     print(f"[unirig_skeleton] Python: {unirig_python}", flush=True)
-    
-    # Build the command to call UniRig's run.py
+
+    # UniRig skeleton inference expects precomputed raw_data.npz under npz_dir.
+    # Mirror UniRig's official launch flow: extract first, then run inference.
+    extract_stamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    extract_cmd = [
+        unirig_python,
+        "-m",
+        "src.data.extract",
+        "--config=configs/data/quick_inference.yaml",
+        "--require_suffix=obj,fbx,FBX,dae,glb,gltf,vrm",
+        "--force_override=true",
+        "--num_runs=1",
+        "--id=0",
+        f"--time={extract_stamp}",
+        f"--faces_target_count={faces_target_count}",
+        f"--input={input_mesh}",
+        f"--output_dir={npz_dir}",
+    ]
+    _run_logged_subprocess(extract_cmd, cwd=unirig_dir, label="unirig_extract")
+
+    raw_npz_files = list(npz_dir.rglob("raw_data.npz"))
+    if not raw_npz_files:
+        raise RuntimeError(
+            f"UniRig extraction finished but produced no raw_data.npz under {npz_dir}"
+        )
+
+    # Build the command to call UniRig's run.py.
     cmd = [
         unirig_python,
         str(run_py),
@@ -1478,6 +1507,7 @@ def stage_unirig_skinning(payload: Dict[str, Any]) -> Dict[str, Any]:
     seed = int(payload.get("seed", 12345))
     skin_task = payload.get("skin_task", "configs/task/quick_inference_unirig_skin.yaml")
     data_name = payload.get("data_name", "raw_data.npz")
+    faces_target_count = int(payload.get("faces_target_count", 50000))
     
     unirig_dir = APP_DIR / "UniRig"
     run_py = unirig_dir / "run.py"
@@ -1501,6 +1531,33 @@ def stage_unirig_skinning(payload: Dict[str, Any]) -> Dict[str, Any]:
     print(f"[unirig_skinning] Output: {output_fbx}", flush=True)
     print(f"[unirig_skinning] Seed: {seed}", flush=True)
     print(f"[unirig_skinning] Python: {unirig_python}", flush=True)
+
+    # UniRig skinning inference also expects precomputed NPZ under npz_dir for this input.
+    extract_stamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    extract_cmd = [
+        unirig_python,
+        "-m",
+        "src.data.extract",
+        "--config=configs/data/quick_inference.yaml",
+        "--require_suffix=obj,fbx,FBX,dae,glb,gltf,vrm",
+        "--force_override=true",
+        "--num_runs=1",
+        "--id=0",
+        f"--time={extract_stamp}",
+        f"--faces_target_count={faces_target_count}",
+        f"--input={input_skeleton}",
+        f"--output_dir={npz_dir}",
+    ]
+    _run_logged_subprocess(extract_cmd, cwd=unirig_dir, label="unirig_extract_skin")
+
+    expected_npz = npz_dir / input_skeleton.stem / data_name
+    if not expected_npz.exists():
+        # Fallback check in case naming differs in get_files() output mapping.
+        any_npz = list(npz_dir.rglob(data_name))
+        if not any_npz:
+            raise RuntimeError(
+                f"UniRig skin extraction finished but produced no {data_name} under {npz_dir}"
+            )
     
     cmd = [
         unirig_python,

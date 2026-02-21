@@ -4,6 +4,8 @@ Allows users to upload 3D models and rig them using the UniRig system.
 """
 import gradio as gr
 import os
+import json
+import shutil
 from pathlib import Path
 from datetime import datetime
 
@@ -88,6 +90,11 @@ def rigging_tab(
                     value="fbx",
                     info="FBX preserves skeleton hierarchy better for most 3D software"
                 )
+                export_both_formats = gr.Checkbox(
+                    label="Also export the other format",
+                    value=True,
+                    info="Saves both FBX and GLB so users can pick the best file for DCC tools or preview."
+                )
                 
                 auto_merge = gr.Checkbox(
                     label="Auto-merge with original mesh",
@@ -100,6 +107,7 @@ def rigging_tab(
             generate_skeleton_btn = gr.Button("🦴 Generate Skeleton", variant="primary", size="lg")
             add_skinning_btn = gr.Button("🎨 Add Skinning", variant="secondary", size="lg")
             export_rigged_btn = gr.Button("💾 Export Rigged Model", variant="secondary", size="lg")
+            send_to_animation_btn = gr.Button("➡ Open In Animation Browser", variant="secondary", size="lg")
             
             with gr.Row():
                 open_outputs_btn = gr.Button("📁 Open Outputs Folder", variant="secondary")
@@ -139,6 +147,7 @@ def rigging_tab(
     skinned_path_state = gr.State(None)
     final_output_state = gr.State(None)
     original_mesh_state = gr.State(None)
+    upload_run_dir_state = gr.State(None)
     
     # Helper to update seed when randomize is toggled
     def randomize_seed_fn(randomize: bool, current_seed: int):
@@ -155,23 +164,246 @@ def rigging_tab(
         show_progress="hidden"
     )
     
-    # Store uploaded mesh path
+    # Store uploaded mesh path and show immediate preview when supported.
+    def _uploaded_file_to_path(file):
+        if file is None:
+            return None
+        if isinstance(file, str):
+            return file
+        if isinstance(file, dict):
+            return file.get("path") or file.get("name")
+        return getattr(file, "name", None)
+
+    def _safe_filename(name: str) -> str:
+        safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(name))
+        safe = safe.strip("._")
+        return safe or "upload_mesh"
+
+    def _create_upload_workspace(upload_path: str):
+        root = Path(rigging_outputs_dir)
+        root.mkdir(parents=True, exist_ok=True)
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        work_dir = root / f"upload_{stamp}"
+        input_dir = work_dir / "inputs"
+        logs_dir = work_dir / "logs"
+        generated_dir = work_dir / "generated"
+        tmp_npz_dir = work_dir / "tmp_npz"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        generated_dir.mkdir(parents=True, exist_ok=True)
+        tmp_npz_dir.mkdir(parents=True, exist_ok=True)
+
+        src = Path(upload_path)
+        dst = input_dir / _safe_filename(src.name)
+        shutil.copy2(src, dst)
+
+        metadata_path = work_dir / "run_metadata.json"
+        metadata = {
+            "schema_version": 1,
+            "created_at": datetime.now().isoformat(),
+            "work_dir": str(work_dir),
+            "input": {
+                "original_upload_path": str(src),
+                "copied_input_path": str(dst),
+                "filename": src.name,
+            },
+            "paths": {
+                "logs_dir": str(logs_dir),
+                "generated_dir": str(generated_dir),
+                "tmp_npz_dir": str(tmp_npz_dir),
+                "full_log_path": str(logs_dir / "run_full.log"),
+            },
+            "stages": {},
+        }
+        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        return str(dst), str(work_dir)
+
+    def _normalize_model3d_path(path_value: str):
+        if not path_value:
+            return None
+        try:
+            path = Path(path_value).resolve()
+            if not path.exists() or not path.is_file():
+                return None
+            return path.as_posix()
+        except Exception:
+            return None
+
+    def _save_preview_metadata(work_dir: str, preview_path: str, preview_note: str):
+        metadata_path = Path(work_dir) / "run_metadata.json"
+        try:
+            metadata = {}
+            if metadata_path.exists():
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata.setdefault("input", {})
+            if preview_path:
+                metadata["input"]["preview_path"] = preview_path
+            if preview_note:
+                metadata["input"]["preview_note"] = preview_note
+            metadata["last_updated_at"] = datetime.now().isoformat()
+            metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _build_preview_asset(copied_path: str, work_dir: str):
+        suffix = Path(copied_path).suffix.lower()
+        previewable_suffixes = {".glb", ".gltf", ".obj", ".ply", ".stl"}
+        if suffix not in previewable_suffixes:
+            return None, f"Preview unavailable for '{suffix}' in Model3D."
+
+        # Fallback: direct uploaded mesh path.
+        direct_preview = _normalize_model3d_path(copied_path)
+        note = "Preview source: uploaded mesh"
+
+        # Compatibility conversion: export a lightweight GLB preview.
+        # Heavy meshes can fail/blank in browser WebGL viewers, so we cap face count.
+        try:
+            import trimesh
+
+            scene = trimesh.load(copied_path, force="scene")
+            if isinstance(scene, trimesh.Scene):
+                mesh = scene.dump(concatenate=True)
+            elif isinstance(scene, trimesh.Trimesh):
+                mesh = scene
+            else:
+                mesh = None
+
+            if mesh is None or len(mesh.faces) == 0:
+                return direct_preview, "Preview conversion skipped; using uploaded mesh."
+
+            target_faces = 120_000
+            original_faces = int(len(mesh.faces))
+            simplified_faces = original_faces
+
+            if original_faces > target_faces:
+                simplified_mesh = None
+                try:
+                    # Optional dependency path (if available).
+                    simplified_mesh = mesh.simplify_quadric_decimation(target_faces)
+                except Exception:
+                    simplified_mesh = None
+
+                if simplified_mesh is None or len(simplified_mesh.faces) == 0:
+                    # Deterministic fallback: subsample faces for viewer-friendly preview.
+                    step = max(1, original_faces // target_faces)
+                    simplified_mesh = trimesh.Trimesh(
+                        vertices=mesh.vertices.copy(),
+                        faces=mesh.faces[::step].copy(),
+                        process=False,
+                    )
+                    simplified_mesh.remove_unreferenced_vertices()
+
+                mesh = simplified_mesh
+                simplified_faces = int(len(mesh.faces))
+
+            preview_dir = Path(work_dir) / "preview"
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            preview_glb = preview_dir / f"{Path(copied_path).stem}_preview.glb"
+            exported = trimesh.Scene(mesh).export(file_type="glb")
+            if isinstance(exported, (bytes, bytearray)):
+                preview_glb.write_bytes(bytes(exported))
+                converted_preview = _normalize_model3d_path(str(preview_glb))
+                if converted_preview:
+                    return (
+                        converted_preview,
+                        f"Preview source: converted {preview_glb.name} ({original_faces}→{simplified_faces} faces)",
+                    )
+        except Exception as e:
+            note = f"Preview conversion failed ({type(e).__name__}); using uploaded mesh."
+
+        return direct_preview, note
+
     def store_mesh(file):
-        return file.name if file else None
+        path = _uploaded_file_to_path(file)
+        if not path:
+            return (
+                None,
+                gr.update(value=None),
+                "Upload a mesh and click 'Generate Skeleton' to begin...",
+                None,
+            )
+        if not os.path.exists(path):
+            return (
+                None,
+                gr.update(value=None),
+                "❌ Uploaded mesh file was not found. Please upload again.",
+                None,
+            )
+
+        try:
+            copied_path, work_dir = _create_upload_workspace(path)
+        except Exception as e:
+            return (
+                None,
+                gr.update(value=None),
+                f"❌ Failed to prepare upload workspace: {type(e).__name__}: {e}",
+                None,
+            )
+
+        preview_path, preview_note = _build_preview_asset(copied_path, work_dir)
+        _save_preview_metadata(work_dir, preview_path, preview_note)
+        suffix = Path(copied_path).suffix.lower()
+
+        if preview_path:
+            status = (
+                f"✅ Mesh uploaded: {Path(copied_path).name}\n"
+                f"Workspace: {work_dir}\n"
+                f"Viewer path: {preview_path}\n"
+                f"{preview_note}\n"
+                "Preview loaded. Click 'Generate Skeleton' to begin."
+            )
+        else:
+            status = (
+                f"✅ Mesh uploaded: {Path(copied_path).name}\n"
+                f"Workspace: {work_dir}\n"
+                f"{preview_note}\n"
+                "You can still run rigging."
+            )
+        return (copied_path, gr.update(value=preview_path), status, work_dir)
     
     mesh_upload.change(
         fn=store_mesh,
         inputs=[mesh_upload],
-        outputs=[original_mesh_state],
+        outputs=[original_mesh_state, rigged_model_preview, rig_status, upload_run_dir_state],
         queue=False,
         show_progress="hidden"
     )
     
-    # Generate Skeleton
-    generate_skeleton_btn.click(
+    def auto_skin_after_skeleton(enable_skin: bool, skeleton_path: str, seed: int, prior_status: str, req: gr.Request):
+        """Automatically run skinning after skeleton generation when enabled."""
+        base_status = prior_status or ""
+
+        if not skeleton_path:
+            msg = "❌ Skeleton generation did not produce an output. Auto-skinning skipped."
+            yield (None, None, (base_status + "\n" + msg).strip() if base_status else msg)
+            return
+
+        if not enable_skin:
+            msg = "ℹ️ Auto-skinning is disabled. Skeleton was saved."
+            yield (None, None, (base_status + "\n" + msg).strip() if base_status else msg)
+            return
+
+        # Stream the underlying skinning stage and keep previous logs visible.
+        for skinned_path, preview_path, skin_status in run_skinning_fn(skeleton_path, seed, req):
+            if skin_status:
+                merged_status = (base_status + "\n" + skin_status).strip() if base_status else skin_status
+            else:
+                merged_status = base_status
+            yield (skinned_path, preview_path, merged_status)
+
+    # Generate Skeleton (+ optional auto-skinning chained after skeleton success)
+    _skeleton_evt = generate_skeleton_btn.click(
         fn=run_skeleton_fn,
-        inputs=[mesh_upload, rig_seed],
+        inputs=[original_mesh_state, rig_seed, upload_run_dir_state],
         outputs=[skeleton_path_state, rigged_model_preview, rig_status]
+    )
+    _skeleton_evt.then(
+        fn=auto_skin_after_skeleton,
+        inputs=[enable_skinning, skeleton_path_state, rig_seed, rig_status],
+        outputs=[skinned_path_state, rigged_model_preview, rig_status],
     )
     
     # Add Skinning
@@ -182,7 +414,7 @@ def rigging_tab(
     )
     
     # Export Rigged Model
-    def prepare_export(skinned_path, skeleton_path, original_mesh, export_fmt, auto_merge_enabled, req):
+    def prepare_export(skinned_path, skeleton_path, original_mesh, export_fmt, export_both, auto_merge_enabled, req):
         """Determine which file to use for merge and call merge function."""
         # Use skinned if available, otherwise skeleton
         source = skinned_path if skinned_path else skeleton_path
@@ -194,11 +426,31 @@ def rigging_tab(
             return (None, None, "❌ Original mesh not found.", gr.update(visible=False))
         
         if auto_merge_enabled:
+            chosen_output = None
+            chosen_download = None
+
+            def _download_update(path):
+                if path:
+                    return gr.update(visible=True, value=path)
+                return gr.update(visible=False)
+
+            # Primary format export (selected by user).
             for output in run_merge_fn(source, original_mesh, export_fmt, req):
-                if output[0] and output[1]:  # final_output_state, download_btn_file, status, download_btn_update
-                    yield (output[0], output[1], output[2], gr.update(visible=True, value=output[1]))
-                else:
-                    yield (output[0], output[1], output[2], gr.update(visible=False))
+                out_path, out_download, out_status = output
+                if out_path and out_download and chosen_output is None:
+                    chosen_output = out_path
+                    chosen_download = out_download
+                yield (chosen_output, chosen_download, out_status, _download_update(chosen_download))
+
+            # Secondary format export (optional) so both FBX+GLB are saved.
+            if export_both:
+                other_fmt = "glb" if export_fmt == "fbx" else "fbx"
+                for output in run_merge_fn(source, original_mesh, other_fmt, req):
+                    out_path, out_download, out_status = output
+                    if out_path and out_download and chosen_output is None:
+                        chosen_output = out_path
+                        chosen_download = out_download
+                    yield (chosen_output, chosen_download, out_status, _download_update(chosen_download))
         else:
             # Just export the source file without merging
             final_status = f"✅ Rigged model ready (no merge):\n{source}"
@@ -211,6 +463,7 @@ def rigging_tab(
             skeleton_path_state,
             original_mesh_state,
             export_format,
+            export_both_formats,
             auto_merge,
         ],
         outputs=[final_output_state, download_btn, rig_status, download_btn]
@@ -235,12 +488,13 @@ def rigging_tab(
     def clear_all():
         return (
             None,  # mesh_upload
-            None,  # rigged_model_preview
+            gr.update(value=None),  # rigged_model_preview
             "Cleared. Upload a new mesh to begin.",  # rig_status
             None,  # skeleton_path_state
             None,  # skinned_path_state
             None,  # final_output_state
             None,  # original_mesh_state
+            None,  # upload_run_dir_state
             gr.update(visible=False),  # download_btn
         )
     
@@ -254,8 +508,17 @@ def rigging_tab(
             skinned_path_state,
             final_output_state,
             original_mesh_state,
+            upload_run_dir_state,
             download_btn,
         ],
         queue=False,
         show_progress="hidden"
     )
+
+    return {
+        "send_to_animation_btn": send_to_animation_btn,
+        "final_output_state": final_output_state,
+        "skinned_path_state": skinned_path_state,
+        "skeleton_path_state": skeleton_path_state,
+        "rig_status": rig_status,
+    }

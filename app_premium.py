@@ -12,6 +12,8 @@ import importlib
 import json
 import time
 import threading
+import inspect
+import string
 from pathlib import Path
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,7 +69,7 @@ from datetime import datetime
 import shutil
 import base64
 import io
-from typing import Tuple, Optional, Dict, List, Any
+from typing import Tuple, Optional, Dict, List, Any, Set
 
 import cv2
 import numpy as np
@@ -128,6 +130,64 @@ RIGGING_OUTPUTS_DIR = os.path.join(OUTPUTS_DIR, "rigged_models")
 
 # Ensure TRELLIS_MODELS_DIR is set (trellis2 code also falls back to ../models).
 os.environ.setdefault("TRELLIS_MODELS_DIR", MODELS_DIR)
+
+
+def _discover_allowed_paths_all_drives() -> List[str]:
+    """
+    Build a permissive allow-list for Gradio file serving.
+    - Windows: include all detected drive roots (A:\\..Z:\\)
+    - Linux/macOS: include '/' and discovered mount points
+    """
+    allowed: List[str] = []
+    seen: Set[str] = set()
+
+    def _add(path: str) -> None:
+        if not path:
+            return
+        try:
+            resolved = str(Path(path).resolve())
+        except Exception:
+            resolved = os.path.abspath(path)
+        if resolved in seen:
+            return
+        if os.path.isdir(resolved):
+            seen.add(resolved)
+            allowed.append(resolved)
+
+    # Always include app-specific paths first.
+    for base in [APP_DIR, MODELS_DIR, OUTPUTS_DIR, RIGGING_OUTPUTS_DIR, TMP_DIR, PRESETS_DIR]:
+        _add(base)
+
+    if os.name == "nt":
+        for letter in string.ascii_uppercase:
+            _add(f"{letter}:\\")
+    else:
+        # Root covers all mounted filesystems on Unix-like systems.
+        _add("/")
+
+        for parent in ("/mnt", "/media", "/run/media", "/Volumes"):
+            _add(parent)
+            try:
+                parent_path = Path(parent)
+                if parent_path.is_dir():
+                    for child in parent_path.iterdir():
+                        if child.is_dir():
+                            _add(str(child))
+            except Exception:
+                pass
+
+        proc_mounts = Path("/proc/mounts")
+        if proc_mounts.exists():
+            try:
+                for line in proc_mounts.read_text(encoding="utf-8", errors="ignore").splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        mount_point = parts[1].replace("\\040", " ")
+                        _add(mount_point)
+            except Exception:
+                pass
+
+    return allowed
 
 # Local helpers (not the stdlib `subprocess` module)
 from subprocess_utils import allocate_run_dir, next_indexed_path, ensure_dir, safe_relpath  # noqa: E402
@@ -871,9 +931,10 @@ def _list_rigged_models() -> List[str]:
     if not rigged_dir.exists():
         return []
     
+    supported_exts = {".fbx", ".glb", ".gltf", ".obj", ".ply", ".stl"}
     models = []
     for item in rigged_dir.rglob("*"):
-        if item.is_file() and item.suffix.lower() in (".fbx", ".glb"):
+        if item.is_file() and item.suffix.lower() in supported_exts:
             # Store relative paths from rigging outputs dir
             rel_path = item.relative_to(rigged_dir)
             models.append(str(rel_path))
@@ -881,59 +942,222 @@ def _list_rigged_models() -> List[str]:
     return sorted(models)
 
 
-def _run_unirig_skeleton(input_mesh_path: str, seed: int, req: gr.Request):
+def _safe_rig_filename(name: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(name))
+    safe = safe.strip("._")
+    return safe or "mesh"
+
+
+def _ensure_rig_workspace_dirs(work_dir: Path) -> None:
+    (work_dir / "inputs").mkdir(parents=True, exist_ok=True)
+    (work_dir / "logs").mkdir(parents=True, exist_ok=True)
+    (work_dir / "generated").mkdir(parents=True, exist_ok=True)
+    (work_dir / "tmp_npz").mkdir(parents=True, exist_ok=True)
+
+
+def _rig_metadata_path(work_dir: Path) -> Path:
+    return work_dir / "run_metadata.json"
+
+
+def _load_rig_metadata(work_dir: Path) -> Dict[str, Any]:
+    path = _rig_metadata_path(work_dir)
+    if path.exists():
+        try:
+            data = _read_json(str(path))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {
+        "schema_version": 1,
+        "created_at": datetime.now().isoformat(),
+        "work_dir": str(work_dir),
+        "input": {},
+        "paths": {
+            "logs_dir": str(work_dir / "logs"),
+            "generated_dir": str(work_dir / "generated"),
+            "tmp_npz_dir": str(work_dir / "tmp_npz"),
+            "full_log_path": str(work_dir / "logs" / "run_full.log"),
+        },
+        "stages": {},
+    }
+
+
+def _save_rig_metadata(work_dir: Path, metadata: Dict[str, Any]) -> None:
+    metadata["last_updated_at"] = datetime.now().isoformat()
+    _write_json(str(_rig_metadata_path(work_dir)), metadata)
+
+
+def _append_rig_full_log(work_dir: Path, stage: str, line: str) -> None:
+    log_path = work_dir / "logs" / "run_full.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(f"[{stage}] {line}\n")
+
+
+def _find_rig_work_dir(path: Path) -> Path:
+    for candidate in [path.parent, *path.parents]:
+        if (_rig_metadata_path(candidate)).exists():
+            return candidate
+    if path.parent.name in {"generated", "inputs", "logs", "tmp_npz"}:
+        return path.parent.parent
+    return path.parent
+
+
+def _prepare_rig_input(input_mesh_path: str, upload_run_dir: Optional[str]) -> Tuple[Path, Path]:
+    input_src = Path(input_mesh_path)
+    if upload_run_dir:
+        work_dir = Path(upload_run_dir)
+    else:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        work_dir = Path(RIGGING_OUTPUTS_DIR) / f"upload_{timestamp}"
+    _ensure_rig_workspace_dirs(work_dir)
+
+    dst = work_dir / "inputs" / _safe_rig_filename(input_src.name)
+    try:
+        same_file = input_src.resolve() == dst.resolve()
+    except Exception:
+        same_file = False
+    if not same_file:
+        shutil.copy2(input_src, dst)
+
+    metadata = _load_rig_metadata(work_dir)
+    metadata["input"] = {
+        "original_upload_path": str(input_src),
+        "copied_input_path": str(dst),
+        "filename": input_src.name,
+    }
+    _save_rig_metadata(work_dir, metadata)
+    return work_dir, dst
+
+
+def _normalize_model3d_preview_path(path_value: Optional[str]) -> Optional[str]:
+    if not path_value:
+        return None
+    try:
+        path = Path(path_value).resolve()
+        if not path.exists() or not path.is_file():
+            return None
+        return path.as_posix()
+    except Exception:
+        return None
+
+
+def _select_rig_preview_source(metadata: Dict[str, Any], fallback_path: Optional[str] = None) -> Optional[str]:
+    input_meta = metadata.get("input", {}) if isinstance(metadata, dict) else {}
+    candidates = [
+        input_meta.get("preview_path"),
+        input_meta.get("copied_input_path"),
+        fallback_path,
+    ]
+    for candidate in candidates:
+        normalized = _normalize_model3d_preview_path(candidate)
+        if normalized:
+            return normalized
+    return None
+
+
+def _run_unirig_skeleton(input_mesh_path: str, seed: int, upload_run_dir: Optional[str], req: gr.Request):
     """
     Generate skeleton for uploaded mesh using UniRig via subprocess.
     Yields status updates as processing proceeds.
     """
     session = str(req.session_hash)
-    
+    work_dir: Optional[Path] = None
+
     try:
-        # Validate input
         if not input_mesh_path or not os.path.exists(input_mesh_path):
             yield (None, None, "❌ Please upload a valid mesh file.")
             return
-        
-        # Create output directory
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        work_dir = Path(RIGGING_OUTPUTS_DIR) / f"skeleton_{timestamp}"
-        work_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Prepare output paths
-        input_path = Path(input_mesh_path)
-        skeleton_fbx = work_dir / f"{input_path.stem}_skeleton.fbx"
+
+        work_dir, input_path = _prepare_rig_input(input_mesh_path, upload_run_dir)
+        generated_dir = work_dir / "generated"
+        logs_dir = work_dir / "logs"
+
+        skeleton_fbx = generated_dir / f"{input_path.stem}_skeleton.fbx"
         npz_dir = work_dir / "tmp_npz"
-        log_path = work_dir / "skeleton_log.txt"
-        
-        yield (None, None, f"🔄 Starting skeleton generation...\\nInput: {input_path.name}\\nSeed: {seed}")
-        
-        # Build payload for subprocess
+        log_path = logs_dir / "skeleton_log.txt"
+
+        metadata = _load_rig_metadata(work_dir)
+        metadata.setdefault("stages", {})["skeleton"] = {
+            "status": "running",
+            "started_at": datetime.now().isoformat(),
+            "log_path": str(log_path),
+            "payload_path": str(work_dir / "unirig_skeleton.payload.json"),
+            "result_path": str(work_dir / "unirig_skeleton.result.json"),
+            "input_mesh_path": str(input_path),
+            "output_path": str(skeleton_fbx),
+            "seed": int(seed),
+        }
+        _save_rig_metadata(work_dir, metadata)
+
+        yield (
+            None,
+            None,
+            f"Starting skeleton generation...\nInput: {input_path.name}\nSeed: {seed}\nWorkspace: {work_dir}",
+        )
+
         payload = {
             "input_mesh_path": str(input_path),
             "output_fbx_path": str(skeleton_fbx),
             "npz_dir": str(npz_dir),
             "seed": seed,
         }
-        
+
         status = ""
         result = None
-        
-        # Run skeleton generation subprocess
         for event in _iter_subprocess_stage("unirig_skeleton", payload, work_dir, log_path, session=session):
             if event["type"] == "log":
+                _append_rig_full_log(work_dir, "skeleton", event["text"])
                 status = _append_status(status, event["text"])
                 status = _trim_status(status)
                 yield (None, None, status)
             elif event["type"] == "result":
                 result = event["result"]
-        
+
+        metadata = _load_rig_metadata(work_dir)
         if result and skeleton_fbx.exists():
-            final_status = _append_status(status, f"\\n✅ Skeleton generated successfully!\\nOutput: {skeleton_fbx}")
-            yield (str(skeleton_fbx), str(skeleton_fbx), final_status)
+            metadata.setdefault("stages", {}).setdefault("skeleton", {}).update(
+                {
+                    "status": "completed",
+                    "completed_at": datetime.now().isoformat(),
+                    "result": result,
+                }
+            )
+            metadata.setdefault("paths", {})["skeleton_output"] = str(skeleton_fbx)
+            _save_rig_metadata(work_dir, metadata)
+            preview_source = _select_rig_preview_source(metadata, str(input_path))
+            note = (
+                "\nNote: skeleton FBX can appear blank in Model3D because it often contains bones without surface mesh. "
+                "Preview is showing your uploaded mesh."
+            )
+            final_status = _append_status(status, f"\n✅ Skeleton generated successfully!\nOutput: {skeleton_fbx}{note}")
+            yield (str(skeleton_fbx), preview_source, final_status)
         else:
-            yield (None, None, _append_status(status, "\\n❌ Skeleton generation failed."))
-    
+            metadata.setdefault("stages", {}).setdefault("skeleton", {}).update(
+                {
+                    "status": "failed",
+                    "completed_at": datetime.now().isoformat(),
+                }
+            )
+            _save_rig_metadata(work_dir, metadata)
+            yield (None, None, _append_status(status, "\n❌ Skeleton generation failed."))
+
     except Exception as e:
+        if work_dir is not None and work_dir.exists():
+            try:
+                metadata = _load_rig_metadata(work_dir)
+                metadata.setdefault("stages", {}).setdefault("skeleton", {}).update(
+                    {
+                        "status": "failed",
+                        "completed_at": datetime.now().isoformat(),
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+                )
+                _save_rig_metadata(work_dir, metadata)
+                _append_rig_full_log(work_dir, "skeleton", f"ERROR: {type(e).__name__}: {e}")
+            except Exception:
+                pass
         yield (None, None, f"❌ Error: {type(e).__name__}: {e}")
 
 
@@ -942,20 +1166,35 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
     Add skinning weights to skeleton using UniRig via subprocess.
     """
     session = str(req.session_hash)
-    
+    work_dir: Optional[Path] = None
+
     try:
         if not skeleton_fbx_path or not os.path.exists(skeleton_fbx_path):
             yield (None, None, "❌ Please generate or upload a skeleton first.")
             return
-        
+
         skeleton_path = Path(skeleton_fbx_path)
-        work_dir = skeleton_path.parent
-        skinned_fbx = work_dir / f"{skeleton_path.stem.replace('_skeleton', '')}_skinned.fbx"
-        log_path = work_dir / "skinning_log.txt"
+        work_dir = _find_rig_work_dir(skeleton_path)
+        _ensure_rig_workspace_dirs(work_dir)
+        skinned_fbx = work_dir / "generated" / f"{skeleton_path.stem.replace('_skeleton', '')}_skinned.fbx"
+        log_path = work_dir / "logs" / "skinning_log.txt"
         npz_dir = work_dir / "tmp_npz"
-        
-        yield (None, None, f"🔄 Starting skinning prediction...\\nSkeleton: {skeleton_path.name}\\nSeed: {seed}")
-        
+
+        metadata = _load_rig_metadata(work_dir)
+        metadata.setdefault("stages", {})["skinning"] = {
+            "status": "running",
+            "started_at": datetime.now().isoformat(),
+            "log_path": str(log_path),
+            "payload_path": str(work_dir / "unirig_skinning.payload.json"),
+            "result_path": str(work_dir / "unirig_skinning.result.json"),
+            "input_skeleton_path": str(skeleton_path),
+            "output_path": str(skinned_fbx),
+            "seed": int(seed),
+        }
+        _save_rig_metadata(work_dir, metadata)
+
+        yield (None, None, f"Starting skinning prediction...\nSkeleton: {skeleton_path.name}\nSeed: {seed}")
+
         payload = {
             "input_skeleton_path": str(skeleton_path),
             "output_fbx_path": str(skinned_fbx),
@@ -963,25 +1202,68 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
             "seed": seed,
             "data_name": "raw_data.npz",
         }
-        
+
         status = ""
         result = None
-        
         for event in _iter_subprocess_stage("unirig_skinning", payload, work_dir, log_path, session=session):
             if event["type"] == "log":
+                _append_rig_full_log(work_dir, "skinning", event["text"])
                 status = _append_status(status, event["text"])
                 status = _trim_status(status)
                 yield (None, None, status)
             elif event["type"] == "result":
                 result = event["result"]
-        
+
+        metadata = _load_rig_metadata(work_dir)
         if result and skinned_fbx.exists():
-            final_status = _append_status(status, f"\\n✅ Skinning completed!\\nOutput: {skinned_fbx}")
-            yield (str(skinned_fbx), str(skinned_fbx), final_status)
+            metadata.setdefault("stages", {}).setdefault("skinning", {}).update(
+                {
+                    "status": "completed",
+                    "completed_at": datetime.now().isoformat(),
+                    "result": result,
+                }
+            )
+            metadata.setdefault("paths", {})["skinning_output"] = str(skinned_fbx)
+            _save_rig_metadata(work_dir, metadata)
+            preview_source: Optional[str] = _normalize_model3d_preview_path(str(skinned_fbx))
+            note = ""
+            if skinned_fbx.suffix.lower() == ".fbx":
+                preview_source = _select_rig_preview_source(metadata, None)
+                if preview_source:
+                    note = (
+                        "\nNote: skinned FBX preview may be blank in Gradio Model3D. "
+                        "Showing uploaded mesh as preview fallback."
+                    )
+                else:
+                    preview_source = None
+                    note = "\nNote: FBX preview is not supported by Gradio Model3D in this view."
+            final_status = _append_status(status, f"\n✅ Skinning completed!\nOutput: {skinned_fbx}{note}")
+            yield (str(skinned_fbx), preview_source, final_status)
         else:
-            yield (None, None, _append_status(status, "\\n❌ Skinning failed."))
-    
+            metadata.setdefault("stages", {}).setdefault("skinning", {}).update(
+                {
+                    "status": "failed",
+                    "completed_at": datetime.now().isoformat(),
+                }
+            )
+            _save_rig_metadata(work_dir, metadata)
+            yield (None, None, _append_status(status, "\n❌ Skinning failed."))
+
     except Exception as e:
+        if work_dir is not None and work_dir.exists():
+            try:
+                metadata = _load_rig_metadata(work_dir)
+                metadata.setdefault("stages", {}).setdefault("skinning", {}).update(
+                    {
+                        "status": "failed",
+                        "completed_at": datetime.now().isoformat(),
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+                )
+                _save_rig_metadata(work_dir, metadata)
+                _append_rig_full_log(work_dir, "skinning", f"ERROR: {type(e).__name__}: {e}")
+            except Exception:
+                pass
         yield (None, None, f"❌ Error: {type(e).__name__}: {e}")
 
 
@@ -990,52 +1272,150 @@ def _run_unirig_merge(source_fbx_path: str, target_mesh_path: str, export_format
     Merge rigged skeleton with original mesh using UniRig via subprocess.
     """
     session = str(req.session_hash)
-    
+    work_dir: Optional[Path] = None
+
     try:
         if not source_fbx_path or not os.path.exists(source_fbx_path):
             yield (None, None, "❌ Please generate skeleton/skinning first.")
             return
-        
+
         if not target_mesh_path or not os.path.exists(target_mesh_path):
             yield (None, None, "❌ Please upload target mesh.")
             return
-        
+
         source_path = Path(source_fbx_path)
         target_path = Path(target_mesh_path)
-        work_dir = source_path.parent
-        
+        work_dir = _find_rig_work_dir(source_path)
+        _ensure_rig_workspace_dirs(work_dir)
+
         ext = ".fbx" if export_format == "fbx" else ".glb"
-        final_output = work_dir / f"{target_path.stem}_rigged{ext}"
-        log_path = work_dir / "merge_log.txt"
-        
-        yield (None, None, f"🔄 Merging rig with mesh...\\nSource: {source_path.name}\\nTarget: {target_path.name}")
-        
+        final_output = work_dir / "generated" / f"{target_path.stem}_rigged{ext}"
+        log_path = work_dir / "logs" / "merge_log.txt"
+
+        metadata = _load_rig_metadata(work_dir)
+        metadata.setdefault("stages", {})["merge"] = {
+            "status": "running",
+            "started_at": datetime.now().isoformat(),
+            "log_path": str(log_path),
+            "payload_path": str(work_dir / "unirig_merge.payload.json"),
+            "result_path": str(work_dir / "unirig_merge.result.json"),
+            "source_path": str(source_path),
+            "target_path": str(target_path),
+            "output_path": str(final_output),
+            "export_format": export_format,
+        }
+        _save_rig_metadata(work_dir, metadata)
+
+        yield (None, None, f"Merging rig with mesh...\nSource: {source_path.name}\nTarget: {target_path.name}")
+
         payload = {
             "source_path": str(source_path),
             "target_path": str(target_path),
             "output_path": str(final_output),
             "export_format": export_format,
         }
-        
+
         status = ""
         result = None
-        
         for event in _iter_subprocess_stage("unirig_merge", payload, work_dir, log_path, session=session):
             if event["type"] == "log":
+                _append_rig_full_log(work_dir, "merge", event["text"])
                 status = _append_status(status, event["text"])
                 status = _trim_status(status)
                 yield (None, None, status)
             elif event["type"] == "result":
                 result = event["result"]
-        
+
+        metadata = _load_rig_metadata(work_dir)
         if result and final_output.exists():
-            final_status = _append_status(status, f"\\n✅ Rigged model created!\\nOutput: {final_output}")
-            yield (str(final_output), str(final_output), final_status)
+            metadata.setdefault("stages", {}).setdefault("merge", {}).update(
+                {
+                    "status": "completed",
+                    "completed_at": datetime.now().isoformat(),
+                    "result": result,
+                }
+            )
+            metadata.setdefault("paths", {})["final_output"] = str(final_output)
+            _save_rig_metadata(work_dir, metadata)
+            preview_source: Optional[str] = _normalize_model3d_preview_path(str(final_output))
+            note = ""
+            if final_output.suffix.lower() == ".fbx":
+                preview_source = _select_rig_preview_source(metadata, None)
+                if preview_source:
+                    note = (
+                        "\nNote: FBX preview may be blank in Gradio Model3D. "
+                        "Showing uploaded mesh as preview fallback."
+                    )
+                else:
+                    preview_source = None
+                    note = "\nNote: FBX preview is not supported by Gradio Model3D in this view."
+            final_status = _append_status(status, f"\n✅ Rigged model created!\nOutput: {final_output}{note}")
+            yield (str(final_output), preview_source, final_status)
         else:
-            yield (None, None, _append_status(status, "\\n❌ Merge failed."))
-    
+            metadata.setdefault("stages", {}).setdefault("merge", {}).update(
+                {
+                    "status": "failed",
+                    "completed_at": datetime.now().isoformat(),
+                }
+            )
+            _save_rig_metadata(work_dir, metadata)
+            yield (None, None, _append_status(status, "\n❌ Merge failed."))
+
     except Exception as e:
+        if work_dir is not None and work_dir.exists():
+            try:
+                metadata = _load_rig_metadata(work_dir)
+                metadata.setdefault("stages", {}).setdefault("merge", {}).update(
+                    {
+                        "status": "failed",
+                        "completed_at": datetime.now().isoformat(),
+                        "error": f"{type(e).__name__}: {e}",
+                    }
+                )
+                _save_rig_metadata(work_dir, metadata)
+                _append_rig_full_log(work_dir, "merge", f"ERROR: {type(e).__name__}: {e}")
+            except Exception:
+                pass
         yield (None, None, f"❌ Error: {type(e).__name__}: {e}")
+
+
+def _send_rig_output_to_animation(
+    final_output_path: Optional[str],
+    skinned_path: Optional[str],
+    skeleton_path: Optional[str],
+    current_status: str,
+):
+    def _norm_path(path: str) -> str:
+        try:
+            return Path(path).resolve().as_posix()
+        except Exception:
+            return path
+
+    # Prefer skinned output for animation browsing.
+    candidate = skinned_path or skeleton_path or final_output_path
+    if not candidate:
+        status = _append_status(current_status or "", "❌ No rig output to send. Generate skeleton/skinning/export first.")
+        return "", _trim_status(status), gr.update()
+    if not os.path.exists(candidate):
+        status = _append_status(current_status or "", f"❌ Output file not found: {candidate}")
+        return "", _trim_status(status), gr.update()
+
+    # Prefer a preview-friendly sibling when available (GLB/GTLF) while keeping FBX saved for DCC.
+    candidate_path = Path(candidate)
+    viewer_candidate = candidate
+    if candidate_path.suffix.lower() == ".fbx":
+        same_stem_glb = candidate_path.with_suffix(".glb")
+        same_stem_gltf = candidate_path.with_suffix(".gltf")
+        if same_stem_glb.exists():
+            viewer_candidate = str(same_stem_glb)
+        elif same_stem_gltf.exists():
+            viewer_candidate = str(same_stem_gltf)
+        elif final_output_path and os.path.exists(final_output_path) and Path(final_output_path).suffix.lower() in {".glb", ".gltf"}:
+            viewer_candidate = final_output_path
+
+    viewer_candidate = _norm_path(viewer_candidate)
+    status = _append_status(current_status or "", f"➡ Sent to Animation Browser: {Path(viewer_candidate).name}")
+    return viewer_candidate, _trim_status(status), gr.Tabs(selected="animation_tab")
 
 
 # ------------------------------- Cancellation -------------------------------
@@ -3194,7 +3574,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
     demo.load(start_session)
     demo.unload(end_session)
 
-    with gr.Tabs():
+    with gr.Tabs() as main_tabs:
         # ---------------------------- Tab 1: Image -> 3D ----------------------------
         with gr.Tab("Image → 3D"):
             with gr.Row():
@@ -4285,8 +4665,8 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
             )
 
         # ---------------------------- Tab 5: Rigging (UniRig) ----------------------------
-        with gr.Tab("🦴 Rigging"):
-            rigging_tab(
+        with gr.Tab("🦴 Rigging", id="rigging_tab"):
+            rigging_ui = rigging_tab(
                 run_skeleton_fn=_run_unirig_skeleton,
                 run_skinning_fn=_run_unirig_skinning,
                 run_merge_fn=_run_unirig_merge,
@@ -4295,12 +4675,30 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
             )
 
         # ---------------------------- Tab 6: Animation Player ----------------------------
-        with gr.Tab("🎬 Animation Player"):
-            animation_player_tab(
+        with gr.Tab("🎬 Animation Player", id="animation_tab"):
+            animation_ui = animation_player_tab(
                 list_models_fn=_list_rigged_models,
                 rigging_outputs_dir=RIGGING_OUTPUTS_DIR,
                 open_folder_fn=_open_folder,
             )
+
+    # Bridge: Rigging -> Animation browser selection.
+    rigging_ui["send_to_animation_btn"].click(
+        fn=_send_rig_output_to_animation,
+        inputs=[
+            rigging_ui["final_output_state"],
+            rigging_ui["skinned_path_state"],
+            rigging_ui["skeleton_path_state"],
+            rigging_ui["rig_status"],
+        ],
+        outputs=[
+            animation_ui["external_select_input"],
+            rigging_ui["rig_status"],
+            main_tabs,
+        ],
+        queue=False,
+        show_progress="hidden",
+    )
 
     # ---------------------------- Preset Wiring ----------------------------
     _CONFIG_KEYS = [
@@ -4538,8 +4936,18 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
 def _parse_launch_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TRELLIS.2 Premium (Gradio)")
     parser.add_argument("--share", action="store_true", help="Create a public Gradio share link")
-    parser.add_argument("--server-name", type=str, default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
-    parser.add_argument("--server-port", type=int, default=7860, help="Port to listen on (default: 7860)")
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=None,
+        help="Optional bind address. If omitted, Gradio default host is used.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Optional port. If omitted, Gradio chooses its default behavior.",
+    )
     parser.add_argument(
         "--no-browser",
         action="store_true",
@@ -4555,8 +4963,23 @@ if __name__ == "__main__":
     os.makedirs(PRESETS_DIR, exist_ok=True)
     demo.queue()
     args = _parse_launch_args()
-    demo.launch(
-        share=args.share,
-        inbrowser=True,
-        show_error=True,
-    )
+    launch_kwargs = {
+        "share": args.share,
+        "inbrowser": not args.no_browser,
+        "show_error": True,
+    }
+    if args.host is not None:
+        launch_kwargs["server_name"] = args.host
+    if args.port is not None:
+        launch_kwargs["server_port"] = args.port
+    try:
+        launch_sig = inspect.signature(demo.launch)
+        if "allowed_paths" in launch_sig.parameters:
+            launch_kwargs["allowed_paths"] = _discover_allowed_paths_all_drives()
+            print(
+                f"[launch] Gradio allowed_paths enabled with {len(launch_kwargs['allowed_paths'])} path roots.",
+                flush=True,
+            )
+    except Exception:
+        pass
+    demo.launch(**launch_kwargs)

@@ -23,6 +23,8 @@ var/
 wheels/
 SECourses_Musubi_Trainer
 UniRig
+glb_0001.glb
+venv_rig/
 blender
 share/python-wheels/
 *.egg-info/

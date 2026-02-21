@@ -5,6 +5,8 @@ Displays rigged models with metadata and download options.
 import gradio as gr
 import os
 import json
+import shutil
+from datetime import datetime
 from pathlib import Path
 
 
@@ -38,6 +40,12 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
             )
             
             refresh_btn = gr.Button("🔄 Refresh List", variant="secondary")
+
+            upload_model_file = gr.File(
+                label="Upload Model To Browser",
+                file_types=[".fbx", ".glb", ".gltf", ".obj", ".ply", ".stl"],
+                file_count="single",
+            )
             
             # Metadata display
             gr.Markdown("## Model Information")
@@ -103,12 +111,78 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
     
     # State to track selected model path
     selected_model_path = gr.State(None)
-    
+    external_select_input = gr.Textbox(visible=False, label="External Model Path")
+
+    def _safe_filename(name: str) -> str:
+        safe = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in str(name))
+        safe = safe.strip("._")
+        return safe or "model"
+
+    def _uploaded_file_to_path(file):
+        if file is None:
+            return None
+        if isinstance(file, str):
+            return file
+        if isinstance(file, dict):
+            return file.get("path") or file.get("name")
+        return getattr(file, "name", None)
+
+    def _import_model_to_browser(src_path: str) -> str:
+        src = Path(src_path)
+        if not src.exists():
+            raise FileNotFoundError(f"File not found: {src_path}")
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        work_dir = Path(rigging_outputs_dir) / f"animation_upload_{stamp}"
+        generated_dir = work_dir / "generated"
+        generated_dir.mkdir(parents=True, exist_ok=True)
+
+        dst = generated_dir / _safe_filename(src.name)
+        shutil.copy2(src, dst)
+        return str(dst.relative_to(Path(rigging_outputs_dir)))
+
+    def _resolve_to_rel_model_path(path_value: str) -> str:
+        if not path_value:
+            raise ValueError("No model path provided.")
+
+        root = Path(rigging_outputs_dir).resolve()
+        path = Path(path_value)
+
+        if path.is_absolute():
+            if not path.exists():
+                raise FileNotFoundError(f"Model file not found: {path}")
+            abs_path = path.resolve()
+            try:
+                return str(abs_path.relative_to(root))
+            except ValueError:
+                return _import_model_to_browser(str(abs_path))
+
+        rel_candidate = root / path
+        if rel_candidate.exists():
+            return str(path)
+
+        raise FileNotFoundError(f"Model file not found: {path_value}")
+
+    def _normalize_model3d_path(path_value: str):
+        """
+        Normalize a file path for Gradio Model3D.
+        Uses absolute path + forward slashes for consistent browser loading on Windows.
+        """
+        if not path_value:
+            return None
+        try:
+            path = Path(path_value).resolve()
+            if not path.exists() or not path.is_file():
+                return None
+            return path.as_posix()
+        except Exception:
+            return None
+
     def load_model(model_rel_path):
         """Load selected model and extract metadata."""
         if not model_rel_path:
             return (
-                None,  # viewer
+                gr.update(value=None),  # viewer
                 None,  # metadata
                 "No model selected",  # file_info
                 None,  # selected_model_path
@@ -121,7 +195,7 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
             
             if not full_path.exists():
                 return (
-                    None,
+                    gr.update(value=None),
                     {"error": "File not found"},
                     f"❌ File not found: {model_rel_path}",
                     None,
@@ -131,7 +205,7 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
             # Get file info
             file_size = full_path.stat().st_size
             file_size_mb = file_size / (1024 * 1024)
-            file_ext = full_path.suffix
+            file_ext = full_path.suffix.lower()
             file_modified = full_path.stat().st_mtime
             
             from datetime import datetime
@@ -149,6 +223,53 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
                 "format": file_ext,
                 "size_mb": round(file_size_mb, 2),
             }
+
+            # Decide what to show in Model3D. FBX commonly appears blank in Gradio.
+            previewable_exts = {".glb", ".gltf", ".obj", ".ply", ".stl"}
+            viewer_path = str(full_path) if file_ext in previewable_exts else None
+            viewer_note = ""
+
+            if viewer_path is None:
+                # Prefer sibling GLB/GLTF if available (same model, preview-friendly format).
+                same_stem_glb = full_path.with_suffix(".glb")
+                same_stem_gltf = full_path.with_suffix(".gltf")
+                if same_stem_glb.exists():
+                    viewer_path = str(same_stem_glb)
+                    viewer_note = f"Viewer fallback: sibling {same_stem_glb.name}"
+                elif same_stem_gltf.exists():
+                    viewer_path = str(same_stem_gltf)
+                    viewer_note = f"Viewer fallback: sibling {same_stem_gltf.name}"
+
+            if viewer_path is None:
+                metadata_path = None
+                for parent in [full_path.parent, *full_path.parents]:
+                    cand = parent / "run_metadata.json"
+                    if cand.exists():
+                        metadata_path = cand
+                        break
+
+                if metadata_path is not None:
+                    try:
+                        run_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
+                        input_meta = run_meta.get("input", {})
+                        fallback = input_meta.get("preview_path") or input_meta.get("copied_input_path")
+                        if fallback and os.path.exists(fallback):
+                            fallback_ext = Path(fallback).suffix.lower()
+                            if fallback_ext in previewable_exts:
+                                viewer_path = str(Path(fallback))
+                                viewer_note = f"Viewer fallback: source mesh ({Path(fallback).name})"
+                    except Exception:
+                        pass
+
+            if viewer_path is None and file_ext == ".fbx":
+                viewer_note = "FBX preview is not supported by Gradio Model3D in this view."
+
+            normalized_viewer = _normalize_model3d_path(viewer_path)
+            if viewer_path and not normalized_viewer:
+                viewer_note = f"Viewer path was not accessible: {viewer_path}"
+                viewer_path = None
+            else:
+                viewer_path = normalized_viewer
             
             # Look for log file or metadata file
             log_file = full_path.parent / (full_path.stem + "_log.txt")
@@ -162,9 +283,14 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
                 metadata["type"] = "Rigged (Skinned)"
             else:
                 metadata["type"] = "Unknown"
+
+            metadata["viewer_path"] = viewer_path
+            if viewer_note:
+                metadata["viewer_note"] = viewer_note
+                file_info += f"\n**Viewer:** {viewer_note}"
             
             return (
-                str(full_path),  # viewer (load model)
+                gr.update(value=viewer_path),  # viewer (load previewable model or fallback)
                 metadata,
                 file_info,
                 str(full_path),  # selected_model_path
@@ -173,7 +299,7 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
         
         except Exception as e:
             return (
-                None,
+                gr.update(value=None),
                 {"error": str(e)},
                 f"❌ Error loading model: {e}",
                 None,
@@ -193,6 +319,84 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
         ],
         queue=False,
         show_progress="minimal"
+    )
+
+    def _load_external_model(path_value: str):
+        if not path_value:
+            return (
+                gr.update(),
+                gr.update(value=None),
+                None,
+                "No model selected",
+                None,
+                gr.update(visible=False),
+            )
+
+        try:
+            model_rel_path = _resolve_to_rel_model_path(path_value)
+            models = list_models_fn()
+            if model_rel_path not in models:
+                models = sorted(set(models + [model_rel_path]))
+            viewer, metadata, file_info, selected_path, download_update = load_model(model_rel_path)
+            return (
+                gr.update(choices=models, value=model_rel_path),
+                viewer,
+                metadata,
+                file_info,
+                selected_path,
+                download_update,
+            )
+        except Exception as e:
+            return (
+                gr.update(),
+                gr.update(value=None),
+                {"error": str(e)},
+                f"❌ Error loading model: {e}",
+                None,
+                gr.update(visible=False),
+            )
+
+    external_select_input.change(
+        fn=_load_external_model,
+        inputs=[external_select_input],
+        outputs=[
+            rigged_models_dropdown,
+            model_viewer,
+            metadata_display,
+            file_info_text,
+            selected_model_path,
+            download_model_btn,
+        ],
+        queue=False,
+        show_progress="minimal",
+    )
+
+    def _upload_model_to_browser(file):
+        path = _uploaded_file_to_path(file)
+        if not path:
+            return (
+                gr.update(),
+                gr.update(value=None),
+                {"error": "No file uploaded"},
+                "❌ Please upload a valid model file.",
+                None,
+                gr.update(visible=False),
+            )
+        return _load_external_model(path)
+
+    upload_model_file.change(
+        fn=_upload_model_to_browser,
+        inputs=[upload_model_file],
+        outputs=[
+            rigged_models_dropdown,
+            model_viewer,
+            metadata_display,
+            file_info_text,
+            selected_model_path,
+            download_model_btn,
+        ],
+        queue=False,
+        show_progress="minimal",
     )
     
     # Refresh model list
@@ -224,7 +428,7 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
     def clear_viewer():
         return (
             None,  # dropdown
-            None,  # viewer
+            gr.update(value=None),  # viewer
             None,  # metadata
             "Select a model to view details...",  # file_info
             None,  # selected_model_path
@@ -244,3 +448,8 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
         queue=False,
         show_progress="hidden"
     )
+
+    return {
+        "external_select_input": external_select_input,
+        "rigged_models_dropdown": rigged_models_dropdown,
+    }
