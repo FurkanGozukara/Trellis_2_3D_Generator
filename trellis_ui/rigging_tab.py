@@ -182,17 +182,16 @@ def rigging_tab(
     def _create_upload_workspace(upload_path: str):
         root = Path(rigging_outputs_dir)
         root.mkdir(parents=True, exist_ok=True)
-
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        work_dir = root / f"upload_{stamp}"
+        run = allocate_run_dir(root, digits=4)
+        work_dir = run.run_dir
         input_dir = work_dir / "inputs"
         logs_dir = work_dir / "logs"
-        generated_dir = work_dir / "generated"
         tmp_npz_dir = work_dir / "tmp_npz"
+        preview_dir = work_dir / "preview"
         input_dir.mkdir(parents=True, exist_ok=True)
         logs_dir.mkdir(parents=True, exist_ok=True)
-        generated_dir.mkdir(parents=True, exist_ok=True)
         tmp_npz_dir.mkdir(parents=True, exist_ok=True)
+        preview_dir.mkdir(parents=True, exist_ok=True)
 
         src = Path(upload_path)
         dst = input_dir / _safe_filename(src.name)
@@ -210,7 +209,7 @@ def rigging_tab(
             },
             "paths": {
                 "logs_dir": str(logs_dir),
-                "generated_dir": str(generated_dir),
+                "outputs_dir": str(work_dir),
                 "tmp_npz_dir": str(tmp_npz_dir),
                 "full_log_path": str(logs_dir / "run_full.log"),
             },

@@ -21,6 +21,9 @@ parts/
 sdist/
 var/
 wheels/
+a.png
+b.png
+tmp_test_alpha.glb
 SECourses_Musubi_Trainer
 UniRig
 glb_0001.glb

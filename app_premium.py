@@ -3,7 +3,7 @@ import gradio as gr
 import argparse
 import os
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import sys
 import subprocess
@@ -125,7 +125,9 @@ SUBPROCESS_STAGE_SCRIPT = os.path.join(APP_DIR, "subprocess_stage.py")
 # UniRig paths
 UNIRIG_DIR = os.path.join(APP_DIR, "UniRig")
 UNIRIG_RUN_PY = os.path.join(UNIRIG_DIR, "run.py")
-RIGGING_OUTPUTS_DIR = os.path.join(OUTPUTS_DIR, "rigged_models")
+LEGACY_RIGGING_OUTPUTS_DIR = os.path.join(OUTPUTS_DIR, "rigged_models")
+# Rigging runs now share the same numbered outputs root (outputs/0001, outputs/0002, ...).
+RIGGING_OUTPUTS_DIR = OUTPUTS_DIR
 
 
 # Ensure TRELLIS_MODELS_DIR is set (trellis2 code also falls back to ../models).
@@ -155,7 +157,15 @@ def _discover_allowed_paths_all_drives() -> List[str]:
             allowed.append(resolved)
 
     # Always include app-specific paths first.
-    for base in [APP_DIR, MODELS_DIR, OUTPUTS_DIR, RIGGING_OUTPUTS_DIR, TMP_DIR, PRESETS_DIR]:
+    for base in [
+        APP_DIR,
+        MODELS_DIR,
+        OUTPUTS_DIR,
+        RIGGING_OUTPUTS_DIR,
+        LEGACY_RIGGING_OUTPUTS_DIR,
+        TMP_DIR,
+        PRESETS_DIR,
+    ]:
         _add(base)
 
     if os.name == "nt":
@@ -930,16 +940,28 @@ def _list_rigged_models() -> List[str]:
     rigged_dir = Path(RIGGING_OUTPUTS_DIR)
     if not rigged_dir.exists():
         return []
-    
+
     supported_exts = {".fbx", ".glb", ".gltf", ".obj", ".ply", ".stl"}
+    rig_name_tokens = (
+        "_skeleton",
+        "_skinned",
+        "_rigged",
+        "_anim_preview",
+        "_animation_preview",
+        "_skeleton_preview",
+    )
     models = []
     for item in rigged_dir.rglob("*"):
-        if item.is_file() and item.suffix.lower() in supported_exts:
-            # Store relative paths from rigging outputs dir
-            rel_path = item.relative_to(rigged_dir)
-            models.append(str(rel_path))
-    
-    return sorted(models)
+        if not item.is_file() or item.suffix.lower() not in supported_exts:
+            continue
+        stem_l = item.stem.lower()
+        if not any(tok in stem_l for tok in rig_name_tokens):
+            continue
+        # Store relative paths from rigging outputs dir.
+        rel_path = item.relative_to(rigged_dir)
+        models.append(str(rel_path))
+
+    return sorted(set(models))
 
 
 def _safe_rig_filename(name: str) -> str:
@@ -951,8 +973,8 @@ def _safe_rig_filename(name: str) -> str:
 def _ensure_rig_workspace_dirs(work_dir: Path) -> None:
     (work_dir / "inputs").mkdir(parents=True, exist_ok=True)
     (work_dir / "logs").mkdir(parents=True, exist_ok=True)
-    (work_dir / "generated").mkdir(parents=True, exist_ok=True)
     (work_dir / "tmp_npz").mkdir(parents=True, exist_ok=True)
+    (work_dir / "preview").mkdir(parents=True, exist_ok=True)
 
 
 def _rig_metadata_path(work_dir: Path) -> Path:
@@ -975,7 +997,7 @@ def _load_rig_metadata(work_dir: Path) -> Dict[str, Any]:
         "input": {},
         "paths": {
             "logs_dir": str(work_dir / "logs"),
-            "generated_dir": str(work_dir / "generated"),
+            "outputs_dir": str(work_dir),
             "tmp_npz_dir": str(work_dir / "tmp_npz"),
             "full_log_path": str(work_dir / "logs" / "run_full.log"),
         },
@@ -999,7 +1021,7 @@ def _find_rig_work_dir(path: Path) -> Path:
     for candidate in [path.parent, *path.parents]:
         if (_rig_metadata_path(candidate)).exists():
             return candidate
-    if path.parent.name in {"generated", "inputs", "logs", "tmp_npz"}:
+    if path.parent.name in {"generated", "inputs", "logs", "tmp_npz", "preview"}:
         return path.parent.parent
     return path.parent
 
@@ -1009,8 +1031,8 @@ def _prepare_rig_input(input_mesh_path: str, upload_run_dir: Optional[str]) -> T
     if upload_run_dir:
         work_dir = Path(upload_run_dir)
     else:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        work_dir = Path(RIGGING_OUTPUTS_DIR) / f"upload_{timestamp}"
+        run = allocate_run_dir(OUTPUTS_DIR, digits=4)
+        work_dir = run.run_dir
     _ensure_rig_workspace_dirs(work_dir)
 
     dst = work_dir / "inputs" / _safe_rig_filename(input_src.name)
@@ -1057,6 +1079,54 @@ def _select_rig_preview_source(metadata: Dict[str, Any], fallback_path: Optional
     return None
 
 
+def _load_rig_metadata_for_path(path_value: str) -> Dict[str, Any]:
+    """Best-effort metadata lookup by walking parent directories."""
+    try:
+        path = Path(path_value).resolve()
+    except Exception:
+        return {}
+    for parent in [path.parent, *path.parents]:
+        meta_path = parent / "run_metadata.json"
+        if meta_path.exists():
+            try:
+                data = _read_json(str(meta_path))
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                return {}
+        if parent == Path(OUTPUTS_DIR):
+            break
+    return {}
+
+
+def _preferred_animation_preview_path(path_value: str) -> Optional[str]:
+    """Prefer a generated animated GLB preview next to or referenced by a rig output."""
+    try:
+        path = Path(path_value).resolve()
+    except Exception:
+        return None
+
+    # 1) Check metadata reference first.
+    metadata = _load_rig_metadata_for_path(str(path))
+    paths_meta = metadata.get("paths", {}) if isinstance(metadata, dict) else {}
+    preview_from_meta = paths_meta.get("animation_preview") or paths_meta.get("skeleton_preview")
+    normalized = _normalize_model3d_preview_path(preview_from_meta)
+    if normalized:
+        return normalized
+
+    # 2) Check common sibling naming.
+    sibling_candidates = [
+        path.with_name(f"{path.stem}_anim_preview.glb"),
+        path.with_name(f"{path.stem}_animation_preview.glb"),
+        path.with_name(f"{path.stem}_preview.glb"),
+    ]
+    for candidate in sibling_candidates:
+        normalized = _normalize_model3d_preview_path(str(candidate))
+        if normalized:
+            return normalized
+    return None
+
+
 def _run_unirig_skeleton(input_mesh_path: str, seed: int, upload_run_dir: Optional[str], req: gr.Request):
     """
     Generate skeleton for uploaded mesh using UniRig via subprocess.
@@ -1071,12 +1141,12 @@ def _run_unirig_skeleton(input_mesh_path: str, seed: int, upload_run_dir: Option
             return
 
         work_dir, input_path = _prepare_rig_input(input_mesh_path, upload_run_dir)
-        generated_dir = work_dir / "generated"
         logs_dir = work_dir / "logs"
 
-        skeleton_fbx = generated_dir / f"{input_path.stem}_skeleton.fbx"
+        skeleton_fbx = work_dir / f"{input_path.stem}_skeleton.fbx"
         npz_dir = work_dir / "tmp_npz"
         log_path = logs_dir / "skeleton_log.txt"
+        preview_log_path = logs_dir / "skeleton_preview_log.txt"
 
         metadata = _load_rig_metadata(work_dir)
         metadata.setdefault("stages", {})["skeleton"] = {
@@ -1117,6 +1187,40 @@ def _run_unirig_skeleton(input_mesh_path: str, seed: int, upload_run_dir: Option
 
         metadata = _load_rig_metadata(work_dir)
         if result and skeleton_fbx.exists():
+            skeleton_preview_glb: Optional[str] = None
+            skeleton_npz = npz_dir / skeleton_fbx.stem / "raw_data.npz"
+            preview_payload = {
+                "source_npz_path": str(skeleton_npz),
+                "source_fbx_path": str(skeleton_fbx),
+                "npz_dir": str(npz_dir),
+                "faces_target_count": 50000,
+                "mesh_alpha": 0.5,
+                "include_mesh": True,
+                "visibility_boost": True,
+                "output_glb_path": str(work_dir / f"{input_path.stem}_skeleton_preview.glb"),
+            }
+            try:
+                for event in _iter_subprocess_stage(
+                    "unirig_skeleton_preview",
+                    preview_payload,
+                    work_dir,
+                    preview_log_path,
+                    session=session,
+                ):
+                    if event["type"] == "log":
+                        _append_rig_full_log(work_dir, "skeleton_preview", event["text"])
+                        status = _append_status(status, event["text"])
+                        status = _trim_status(status)
+                        yield (None, None, status)
+                    elif event["type"] == "result":
+                        skeleton_preview_glb = event["result"].get("preview_glb_path")
+            except Exception as preview_err:
+                status = _append_status(
+                    status,
+                    f"[skeleton_preview] Warning: {type(preview_err).__name__}: {preview_err}",
+                )
+                status = _trim_status(status)
+                yield (None, None, status)
             metadata.setdefault("stages", {}).setdefault("skeleton", {}).update(
                 {
                     "status": "completed",
@@ -1125,12 +1229,14 @@ def _run_unirig_skeleton(input_mesh_path: str, seed: int, upload_run_dir: Option
                 }
             )
             metadata.setdefault("paths", {})["skeleton_output"] = str(skeleton_fbx)
+            if skeleton_preview_glb and os.path.exists(skeleton_preview_glb):
+                metadata.setdefault("paths", {})["skeleton_preview"] = str(Path(skeleton_preview_glb).resolve())
             _save_rig_metadata(work_dir, metadata)
-            preview_source = _select_rig_preview_source(metadata, str(input_path))
-            note = (
-                "\nNote: skeleton FBX can appear blank in Model3D because it often contains bones without surface mesh. "
-                "Preview is showing your uploaded mesh."
-            )
+            preview_source = _normalize_model3d_preview_path(skeleton_preview_glb)
+            note = "\nPreview: mesh + generated skeleton overlay."
+            if not preview_source:
+                preview_source = _select_rig_preview_source(metadata, str(input_path))
+                note = "\nPreview fallback: could not build skeleton overlay, showing uploaded mesh."
             final_status = _append_status(status, f"\n✅ Skeleton generated successfully!\nOutput: {skeleton_fbx}{note}")
             yield (str(skeleton_fbx), preview_source, final_status)
         else:
@@ -1176,8 +1282,9 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
         skeleton_path = Path(skeleton_fbx_path)
         work_dir = _find_rig_work_dir(skeleton_path)
         _ensure_rig_workspace_dirs(work_dir)
-        skinned_fbx = work_dir / "generated" / f"{skeleton_path.stem.replace('_skeleton', '')}_skinned.fbx"
+        skinned_fbx = work_dir / f"{skeleton_path.stem.replace('_skeleton', '')}_skinned.fbx"
         log_path = work_dir / "logs" / "skinning_log.txt"
+        animation_log_path = work_dir / "logs" / "animation_preview_log.txt"
         npz_dir = work_dir / "tmp_npz"
 
         metadata = _load_rig_metadata(work_dir)
@@ -1216,6 +1323,35 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
 
         metadata = _load_rig_metadata(work_dir)
         if result and skinned_fbx.exists():
+            animation_preview_glb: Optional[str] = None
+            animation_payload = {
+                "input_fbx_path": str(skinned_fbx),
+                "output_glb_path": str(work_dir / f"{skinned_fbx.stem}_anim_preview.glb"),
+                "frame_end": 90,
+            }
+            try:
+                for event in _iter_subprocess_stage(
+                    "unirig_animation_preview",
+                    animation_payload,
+                    work_dir,
+                    animation_log_path,
+                    session=session,
+                ):
+                    if event["type"] == "log":
+                        _append_rig_full_log(work_dir, "animation_preview", event["text"])
+                        status = _append_status(status, event["text"])
+                        status = _trim_status(status)
+                        yield (None, None, status)
+                    elif event["type"] == "result":
+                        animation_preview_glb = event["result"].get("animation_preview_glb_path")
+            except Exception as anim_err:
+                status = _append_status(
+                    status,
+                    f"[animation_preview] Warning: {type(anim_err).__name__}: {anim_err}",
+                )
+                status = _trim_status(status)
+                yield (None, None, status)
+
             metadata.setdefault("stages", {}).setdefault("skinning", {}).update(
                 {
                     "status": "completed",
@@ -1224,19 +1360,27 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
                 }
             )
             metadata.setdefault("paths", {})["skinning_output"] = str(skinned_fbx)
+            if animation_preview_glb and os.path.exists(animation_preview_glb):
+                metadata.setdefault("paths", {})["animation_preview"] = str(Path(animation_preview_glb).resolve())
             _save_rig_metadata(work_dir, metadata)
-            preview_source: Optional[str] = _normalize_model3d_preview_path(str(skinned_fbx))
-            note = ""
-            if skinned_fbx.suffix.lower() == ".fbx":
+            preview_source: Optional[str] = _normalize_model3d_preview_path(
+                metadata.get("paths", {}).get("skeleton_preview")
+            )
+            note = "\nPreview: mesh + generated skeleton overlay."
+            if not preview_source:
+                preview_source = _normalize_model3d_preview_path(animation_preview_glb)
+            if not preview_source and skinned_fbx.suffix.lower() == ".fbx":
                 preview_source = _select_rig_preview_source(metadata, None)
                 if preview_source:
                     note = (
-                        "\nNote: skinned FBX preview may be blank in Gradio Model3D. "
-                        "Showing uploaded mesh as preview fallback."
+                        "\nPreview fallback: skinned FBX is not directly previewable in Model3D; "
+                        "showing uploaded mesh."
                     )
                 else:
                     preview_source = None
                     note = "\nNote: FBX preview is not supported by Gradio Model3D in this view."
+            if animation_preview_glb and os.path.exists(animation_preview_glb):
+                note += f"\nAnimation preview ready: {Path(animation_preview_glb).name}"
             final_status = _append_status(status, f"\n✅ Skinning completed!\nOutput: {skinned_fbx}{note}")
             yield (str(skinned_fbx), preview_source, final_status)
         else:
@@ -1289,7 +1433,7 @@ def _run_unirig_merge(source_fbx_path: str, target_mesh_path: str, export_format
         _ensure_rig_workspace_dirs(work_dir)
 
         ext = ".fbx" if export_format == "fbx" else ".glb"
-        final_output = work_dir / "generated" / f"{target_path.stem}_rigged{ext}"
+        final_output = work_dir / f"{target_path.stem}_rigged{ext}"
         log_path = work_dir / "logs" / "merge_log.txt"
 
         metadata = _load_rig_metadata(work_dir)
@@ -1337,10 +1481,13 @@ def _run_unirig_merge(source_fbx_path: str, target_mesh_path: str, export_format
             )
             metadata.setdefault("paths", {})["final_output"] = str(final_output)
             _save_rig_metadata(work_dir, metadata)
-            preview_source: Optional[str] = _normalize_model3d_preview_path(str(final_output))
+            preview_source: Optional[str] = _preferred_animation_preview_path(str(final_output))
+            if not preview_source:
+                preview_source = _normalize_model3d_preview_path(str(final_output))
             note = ""
             if final_output.suffix.lower() == ".fbx":
-                preview_source = _select_rig_preview_source(metadata, None)
+                if not preview_source:
+                    preview_source = _select_rig_preview_source(metadata, None)
                 if preview_source:
                     note = (
                         "\nNote: FBX preview may be blank in Gradio Model3D. "
@@ -1400,10 +1547,10 @@ def _send_rig_output_to_animation(
         status = _append_status(current_status or "", f"❌ Output file not found: {candidate}")
         return "", _trim_status(status), gr.update()
 
-    # Prefer a preview-friendly sibling when available (GLB/GTLF) while keeping FBX saved for DCC.
+    # Prefer an explicit animation preview first, then other preview-friendly siblings.
     candidate_path = Path(candidate)
-    viewer_candidate = candidate
-    if candidate_path.suffix.lower() == ".fbx":
+    viewer_candidate = _preferred_animation_preview_path(str(candidate_path)) or candidate
+    if viewer_candidate == candidate and candidate_path.suffix.lower() == ".fbx":
         same_stem_glb = candidate_path.with_suffix(".glb")
         same_stem_gltf = candidate_path.with_suffix(".gltf")
         if same_stem_glb.exists():
@@ -4670,7 +4817,7 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
                 run_skeleton_fn=_run_unirig_skeleton,
                 run_skinning_fn=_run_unirig_skinning,
                 run_merge_fn=_run_unirig_merge,
-                rigging_outputs_dir=RIGGING_OUTPUTS_DIR,
+                rigging_outputs_dir=OUTPUTS_DIR,
                 open_folder_fn=_open_folder,
             )
 
@@ -4678,7 +4825,7 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         with gr.Tab("🎬 Animation Player", id="animation_tab"):
             animation_ui = animation_player_tab(
                 list_models_fn=_list_rigged_models,
-                rigging_outputs_dir=RIGGING_OUTPUTS_DIR,
+                rigging_outputs_dir=OUTPUTS_DIR,
                 open_folder_fn=_open_folder,
             )
 

@@ -7,7 +7,7 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Windows can default to a non-UTF8 stdout encoding (e.g. cp1252), which can crash
 # on printing certain unicode characters. Force UTF-8 so subprocess stages never
@@ -22,7 +22,7 @@ except Exception:
 
 # Keep env consistent with the Gradio app.
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 # UniRig checkpoints are trusted local files but may include custom objects.
 # PyTorch 2.6+ defaults torch.load(weights_only=True), which can fail on these ckpts.
 os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
@@ -1647,6 +1647,372 @@ def stage_unirig_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def stage_unirig_skeleton_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a preview-friendly GLB that includes both mesh + visible skeleton overlay.
+
+    Payload:
+        source_npz_path: Path to UniRig raw_data.npz containing vertices/faces/joints/parents
+        source_fbx_path: Optional skeleton FBX path used to regenerate NPZ when missing/invalid
+        npz_dir: Optional NPZ root dir used with source_fbx_path
+        faces_target_count: Optional extraction simplification target when regenerating NPZ
+        output_glb_path: Output GLB path
+        bone_radius: Optional explicit bone radius
+        mesh_alpha: Mesh opacity for preview body in [0,1] (default: 0.5)
+        include_mesh: Whether to include the mesh in preview (default: True)
+        visibility_boost: Add an outward duplicate skeleton for visibility (default: True)
+    """
+    import numpy as np
+    import trimesh
+
+    source_npz = Path(payload.get("source_npz_path", ""))
+    source_fbx_path = payload.get("source_fbx_path")
+    npz_dir_path = payload.get("npz_dir")
+    faces_target_count = int(payload.get("faces_target_count", 50000))
+    output_glb = Path(payload["output_glb_path"])
+    explicit_radius = payload.get("bone_radius")
+    mesh_alpha = float(payload.get("mesh_alpha", 0.5))
+    mesh_alpha = max(0.05, min(0.95, mesh_alpha))
+    include_mesh = bool(payload.get("include_mesh", True))
+    visibility_boost = bool(payload.get("visibility_boost", True))
+
+    def _load_preview_arrays(npz_path: Path) -> Optional[Tuple["np.ndarray", "np.ndarray", "np.ndarray", "np.ndarray"]]:
+        if not npz_path.exists():
+            return None
+        try:
+            data = np.load(str(npz_path), allow_pickle=True)
+            vertices_local = np.asarray(data["vertices"], dtype=np.float32)
+            faces_local = np.asarray(data["faces"], dtype=np.int64)
+            joints_blob = data["joints"]
+            joints_raw = joints_blob[()] if getattr(joints_blob, "dtype", None) == object and joints_blob.shape == () else joints_blob
+            if joints_raw is None:
+                return None
+            joints_local = np.asarray(joints_raw, dtype=np.float32)
+            parents_blob = data["parents"]
+            parents_raw = parents_blob[()] if getattr(parents_blob, "dtype", None) == object and parents_blob.shape == () else parents_blob
+            if parents_raw is None:
+                return None
+            parents_local = np.asarray(parents_raw, dtype=object).reshape(-1)
+        except Exception:
+            return None
+
+        if vertices_local.ndim != 2 or vertices_local.shape[1] != 3:
+            return None
+        if faces_local.ndim != 2 or faces_local.shape[1] != 3:
+            return None
+        if joints_local.ndim != 2 or joints_local.shape[1] != 3:
+            return None
+        if len(joints_local) == 0 or len(parents_local) == 0:
+            return None
+        return vertices_local, faces_local, joints_local, parents_local
+
+    loaded = _load_preview_arrays(source_npz)
+
+    # Fresh skeleton runs don't always have the skeleton NPZ yet.
+    # Regenerate it from the produced skeleton FBX on demand.
+    if loaded is None and source_fbx_path and npz_dir_path:
+        source_fbx = Path(source_fbx_path)
+        npz_dir = Path(npz_dir_path)
+        if source_fbx.exists():
+            print(
+                f"[unirig_skeleton_preview] Source NPZ missing/invalid, regenerating from skeleton FBX: {source_fbx}",
+                flush=True,
+            )
+            unirig_dir = APP_DIR / "UniRig"
+            unirig_python = _resolve_unirig_python(payload)
+            _ensure_unirig_runtime_ready(
+                python_exe=unirig_python,
+                import_to_package=_UNIRIG_PREDICT_IMPORT_TO_PACKAGE,
+                stage_label="unirig_skeleton_preview_extract",
+            )
+            npz_dir.mkdir(parents=True, exist_ok=True)
+            extract_stamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+            extract_cmd = [
+                unirig_python,
+                "-m",
+                "src.data.extract",
+                "--config=configs/data/quick_inference.yaml",
+                "--require_suffix=obj,fbx,FBX,dae,glb,gltf,vrm",
+                "--force_override=true",
+                "--num_runs=1",
+                "--id=0",
+                f"--time={extract_stamp}",
+                f"--faces_target_count={faces_target_count}",
+                f"--input={source_fbx}",
+                f"--output_dir={npz_dir}",
+            ]
+            _run_logged_subprocess(extract_cmd, cwd=unirig_dir, label="unirig_extract_preview")
+
+            candidates: List[Path] = [npz_dir / source_fbx.stem / "raw_data.npz"]
+            try:
+                dynamic = sorted(
+                    npz_dir.rglob("raw_data.npz"),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                candidates.extend(dynamic)
+            except Exception:
+                pass
+
+            seen: Set[str] = set()
+            for candidate in candidates:
+                key = str(candidate.resolve()) if candidate.exists() else str(candidate)
+                if key in seen:
+                    continue
+                seen.add(key)
+                probe = _load_preview_arrays(candidate)
+                if probe is not None:
+                    source_npz = candidate
+                    loaded = probe
+                    break
+
+    if loaded is None:
+        raise FileNotFoundError(
+            f"Skeleton preview source npz not found or invalid: {source_npz}. "
+            "Tried regenerating from skeleton FBX when available."
+        )
+
+    vertices, faces, joints, parents = loaded
+
+    print(f"[unirig_skeleton_preview] Source NPZ: {source_npz}", flush=True)
+    print(f"[unirig_skeleton_preview] Output GLB: {output_glb}", flush=True)
+
+    if vertices.ndim != 2 or vertices.shape[1] != 3:
+        raise ValueError("Invalid vertices in source npz.")
+    if faces.ndim != 2 or faces.shape[1] != 3:
+        raise ValueError("Invalid faces in source npz.")
+    if joints.ndim != 2 or joints.shape[1] != 3:
+        raise ValueError("Invalid joints in source npz.")
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    # Use explicit PBR alpha blending so the body is truly translucent in GLB viewers.
+    mesh_mat = trimesh.visual.material.PBRMaterial(
+        baseColorFactor=[0.58, 0.62, 0.72, mesh_alpha],
+        metallicFactor=0.0,
+        roughnessFactor=0.92,
+        alphaMode="BLEND",
+        doubleSided=True,
+    )
+    mesh_uv = np.zeros((len(mesh.vertices), 2), dtype=np.float32)
+    mesh.visual = trimesh.visual.texture.TextureVisuals(uv=mesh_uv, material=mesh_mat)
+
+    if explicit_radius is None:
+        bounds_min = vertices.min(axis=0)
+        bounds_max = vertices.max(axis=0)
+        diag = float(np.linalg.norm(bounds_max - bounds_min))
+        # Boost default radius so skeleton stays visible on dense characters.
+        bone_radius = max(0.008, min(0.08, diag * 0.012))
+    else:
+        bone_radius = float(explicit_radius)
+
+    center = vertices.mean(axis=0)
+
+    def _outward_shift(point: "np.ndarray", strength: float) -> "np.ndarray":
+        vec = point - center
+        norm = float(np.linalg.norm(vec))
+        if norm < 1e-8:
+            return np.zeros(3, dtype=np.float32)
+        return (vec / norm) * float(strength)
+
+    scene_meshes = [mesh] if include_mesh else []
+    bone_count = 0
+
+    for idx, parent in enumerate(parents):
+        if parent is None:
+            continue
+        try:
+            parent_idx = int(parent)
+        except Exception:
+            continue
+        if parent_idx < 0 or parent_idx >= len(joints):
+            continue
+
+        start = joints[parent_idx]
+        end = joints[idx]
+        vec = end - start
+        length = float(np.linalg.norm(vec))
+        if length < 1e-6:
+            continue
+
+        cyl = trimesh.creation.cylinder(radius=bone_radius, height=length, sections=14)
+        transform = trimesh.geometry.align_vectors([0.0, 0.0, 1.0], vec / length)
+        if transform is None:
+            transform = np.eye(4, dtype=np.float32)
+        transform[:3, 3] = (start + end) * 0.5
+        cyl.apply_transform(transform)
+        cyl.visual.face_colors = [255, 52, 38, 255]
+        scene_meshes.append(cyl)
+
+        if visibility_boost:
+            mid = (start + end) * 0.5
+            shift = _outward_shift(mid, bone_radius * 2.75)
+            start_b = start + shift
+            end_b = end + shift
+            vec_b = end_b - start_b
+            len_b = float(np.linalg.norm(vec_b))
+            if len_b > 1e-6:
+                cyl_b = trimesh.creation.cylinder(radius=bone_radius * 0.9, height=len_b, sections=12)
+                transform_b = trimesh.geometry.align_vectors([0.0, 0.0, 1.0], vec_b / len_b)
+                if transform_b is None:
+                    transform_b = np.eye(4, dtype=np.float32)
+                transform_b[:3, 3] = (start_b + end_b) * 0.5
+                cyl_b.apply_transform(transform_b)
+                cyl_b.visual.face_colors = [0, 255, 255, 255]
+                scene_meshes.append(cyl_b)
+        bone_count += 1
+
+    joint_radius = bone_radius * 1.6
+    for joint in joints:
+        sphere = trimesh.creation.icosphere(subdivisions=1, radius=joint_radius)
+        sphere.apply_translation(joint)
+        sphere.visual.face_colors = [255, 210, 28, 255]
+        scene_meshes.append(sphere)
+
+        if visibility_boost:
+            shift = _outward_shift(joint, bone_radius * 2.9)
+            sphere_b = trimesh.creation.icosphere(subdivisions=1, radius=joint_radius * 0.95)
+            sphere_b.apply_translation(joint + shift)
+            sphere_b.visual.face_colors = [255, 0, 255, 255]
+            scene_meshes.append(sphere_b)
+
+    output_glb.parent.mkdir(parents=True, exist_ok=True)
+    scene = trimesh.Scene(scene_meshes)
+    scene.export(str(output_glb))
+
+    if not output_glb.exists():
+        raise RuntimeError(f"Skeleton preview export failed: {output_glb}")
+
+    print(
+        f"[unirig_skeleton_preview] Success! Bones: {bone_count}, Joints: {len(joints)}, Output: {output_glb}",
+        flush=True,
+    )
+    return {
+        "preview_glb_path": str(output_glb),
+        "bone_count": int(bone_count),
+        "joint_count": int(len(joints)),
+    }
+
+
+def stage_unirig_animation_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a simple procedural animation preview GLB from a rigged/skinned FBX.
+
+    Payload:
+        input_fbx_path: Path to skinned FBX
+        output_glb_path: Output animated GLB path
+        frame_end: End frame for looping animation (default: 90)
+    """
+    import hashlib
+
+    blender_user_root = APP_DIR / "tmp" / "blender_user"
+    blender_user_config = blender_user_root / "config"
+    blender_user_scripts = blender_user_root / "scripts"
+    blender_user_data = blender_user_root / "datafiles"
+    blender_user_config.mkdir(parents=True, exist_ok=True)
+    blender_user_scripts.mkdir(parents=True, exist_ok=True)
+    blender_user_data.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("BLENDER_USER_CONFIG", str(blender_user_config))
+    os.environ.setdefault("BLENDER_USER_SCRIPTS", str(blender_user_scripts))
+    os.environ.setdefault("BLENDER_USER_DATAFILES", str(blender_user_data))
+
+    import bpy
+
+    input_fbx = Path(payload["input_fbx_path"])
+    output_glb = Path(payload["output_glb_path"])
+    frame_end = int(payload.get("frame_end", 90))
+    frame_end = max(frame_end, 30)
+
+    if not input_fbx.exists():
+        raise FileNotFoundError(f"Animation preview source FBX not found: {input_fbx}")
+
+    print(f"[unirig_animation_preview] Input FBX: {input_fbx}", flush=True)
+    print(f"[unirig_animation_preview] Output GLB: {output_glb}", flush=True)
+
+    # Reset to an empty scene for deterministic exports.
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+
+    ret = bpy.ops.import_scene.fbx(filepath=str(input_fbx))
+    if "FINISHED" not in ret:
+        raise RuntimeError(f"FBX import failed for animation preview: {input_fbx}")
+
+    scene = bpy.context.scene
+    scene.frame_start = 1
+    scene.frame_end = frame_end
+
+    armatures = [obj for obj in scene.objects if obj.type == "ARMATURE"]
+    if not armatures:
+        raise RuntimeError("No armature found in imported FBX; cannot build animation preview.")
+
+    key_a = max(2, frame_end // 3)
+    key_b = max(key_a + 1, (2 * frame_end) // 3)
+    animated_bones = 0
+
+    for armature in armatures:
+        bpy.context.view_layer.objects.active = armature
+        try:
+            bpy.ops.object.mode_set(mode="POSE")
+        except Exception:
+            pass
+
+        for pose_bone in armature.pose.bones:
+            if pose_bone.parent is None:
+                continue
+            pose_bone.rotation_mode = "XYZ"
+            seed = hashlib.sha1(pose_bone.name.encode("utf-8")).digest()
+            amp = 0.08 + (seed[0] / 255.0) * 0.18
+            axis = seed[1] % 3
+            sign = 1.0 if (seed[2] % 2) == 0 else -1.0
+
+            vals_pos = [0.0, 0.0, 0.0]
+            vals_neg = [0.0, 0.0, 0.0]
+            vals_pos[axis] = sign * amp
+            vals_neg[axis] = -sign * amp
+
+            pose_bone.rotation_euler = (0.0, 0.0, 0.0)
+            pose_bone.keyframe_insert(data_path="rotation_euler", frame=1)
+            pose_bone.rotation_euler = vals_pos
+            pose_bone.keyframe_insert(data_path="rotation_euler", frame=key_a)
+            pose_bone.rotation_euler = (0.0, 0.0, 0.0)
+            pose_bone.keyframe_insert(data_path="rotation_euler", frame=key_b)
+            pose_bone.rotation_euler = vals_neg
+            pose_bone.keyframe_insert(data_path="rotation_euler", frame=frame_end)
+            animated_bones += 1
+
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception:
+            pass
+
+    if animated_bones == 0:
+        raise RuntimeError("No animatable bones were found for preview animation.")
+
+    output_glb.parent.mkdir(parents=True, exist_ok=True)
+    ret = bpy.ops.export_scene.gltf(
+        filepath=str(output_glb),
+        export_format="GLB",
+        use_selection=False,
+        export_animations=True,
+        export_force_sampling=True,
+        export_frame_range=True,
+    )
+    if "FINISHED" not in ret:
+        raise RuntimeError(f"GLB export failed for animation preview: {output_glb}")
+
+    if not output_glb.exists():
+        raise RuntimeError(f"Animation preview export failed: {output_glb}")
+
+    print(
+        f"[unirig_animation_preview] Success! Armatures: {len(armatures)}, Animated bones: {animated_bones}, Output: {output_glb}",
+        flush=True,
+    )
+    return {
+        "animation_preview_glb_path": str(output_glb),
+        "armature_count": int(len(armatures)),
+        "animated_bones": int(animated_bones),
+        "frame_end": int(frame_end),
+    }
+
+
 # ================================ Main ================================
 
 
@@ -1659,7 +2025,13 @@ def main() -> int:
 
     try:
         stage = args.stage.strip()
-        if stage not in {"unirig_skeleton", "unirig_skinning", "unirig_merge"}:
+        if stage not in {
+            "unirig_skeleton",
+            "unirig_skinning",
+            "unirig_merge",
+            "unirig_skeleton_preview",
+            "unirig_animation_preview",
+        }:
             _ensure_o_voxel_available()
 
         payload_path = Path(args.payload)
@@ -1696,6 +2068,10 @@ def main() -> int:
             result = stage_unirig_skinning(payload)
         elif stage == "unirig_merge":
             result = stage_unirig_merge(payload)
+        elif stage == "unirig_skeleton_preview":
+            result = stage_unirig_skeleton_preview(payload)
+        elif stage == "unirig_animation_preview":
+            result = stage_unirig_animation_preview(payload)
         else:
             raise ValueError(f"Unknown stage: {stage}")
 

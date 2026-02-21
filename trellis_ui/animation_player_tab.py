@@ -9,6 +9,8 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
+from subprocess_utils import allocate_run_dir
+
 
 def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
     """
@@ -96,13 +98,13 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
             - Zoom: Scroll wheel
             - Pan: Shift + Click and drag
             
-            **Limitations:**
-            - Gradio's Model3D component does **not** support animation playback
-            - Download the model to view animations in:
+            **Animation Notes:**
+            - Embedded GLB animations auto-play in this viewer when present
+            - FBX files are previewed via generated GLB fallback when available
+            - For full rig editing, still use external DCC tools:
               - **Blender** (recommended - free, full rigging support)
-              - **Unity** (for game development)
-              - **Unreal Engine** (for real-time applications)
-              - **Maya/3ds Max** (professional 3D software)
+              - **Unity** / **Unreal Engine**
+              - **Maya/3ds Max**
             
             **Supported Formats:**
             - `.fbx` - Best for most 3D software (preserves skeleton hierarchy)
@@ -132,12 +134,11 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
         if not src.exists():
             raise FileNotFoundError(f"File not found: {src_path}")
 
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        work_dir = Path(rigging_outputs_dir) / f"animation_upload_{stamp}"
-        generated_dir = work_dir / "generated"
-        generated_dir.mkdir(parents=True, exist_ok=True)
+        run = allocate_run_dir(Path(rigging_outputs_dir), digits=4)
+        work_dir = run.run_dir
+        work_dir.mkdir(parents=True, exist_ok=True)
 
-        dst = generated_dir / _safe_filename(src.name)
+        dst = work_dir / _safe_filename(src.name)
         shutil.copy2(src, dst)
         return str(dst.relative_to(Path(rigging_outputs_dir)))
 
@@ -224,45 +225,61 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
                 "size_mb": round(file_size_mb, 2),
             }
 
-            # Decide what to show in Model3D. FBX commonly appears blank in Gradio.
+            # Decide what to show in Model3D. Prefer animation previews for FBX.
             previewable_exts = {".glb", ".gltf", ".obj", ".ply", ".stl"}
             viewer_path = str(full_path) if file_ext in previewable_exts else None
             viewer_note = ""
 
-            if viewer_path is None:
-                # Prefer sibling GLB/GLTF if available (same model, preview-friendly format).
-                same_stem_glb = full_path.with_suffix(".glb")
-                same_stem_gltf = full_path.with_suffix(".gltf")
-                if same_stem_glb.exists():
-                    viewer_path = str(same_stem_glb)
-                    viewer_note = f"Viewer fallback: sibling {same_stem_glb.name}"
-                elif same_stem_gltf.exists():
-                    viewer_path = str(same_stem_gltf)
-                    viewer_note = f"Viewer fallback: sibling {same_stem_gltf.name}"
+            metadata_path = None
+            run_meta = {}
+            for parent in [full_path.parent, *full_path.parents]:
+                cand = parent / "run_metadata.json"
+                if cand.exists():
+                    metadata_path = cand
+                    break
+
+            if metadata_path is not None:
+                try:
+                    data = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        run_meta = data
+                except Exception:
+                    run_meta = {}
 
             if viewer_path is None:
-                metadata_path = None
-                for parent in [full_path.parent, *full_path.parents]:
-                    cand = parent / "run_metadata.json"
+                paths_meta = run_meta.get("paths", {}) if isinstance(run_meta, dict) else {}
+                if "_skeleton" in full_path.stem.lower():
+                    preferred_preview = paths_meta.get("skeleton_preview") or paths_meta.get("animation_preview")
+                else:
+                    preferred_preview = paths_meta.get("animation_preview") or paths_meta.get("skeleton_preview")
+                if preferred_preview and os.path.exists(preferred_preview):
+                    viewer_path = str(Path(preferred_preview))
+                    viewer_note = f"Viewer: metadata preview ({Path(preferred_preview).name})"
+
+            if viewer_path is None:
+                sibling_candidates = [
+                    full_path.with_name(f"{full_path.stem}_anim_preview.glb"),
+                    full_path.with_name(f"{full_path.stem}_animation_preview.glb"),
+                    full_path.with_suffix(".glb"),
+                    full_path.with_suffix(".gltf"),
+                ]
+                for cand in sibling_candidates:
                     if cand.exists():
-                        metadata_path = cand
+                        viewer_path = str(cand)
+                        viewer_note = f"Viewer fallback: sibling {cand.name}"
                         break
 
-                if metadata_path is not None:
-                    try:
-                        run_meta = json.loads(metadata_path.read_text(encoding="utf-8"))
-                        input_meta = run_meta.get("input", {})
-                        fallback = input_meta.get("preview_path") or input_meta.get("copied_input_path")
-                        if fallback and os.path.exists(fallback):
-                            fallback_ext = Path(fallback).suffix.lower()
-                            if fallback_ext in previewable_exts:
-                                viewer_path = str(Path(fallback))
-                                viewer_note = f"Viewer fallback: source mesh ({Path(fallback).name})"
-                    except Exception:
-                        pass
+            if viewer_path is None:
+                input_meta = run_meta.get("input", {}) if isinstance(run_meta, dict) else {}
+                fallback = input_meta.get("preview_path") or input_meta.get("copied_input_path")
+                if fallback and os.path.exists(fallback):
+                    fallback_ext = Path(fallback).suffix.lower()
+                    if fallback_ext in previewable_exts:
+                        viewer_path = str(Path(fallback))
+                        viewer_note = f"Viewer fallback: source mesh ({Path(fallback).name})"
 
             if viewer_path is None and file_ext == ".fbx":
-                viewer_note = "FBX preview is not supported by Gradio Model3D in this view."
+                viewer_note = "FBX preview is not supported by Model3D unless a GLB fallback exists."
 
             normalized_viewer = _normalize_model3d_path(viewer_path)
             if viewer_path and not normalized_viewer:
