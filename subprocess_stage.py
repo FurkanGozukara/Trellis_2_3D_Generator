@@ -1627,6 +1627,7 @@ def stage_unirig_merge(payload: Dict[str, Any]) -> Dict[str, Any]:
     cmd = [
         unirig_python,
         "-m", "src.inference.merge",
+        "--require_suffix=obj,fbx,FBX,dae,glb,gltf,vrm",
         f"--source={source}",
         f"--target={target}",
         f"--output={output}",
@@ -1895,12 +1896,15 @@ def stage_unirig_skeleton_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def stage_unirig_animation_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Build a simple procedural animation preview GLB from a rigged/skinned FBX.
+    Build a procedural animation preview GLB from a rigged model.
 
     Payload:
-        input_fbx_path: Path to skinned FBX
+        input_model_path: Path to rigged model (.fbx/.glb/.gltf)
+        input_fbx_path: Backward-compatible alias for FBX source
         output_glb_path: Output animated GLB path
         frame_end: End frame for looping animation (default: 90)
+        animation_style: walk|dance|idle (default: walk)
+        animation_strength: multiplier for animation intensity (default: 1.0)
     """
     import hashlib
 
@@ -1917,23 +1921,42 @@ def stage_unirig_animation_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     import bpy
 
-    input_fbx = Path(payload["input_fbx_path"])
+    input_model_value = payload.get("input_model_path") or payload.get("input_fbx_path")
+    if not input_model_value:
+        raise ValueError("Animation preview requires 'input_model_path' (or legacy 'input_fbx_path').")
+
+    input_model = Path(input_model_value)
     output_glb = Path(payload["output_glb_path"])
     frame_end = int(payload.get("frame_end", 90))
     frame_end = max(frame_end, 30)
+    style = str(payload.get("animation_style", "walk")).strip().lower()
+    if style not in {"walk", "dance", "idle"}:
+        style = "walk"
+    strength = float(payload.get("animation_strength", 1.0))
+    strength = max(0.2, min(2.5, strength))
 
-    if not input_fbx.exists():
-        raise FileNotFoundError(f"Animation preview source FBX not found: {input_fbx}")
+    if not input_model.exists():
+        raise FileNotFoundError(f"Animation preview source model not found: {input_model}")
 
-    print(f"[unirig_animation_preview] Input FBX: {input_fbx}", flush=True)
+    print(f"[unirig_animation_preview] Input model: {input_model}", flush=True)
     print(f"[unirig_animation_preview] Output GLB: {output_glb}", flush=True)
+    print(f"[unirig_animation_preview] Style: {style}", flush=True)
+    print(f"[unirig_animation_preview] Strength: {strength}", flush=True)
 
     # Reset to an empty scene for deterministic exports.
     bpy.ops.wm.read_factory_settings(use_empty=True)
 
-    ret = bpy.ops.import_scene.fbx(filepath=str(input_fbx))
-    if "FINISHED" not in ret:
-        raise RuntimeError(f"FBX import failed for animation preview: {input_fbx}")
+    suffix = input_model.suffix.lower()
+    if suffix == ".fbx":
+        ret = bpy.ops.import_scene.fbx(filepath=str(input_model))
+        if "FINISHED" not in ret:
+            raise RuntimeError(f"FBX import failed for animation preview: {input_model}")
+    elif suffix in {".glb", ".gltf"}:
+        ret = bpy.ops.import_scene.gltf(filepath=str(input_model))
+        if "FINISHED" not in ret:
+            raise RuntimeError(f"GLTF import failed for animation preview: {input_model}")
+    else:
+        raise ValueError(f"Unsupported animation preview input format: {suffix}")
 
     scene = bpy.context.scene
     scene.frame_start = 1
@@ -1941,7 +1964,41 @@ def stage_unirig_animation_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     armatures = [obj for obj in scene.objects if obj.type == "ARMATURE"]
     if not armatures:
-        raise RuntimeError("No armature found in imported FBX; cannot build animation preview.")
+        raise RuntimeError("No armature found in imported model; cannot build animation preview.")
+
+    def _name_has(name: str, *tokens: str) -> bool:
+        return any(tok in name for tok in tokens)
+
+    def _bone_side(name: str) -> int:
+        left_hits = (
+            ".l",
+            "_l",
+            "left",
+            " l_",
+            "l_",
+            "hand_l",
+            "foot_l",
+            "arm_l",
+            "leg_l",
+            "thigh_l",
+        )
+        right_hits = (
+            ".r",
+            "_r",
+            "right",
+            " r_",
+            "r_",
+            "hand_r",
+            "foot_r",
+            "arm_r",
+            "leg_r",
+            "thigh_r",
+        )
+        if _name_has(name, *left_hits):
+            return -1
+        if _name_has(name, *right_hits):
+            return 1
+        return 0
 
     key_a = max(2, frame_end // 3)
     key_b = max(key_a + 1, (2 * frame_end) // 3)
@@ -1957,26 +2014,112 @@ def stage_unirig_animation_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
         for pose_bone in armature.pose.bones:
             if pose_bone.parent is None:
                 continue
+
+            lname = pose_bone.name.lower()
+            side = _bone_side(lname)
+            is_leg = _name_has(lname, "thigh", "upleg", "leg", "shin", "calf", "knee", "foot", "toe")
+            is_arm = _name_has(lname, "shoulder", "arm", "forearm", "elbow", "wrist", "hand")
+            is_spine = _name_has(lname, "spine", "chest", "torso", "hip", "pelvis")
+            is_head = _name_has(lname, "neck", "head")
+
             pose_bone.rotation_mode = "XYZ"
             seed = hashlib.sha1(pose_bone.name.encode("utf-8")).digest()
-            amp = 0.08 + (seed[0] / 255.0) * 0.18
-            axis = seed[1] % 3
-            sign = 1.0 if (seed[2] % 2) == 0 else -1.0
+            fallback_sign = 1.0 if (seed[2] % 2) == 0 else -1.0
+            vals_a = [0.0, 0.0, 0.0]
+            vals_b = [0.0, 0.0, 0.0]
+            vals_c = [0.0, 0.0, 0.0]
 
-            vals_pos = [0.0, 0.0, 0.0]
-            vals_neg = [0.0, 0.0, 0.0]
-            vals_pos[axis] = sign * amp
-            vals_neg[axis] = -sign * amp
+            if style == "idle":
+                if is_spine or is_head:
+                    amp = 0.04
+                    vals_a[0] = amp
+                    vals_b[0] = -amp
+                    vals_c[0] = amp * 0.5
+                elif is_arm:
+                    amp = 0.05
+                    sign = float(side) if side != 0 else fallback_sign
+                    vals_a[2] = sign * amp
+                    vals_b[2] = -sign * amp
+                elif is_leg:
+                    amp = 0.025
+                    sign = float(side) if side != 0 else fallback_sign
+                    vals_a[0] = sign * amp
+                    vals_b[0] = -sign * amp
+                else:
+                    amp = 0.02 + (seed[0] / 255.0) * 0.04
+                    axis = seed[1] % 3
+                    vals_a[axis] = fallback_sign * amp
+                    vals_b[axis] = -fallback_sign * amp
+            else:
+                dance_boost = 1.35 if style == "dance" else 1.0
+                if is_leg:
+                    amp = 0.34 * dance_boost
+                    sign = float(side) if side != 0 else fallback_sign
+                    if _name_has(lname, "foot", "toe"):
+                        amp *= 0.55
+                    vals_a[0] = sign * amp
+                    vals_b[0] = -sign * amp * 0.7
+                    vals_c[0] = sign * amp * 0.35
+                elif is_arm:
+                    amp = 0.30 * dance_boost
+                    sign = -float(side) if side != 0 else fallback_sign
+                    vals_a[0] = sign * amp
+                    vals_b[0] = -sign * amp * 0.75
+                    vals_c[0] = sign * amp * 0.4
+                    if style == "dance":
+                        twist = 0.16 * sign
+                        vals_a[2] += twist
+                        vals_b[2] -= twist
+                elif is_spine:
+                    amp = 0.08 * dance_boost
+                    vals_a[2] = amp
+                    vals_b[2] = -amp
+                    vals_c[2] = amp * 0.5
+                    vals_a[0] = 0.025 * dance_boost
+                    vals_b[0] = -0.025 * dance_boost
+                elif is_head:
+                    amp = 0.05 * dance_boost
+                    vals_a[1] = amp
+                    vals_b[1] = -amp
+                else:
+                    amp = 0.05 + (seed[0] / 255.0) * 0.10
+                    axis = seed[1] % 3
+                    vals_a[axis] = fallback_sign * amp
+                    vals_b[axis] = -fallback_sign * amp
+
+            if strength != 1.0:
+                vals_a = [v * strength for v in vals_a]
+                vals_b = [v * strength for v in vals_b]
+                vals_c = [v * strength for v in vals_c]
 
             pose_bone.rotation_euler = (0.0, 0.0, 0.0)
             pose_bone.keyframe_insert(data_path="rotation_euler", frame=1)
-            pose_bone.rotation_euler = vals_pos
+            pose_bone.rotation_euler = tuple(vals_a)
             pose_bone.keyframe_insert(data_path="rotation_euler", frame=key_a)
-            pose_bone.rotation_euler = (0.0, 0.0, 0.0)
+            pose_bone.rotation_euler = tuple(vals_b)
             pose_bone.keyframe_insert(data_path="rotation_euler", frame=key_b)
-            pose_bone.rotation_euler = vals_neg
+            pose_bone.rotation_euler = tuple(vals_c)
             pose_bone.keyframe_insert(data_path="rotation_euler", frame=frame_end)
             animated_bones += 1
+
+        if style in {"walk", "dance"}:
+            root_bones = [pb for pb in armature.pose.bones if pb.parent is None]
+            if root_bones:
+                root = root_bones[0]
+                try:
+                    bob = 0.015 if style == "walk" else 0.028
+                    bob *= strength
+                    root.location = (0.0, 0.0, 0.0)
+                    root.keyframe_insert(data_path="location", frame=1)
+                    root.location = (0.0, 0.0, bob)
+                    root.keyframe_insert(data_path="location", frame=key_a)
+                    root.location = (0.0, 0.0, 0.0)
+                    root.keyframe_insert(data_path="location", frame=key_b)
+                    root.location = (0.0, 0.0, -bob)
+                    root.keyframe_insert(data_path="location", frame=frame_end)
+                    animated_bones += 1
+                except Exception:
+                    pass
 
         try:
             bpy.ops.object.mode_set(mode="OBJECT")
@@ -2010,6 +2153,8 @@ def stage_unirig_animation_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
         "armature_count": int(len(armatures)),
         "animated_bones": int(animated_bones),
         "frame_end": int(frame_end),
+        "animation_style": style,
+        "animation_strength": float(strength),
     }
 
 

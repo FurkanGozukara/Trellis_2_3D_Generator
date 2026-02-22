@@ -12,7 +12,12 @@ from pathlib import Path
 from subprocess_utils import allocate_run_dir
 
 
-def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
+def animation_player_tab(
+    list_models_fn,
+    rigging_outputs_dir,
+    open_folder_fn,
+    generate_animation_preview_fn=None,
+):
     """
     Create the Animation Player tab interface.
     
@@ -20,6 +25,7 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
         list_models_fn: Function to list rigged models
         rigging_outputs_dir: Path to rigging outputs directory
         open_folder_fn: Function to open folder in file explorer
+        generate_animation_preview_fn: Optional callback to regenerate animation preview
     
     Features:
     - Browse previously rigged models
@@ -73,20 +79,71 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
                 size="lg",
                 visible=False
             )
-            
+
+            animation_style = gr.Dropdown(
+                label="Animation Style",
+                choices=["dance", "walk", "idle"],
+                value="dance",
+                info="Generate stronger rig animation previews.",
+            )
+            animation_strength = gr.Slider(
+                label="Animation Strength",
+                minimum=0.4,
+                maximum=2.5,
+                step=0.1,
+                value=1.5,
+            )
+            animation_frames = gr.Slider(
+                label="Animation Frames",
+                minimum=45,
+                maximum=240,
+                step=5,
+                value=120,
+            )
+            regenerate_animation_btn = gr.Button(
+                "🎞️ Generate Animation Preview",
+                variant="secondary",
+                interactive=bool(generate_animation_preview_fn),
+            )
+            animation_action_status = gr.Textbox(
+                label="Animation Status",
+                lines=3,
+                interactive=False,
+                show_label=False,
+                placeholder="Select a model then generate animation preview.",
+            )
+
             open_folder_btn = gr.Button("📁 Open Outputs Folder", variant="secondary")
             clear_viewer_btn = gr.Button("🗑️ Clear Viewer", variant="secondary")
         
         # Right Column: 3D Viewer and Info
         with gr.Column(scale=2, min_width=520):
             gr.Markdown("## 3D Viewer")
-            model_viewer = gr.Model3D(
-                label="Rigged Model Viewer",
-                height=600,
-                show_label=False,
-                display_mode="solid",
-                clear_color=[0.2, 0.2, 0.25, 1.0]
-            )
+            with gr.Tabs() as preview_tabs:
+                with gr.Tab("Animated", id="preview_tab_animated"):
+                    animated_viewer = gr.Model3D(
+                        label="Animated Preview",
+                        height=600,
+                        show_label=False,
+                        display_mode="solid",
+                        clear_color=[0.2, 0.2, 0.25, 1.0],
+                    )
+                with gr.Tab("Textured", id="preview_tab_textured"):
+                    textured_viewer = gr.Model3D(
+                        label="Textured Preview",
+                        height=600,
+                        show_label=False,
+                        display_mode="solid",
+                        clear_color=[0.2, 0.2, 0.25, 1.0],
+                    )
+                with gr.Tab("Skeleton", id="preview_tab_skeleton"):
+                    skeleton_viewer = gr.Model3D(
+                        label="Skeleton Preview",
+                        height=600,
+                        show_label=False,
+                        display_mode="solid",
+                        clear_color=[0.2, 0.2, 0.25, 1.0],
+                    )
             
             # Info panel
             gr.Markdown("""
@@ -99,8 +156,10 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
             - Pan: Shift + Click and drag
             
             **Animation Notes:**
+            - Animated tab: generated animation preview
+            - Textured tab: merged textured rig
+            - Skeleton tab: skeleton preview overlay
             - Embedded GLB animations auto-play in this viewer when present
-            - FBX files are previewed via generated GLB fallback when available
             - For full rig editing, still use external DCC tools:
               - **Blender** (recommended - free, full rigging support)
               - **Unity** / **Unreal Engine**
@@ -169,25 +228,152 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
         Normalize a file path for Gradio Model3D.
         Uses absolute path + forward slashes for consistent browser loading on Windows.
         """
+        previewable_exts = {".glb", ".gltf", ".obj", ".ply", ".stl", ".splat"}
         if not path_value:
             return None
         try:
             path = Path(path_value).resolve()
             if not path.exists() or not path.is_file():
                 return None
+            if path.suffix.lower() not in previewable_exts:
+                return None
             return path.as_posix()
         except Exception:
             return None
+
+    def _load_run_metadata(full_path: Path):
+        metadata_path = None
+        run_meta = {}
+        for parent in [full_path.parent, *full_path.parents]:
+            cand = parent / "run_metadata.json"
+            if cand.exists():
+                metadata_path = cand
+                break
+        if metadata_path is not None:
+            try:
+                data = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    run_meta = data
+            except Exception:
+                run_meta = {}
+        return run_meta
+
+    def _candidate_stems(stem: str):
+        stems = []
+        if stem:
+            stems.append(stem)
+        suffix_tokens = (
+            "_textured_anim_preview",
+            "_anim_preview",
+            "_animation_preview",
+            "_textured_preview",
+            "_skeleton_preview",
+            "_skinned",
+            "_skeleton",
+            "_rigged",
+        )
+        for token in suffix_tokens:
+            if stem.endswith(token):
+                trimmed = stem[: -len(token)]
+                if trimmed:
+                    stems.append(trimmed)
+        # keep order but unique
+        dedup = []
+        for item in stems:
+            if item not in dedup:
+                dedup.append(item)
+        return dedup
+
+    def _first_previewable(candidates):
+        for candidate in candidates:
+            normalized = _normalize_model3d_path(candidate)
+            if normalized:
+                return normalized
+        return None
+
+    def _collect_preview_paths(full_path: Path, run_meta):
+        paths_meta = run_meta.get("paths", {}) if isinstance(run_meta, dict) else {}
+        input_meta = run_meta.get("input", {}) if isinstance(run_meta, dict) else {}
+        stems = _candidate_stems(full_path.stem)
+
+        animated_candidates = [
+            paths_meta.get("textured_animation_preview"),
+            paths_meta.get("animation_preview"),
+        ]
+        textured_candidates = [
+            paths_meta.get("textured_preview"),
+            paths_meta.get("final_output"),
+            input_meta.get("preview_path"),
+            input_meta.get("copied_input_path"),
+        ]
+        skeleton_candidates = [
+            paths_meta.get("skeleton_preview"),
+        ]
+
+        # Include selected model when it already matches one of preview classes.
+        stem_l = full_path.stem.lower()
+        if "_anim_preview" in stem_l or "_animation_preview" in stem_l:
+            animated_candidates.insert(0, str(full_path))
+        if "_textured_preview" in stem_l or "_rigged" in stem_l:
+            textured_candidates.insert(0, str(full_path))
+        if "_skeleton_preview" in stem_l:
+            skeleton_candidates.insert(0, str(full_path))
+
+        for stem in stems:
+            animated_candidates.extend(
+                [
+                    str(full_path.with_name(f"{stem}_textured_anim_preview.glb")),
+                    str(full_path.with_name(f"{stem}_skinned_anim_preview.glb")),
+                    str(full_path.with_name(f"{stem}_anim_preview.glb")),
+                    str(full_path.with_name(f"{stem}_animation_preview.glb")),
+                ]
+            )
+            textured_candidates.extend(
+                [
+                    str(full_path.with_name(f"{stem}_skinned_textured_preview.glb")),
+                    str(full_path.with_name(f"{stem}_textured_preview.glb")),
+                    str(full_path.with_name(f"{stem}_rigged.glb")),
+                    str(full_path.with_name(f"{stem}_rigged.gltf")),
+                ]
+            )
+            skeleton_candidates.append(str(full_path.with_name(f"{stem}_skeleton_preview.glb")))
+
+        animated_path = _first_previewable(animated_candidates)
+        textured_path = _first_previewable(textured_candidates)
+        skeleton_path = _first_previewable(skeleton_candidates)
+
+        # Reasonable fallback for textured view if none was generated.
+        if not textured_path:
+            textured_path = _first_previewable([str(full_path)])
+
+        if animated_path:
+            selected_tab = "preview_tab_animated"
+        elif textured_path:
+            selected_tab = "preview_tab_textured"
+        elif skeleton_path:
+            selected_tab = "preview_tab_skeleton"
+        else:
+            selected_tab = "preview_tab_animated"
+
+        return {
+            "animated": animated_path,
+            "textured": textured_path,
+            "skeleton": skeleton_path,
+            "selected_tab": selected_tab,
+        }
 
     def load_model(model_rel_path):
         """Load selected model and extract metadata."""
         if not model_rel_path:
             return (
-                gr.update(value=None),  # viewer
-                None,  # metadata
-                "No model selected",  # file_info
-                None,  # selected_model_path
-                gr.update(visible=False),  # download_btn
+                gr.update(value=None),
+                gr.update(value=None),
+                gr.update(value=None),
+                gr.Tabs(selected="preview_tab_animated"),
+                None,
+                "No model selected",
+                None,
+                gr.update(visible=False),
             )
         
         try:
@@ -197,6 +383,9 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
             if not full_path.exists():
                 return (
                     gr.update(value=None),
+                    gr.update(value=None),
+                    gr.update(value=None),
+                    gr.Tabs(selected="preview_tab_animated"),
                     {"error": "File not found"},
                     f"❌ File not found: {model_rel_path}",
                     None,
@@ -225,68 +414,14 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
                 "size_mb": round(file_size_mb, 2),
             }
 
-            # Decide what to show in Model3D. Prefer animation previews for FBX.
-            previewable_exts = {".glb", ".gltf", ".obj", ".ply", ".stl"}
-            viewer_path = str(full_path) if file_ext in previewable_exts else None
+            run_meta = _load_run_metadata(full_path)
+            previews = _collect_preview_paths(full_path, run_meta)
             viewer_note = ""
-
-            metadata_path = None
-            run_meta = {}
-            for parent in [full_path.parent, *full_path.parents]:
-                cand = parent / "run_metadata.json"
-                if cand.exists():
-                    metadata_path = cand
-                    break
-
-            if metadata_path is not None:
-                try:
-                    data = json.loads(metadata_path.read_text(encoding="utf-8"))
-                    if isinstance(data, dict):
-                        run_meta = data
-                except Exception:
-                    run_meta = {}
-
-            if viewer_path is None:
-                paths_meta = run_meta.get("paths", {}) if isinstance(run_meta, dict) else {}
-                if "_skeleton" in full_path.stem.lower():
-                    preferred_preview = paths_meta.get("skeleton_preview") or paths_meta.get("animation_preview")
+            if not previews["animated"] and not previews["textured"] and not previews["skeleton"]:
+                if file_ext == ".fbx":
+                    viewer_note = "FBX preview is not supported by Model3D unless a GLB fallback exists."
                 else:
-                    preferred_preview = paths_meta.get("animation_preview") or paths_meta.get("skeleton_preview")
-                if preferred_preview and os.path.exists(preferred_preview):
-                    viewer_path = str(Path(preferred_preview))
-                    viewer_note = f"Viewer: metadata preview ({Path(preferred_preview).name})"
-
-            if viewer_path is None:
-                sibling_candidates = [
-                    full_path.with_name(f"{full_path.stem}_anim_preview.glb"),
-                    full_path.with_name(f"{full_path.stem}_animation_preview.glb"),
-                    full_path.with_suffix(".glb"),
-                    full_path.with_suffix(".gltf"),
-                ]
-                for cand in sibling_candidates:
-                    if cand.exists():
-                        viewer_path = str(cand)
-                        viewer_note = f"Viewer fallback: sibling {cand.name}"
-                        break
-
-            if viewer_path is None:
-                input_meta = run_meta.get("input", {}) if isinstance(run_meta, dict) else {}
-                fallback = input_meta.get("preview_path") or input_meta.get("copied_input_path")
-                if fallback and os.path.exists(fallback):
-                    fallback_ext = Path(fallback).suffix.lower()
-                    if fallback_ext in previewable_exts:
-                        viewer_path = str(Path(fallback))
-                        viewer_note = f"Viewer fallback: source mesh ({Path(fallback).name})"
-
-            if viewer_path is None and file_ext == ".fbx":
-                viewer_note = "FBX preview is not supported by Model3D unless a GLB fallback exists."
-
-            normalized_viewer = _normalize_model3d_path(viewer_path)
-            if viewer_path and not normalized_viewer:
-                viewer_note = f"Viewer path was not accessible: {viewer_path}"
-                viewer_path = None
-            else:
-                viewer_path = normalized_viewer
+                    viewer_note = "No previewable 3D assets were found for this run."
             
             # Look for log file or metadata file
             log_file = full_path.parent / (full_path.stem + "_log.txt")
@@ -301,13 +436,20 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
             else:
                 metadata["type"] = "Unknown"
 
-            metadata["viewer_path"] = viewer_path
+            metadata["preview_paths"] = {
+                "animated": previews["animated"],
+                "textured": previews["textured"],
+                "skeleton": previews["skeleton"],
+            }
             if viewer_note:
                 metadata["viewer_note"] = viewer_note
                 file_info += f"\n**Viewer:** {viewer_note}"
             
             return (
-                gr.update(value=viewer_path),  # viewer (load previewable model or fallback)
+                gr.update(value=previews["animated"]),
+                gr.update(value=previews["textured"]),
+                gr.update(value=previews["skeleton"]),
+                gr.Tabs(selected=previews["selected_tab"]),
                 metadata,
                 file_info,
                 str(full_path),  # selected_model_path
@@ -317,6 +459,9 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
         except Exception as e:
             return (
                 gr.update(value=None),
+                gr.update(value=None),
+                gr.update(value=None),
+                gr.Tabs(selected="preview_tab_animated"),
                 {"error": str(e)},
                 f"❌ Error loading model: {e}",
                 None,
@@ -328,7 +473,10 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
         fn=load_model,
         inputs=[rigged_models_dropdown],
         outputs=[
-            model_viewer,
+            animated_viewer,
+            textured_viewer,
+            skeleton_viewer,
+            preview_tabs,
             metadata_display,
             file_info_text,
             selected_model_path,
@@ -343,6 +491,9 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
             return (
                 gr.update(),
                 gr.update(value=None),
+                gr.update(value=None),
+                gr.update(value=None),
+                gr.Tabs(selected="preview_tab_animated"),
                 None,
                 "No model selected",
                 None,
@@ -354,10 +505,22 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
             models = list_models_fn()
             if model_rel_path not in models:
                 models = sorted(set(models + [model_rel_path]))
-            viewer, metadata, file_info, selected_path, download_update = load_model(model_rel_path)
+            (
+                animated_update,
+                textured_update,
+                skeleton_update,
+                tab_update,
+                metadata,
+                file_info,
+                selected_path,
+                download_update,
+            ) = load_model(model_rel_path)
             return (
                 gr.update(choices=models, value=model_rel_path),
-                viewer,
+                animated_update,
+                textured_update,
+                skeleton_update,
+                tab_update,
                 metadata,
                 file_info,
                 selected_path,
@@ -367,6 +530,9 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
             return (
                 gr.update(),
                 gr.update(value=None),
+                gr.update(value=None),
+                gr.update(value=None),
+                gr.Tabs(selected="preview_tab_animated"),
                 {"error": str(e)},
                 f"❌ Error loading model: {e}",
                 None,
@@ -378,7 +544,10 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
         inputs=[external_select_input],
         outputs=[
             rigged_models_dropdown,
-            model_viewer,
+            animated_viewer,
+            textured_viewer,
+            skeleton_viewer,
+            preview_tabs,
             metadata_display,
             file_info_text,
             selected_model_path,
@@ -394,6 +563,9 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
             return (
                 gr.update(),
                 gr.update(value=None),
+                gr.update(value=None),
+                gr.update(value=None),
+                gr.Tabs(selected="preview_tab_animated"),
                 {"error": "No file uploaded"},
                 "❌ Please upload a valid model file.",
                 None,
@@ -406,13 +578,115 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
         inputs=[upload_model_file],
         outputs=[
             rigged_models_dropdown,
-            model_viewer,
+            animated_viewer,
+            textured_viewer,
+            skeleton_viewer,
+            preview_tabs,
             metadata_display,
             file_info_text,
             selected_model_path,
             download_model_btn,
         ],
         queue=False,
+        show_progress="minimal",
+    )
+
+    def _regenerate_animation_preview(selected_path, model_rel_path, style, strength, frames, req: gr.Request):
+        if not generate_animation_preview_fn:
+            return (
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                "Animation regeneration is not available in this build.",
+            )
+
+        try:
+            target_path = selected_path
+            if not target_path and model_rel_path:
+                target_path = str((Path(rigging_outputs_dir) / model_rel_path).resolve())
+            if not target_path:
+                return (
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    "Select a model first.",
+                )
+
+            _preview_path, status = generate_animation_preview_fn(
+                target_path,
+                str(style),
+                float(strength),
+                int(frames),
+                req,
+            )
+
+            rel_to_reload = model_rel_path or _resolve_to_rel_model_path(target_path)
+            (
+                animated_update,
+                textured_update,
+                skeleton_update,
+                tab_update,
+                metadata,
+                file_info,
+                selected_path_out,
+                download_update,
+            ) = load_model(rel_to_reload)
+
+            return (
+                animated_update,
+                textured_update,
+                skeleton_update,
+                tab_update,
+                metadata,
+                file_info,
+                selected_path_out,
+                download_update,
+                status,
+            )
+        except Exception as e:
+            return (
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                gr.update(),
+                f"❌ Failed to regenerate animation: {type(e).__name__}: {e}",
+            )
+
+    regenerate_animation_btn.click(
+        fn=_regenerate_animation_preview,
+        inputs=[
+            selected_model_path,
+            rigged_models_dropdown,
+            animation_style,
+            animation_strength,
+            animation_frames,
+        ],
+        outputs=[
+            animated_viewer,
+            textured_viewer,
+            skeleton_viewer,
+            preview_tabs,
+            metadata_display,
+            file_info_text,
+            selected_model_path,
+            download_model_btn,
+            animation_action_status,
+        ],
+        queue=True,
         show_progress="minimal",
     )
     
@@ -445,22 +719,30 @@ def animation_player_tab(list_models_fn, rigging_outputs_dir, open_folder_fn):
     def clear_viewer():
         return (
             None,  # dropdown
-            gr.update(value=None),  # viewer
+            gr.update(value=None),  # animated_viewer
+            gr.update(value=None),  # textured_viewer
+            gr.update(value=None),  # skeleton_viewer
+            gr.Tabs(selected="preview_tab_animated"),  # preview_tabs
             None,  # metadata
             "Select a model to view details...",  # file_info
             None,  # selected_model_path
             gr.update(visible=False),  # download_btn
+            "Cleared.",
         )
     
     clear_viewer_btn.click(
         fn=clear_viewer,
         outputs=[
             rigged_models_dropdown,
-            model_viewer,
+            animated_viewer,
+            textured_viewer,
+            skeleton_viewer,
+            preview_tabs,
             metadata_display,
             file_info_text,
             selected_model_path,
             download_model_btn,
+            animation_action_status,
         ],
         queue=False,
         show_progress="hidden"

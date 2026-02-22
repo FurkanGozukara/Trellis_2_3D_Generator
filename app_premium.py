@@ -1060,6 +1060,10 @@ def _normalize_model3d_preview_path(path_value: Optional[str]) -> Optional[str]:
         path = Path(path_value).resolve()
         if not path.exists() or not path.is_file():
             return None
+        # Gradio Model3D does not render FBX directly.
+        previewable_exts = {".glb", ".gltf", ".obj", ".ply", ".stl", ".splat"}
+        if path.suffix.lower() not in previewable_exts:
+            return None
         return path.as_posix()
     except Exception:
         return None
@@ -1109,15 +1113,22 @@ def _preferred_animation_preview_path(path_value: str) -> Optional[str]:
     # 1) Check metadata reference first.
     metadata = _load_rig_metadata_for_path(str(path))
     paths_meta = metadata.get("paths", {}) if isinstance(metadata, dict) else {}
-    preview_from_meta = paths_meta.get("animation_preview") or paths_meta.get("skeleton_preview")
+    preview_from_meta = (
+        paths_meta.get("textured_animation_preview")
+        or paths_meta.get("animation_preview")
+        or paths_meta.get("textured_preview")
+        or paths_meta.get("skeleton_preview")
+    )
     normalized = _normalize_model3d_preview_path(preview_from_meta)
     if normalized:
         return normalized
 
     # 2) Check common sibling naming.
     sibling_candidates = [
+        path.with_name(f"{path.stem}_textured_anim_preview.glb"),
         path.with_name(f"{path.stem}_anim_preview.glb"),
         path.with_name(f"{path.stem}_animation_preview.glb"),
+        path.with_name(f"{path.stem}_textured_preview.glb"),
         path.with_name(f"{path.stem}_preview.glb"),
     ]
     for candidate in sibling_candidates:
@@ -1324,10 +1335,58 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
         metadata = _load_rig_metadata(work_dir)
         if result and skinned_fbx.exists():
             animation_preview_glb: Optional[str] = None
+            textured_preview_glb: Optional[str] = None
+            animation_source_path: Path = skinned_fbx
+
+            input_meta = metadata.get("input", {}) if isinstance(metadata, dict) else {}
+            target_mesh_path = input_meta.get("copied_input_path") or input_meta.get("original_upload_path")
+            merge_preview_log_path = work_dir / "logs" / "animation_preview_merge_log.txt"
+
+            # Build a textured GLB preview first, then animate that asset.
+            if target_mesh_path and os.path.exists(target_mesh_path):
+                textured_preview_output = work_dir / f"{skinned_fbx.stem}_textured_preview.glb"
+                merge_preview_payload = {
+                    "source_path": str(skinned_fbx),
+                    "target_path": str(target_mesh_path),
+                    "output_path": str(textured_preview_output),
+                    "export_format": "glb",
+                }
+                try:
+                    for event in _iter_subprocess_stage(
+                        "unirig_merge",
+                        merge_preview_payload,
+                        work_dir,
+                        merge_preview_log_path,
+                        session=session,
+                    ):
+                        if event["type"] == "log":
+                            _append_rig_full_log(work_dir, "animation_preview_merge", event["text"])
+                            status = _append_status(status, event["text"])
+                            status = _trim_status(status)
+                            yield (None, None, status)
+                        elif event["type"] == "result":
+                            merged_path = event["result"].get("output_path")
+                            merged_candidate = merged_path or str(textured_preview_output)
+                            normalized_merged = _normalize_model3d_preview_path(merged_candidate)
+                            if normalized_merged:
+                                textured_preview_glb = normalized_merged
+                except Exception as merge_err:
+                    status = _append_status(
+                        status,
+                        f"[animation_preview_merge] Warning: {type(merge_err).__name__}: {merge_err}",
+                    )
+                    status = _trim_status(status)
+                    yield (None, None, status)
+
+            if textured_preview_glb:
+                animation_source_path = Path(textured_preview_glb)
+
             animation_payload = {
-                "input_fbx_path": str(skinned_fbx),
+                "input_model_path": str(animation_source_path),
                 "output_glb_path": str(work_dir / f"{skinned_fbx.stem}_anim_preview.glb"),
-                "frame_end": 90,
+                "frame_end": 140,
+                "animation_style": "dance",
+                "animation_strength": 1.5,
             }
             try:
                 for event in _iter_subprocess_stage(
@@ -1360,13 +1419,22 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
                 }
             )
             metadata.setdefault("paths", {})["skinning_output"] = str(skinned_fbx)
+            if textured_preview_glb:
+                metadata.setdefault("paths", {})["textured_preview"] = str(Path(textured_preview_glb).resolve())
             if animation_preview_glb and os.path.exists(animation_preview_glb):
-                metadata.setdefault("paths", {})["animation_preview"] = str(Path(animation_preview_glb).resolve())
+                resolved_anim_preview = str(Path(animation_preview_glb).resolve())
+                metadata.setdefault("paths", {})["animation_preview"] = resolved_anim_preview
+                if textured_preview_glb:
+                    metadata.setdefault("paths", {})["textured_animation_preview"] = resolved_anim_preview
             _save_rig_metadata(work_dir, metadata)
+            paths_meta = metadata.get("paths", {}) if isinstance(metadata, dict) else {}
             preview_source: Optional[str] = _normalize_model3d_preview_path(
-                metadata.get("paths", {}).get("skeleton_preview")
+                paths_meta.get("textured_animation_preview")
+                or paths_meta.get("animation_preview")
+                or paths_meta.get("textured_preview")
+                or paths_meta.get("skeleton_preview")
             )
-            note = "\nPreview: mesh + generated skeleton overlay."
+            note = "\nPreview: generated animation preview."
             if not preview_source:
                 preview_source = _normalize_model3d_preview_path(animation_preview_glb)
             if not preview_source and skinned_fbx.suffix.lower() == ".fbx":
@@ -1379,6 +1447,8 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
                 else:
                     preview_source = None
                     note = "\nNote: FBX preview is not supported by Gradio Model3D in this view."
+            if textured_preview_glb:
+                note += f"\nTextured preview ready: {Path(textured_preview_glb).name}"
             if animation_preview_glb and os.path.exists(animation_preview_glb):
                 note += f"\nAnimation preview ready: {Path(animation_preview_glb).name}"
             final_status = _append_status(status, f"\n✅ Skinning completed!\nOutput: {skinned_fbx}{note}")
@@ -1538,8 +1608,10 @@ def _send_rig_output_to_animation(
         except Exception:
             return path
 
-    # Prefer skinned output for animation browsing.
-    candidate = skinned_path or skeleton_path or final_output_path
+    previewable_exts = {".glb", ".gltf", ".obj", ".ply", ".stl", ".splat"}
+
+    # Prefer merged output first (usually textured), then skinned, then skeleton.
+    candidate = final_output_path or skinned_path or skeleton_path
     if not candidate:
         status = _append_status(current_status or "", "❌ No rig output to send. Generate skeleton/skinning/export first.")
         return "", _trim_status(status), gr.update()
@@ -1547,22 +1619,178 @@ def _send_rig_output_to_animation(
         status = _append_status(current_status or "", f"❌ Output file not found: {candidate}")
         return "", _trim_status(status), gr.update()
 
-    # Prefer an explicit animation preview first, then other preview-friendly siblings.
     candidate_path = Path(candidate)
-    viewer_candidate = _preferred_animation_preview_path(str(candidate_path)) or candidate
+    metadata = _load_rig_metadata_for_path(str(candidate_path))
+    paths_meta = metadata.get("paths", {}) if isinstance(metadata, dict) else {}
+
+    # Prefer textured animated previews when available.
+    viewer_candidate = _normalize_model3d_preview_path(paths_meta.get("textured_animation_preview")) or candidate
+    if viewer_candidate == candidate and candidate_path.suffix.lower() not in previewable_exts:
+        viewer_candidate = _preferred_animation_preview_path(str(candidate_path)) or candidate
+
     if viewer_candidate == candidate and candidate_path.suffix.lower() == ".fbx":
         same_stem_glb = candidate_path.with_suffix(".glb")
         same_stem_gltf = candidate_path.with_suffix(".gltf")
-        if same_stem_glb.exists():
-            viewer_candidate = str(same_stem_glb)
-        elif same_stem_gltf.exists():
-            viewer_candidate = str(same_stem_gltf)
-        elif final_output_path and os.path.exists(final_output_path) and Path(final_output_path).suffix.lower() in {".glb", ".gltf"}:
-            viewer_candidate = final_output_path
+        normalized_same_stem_glb = _normalize_model3d_preview_path(str(same_stem_glb))
+        normalized_same_stem_gltf = _normalize_model3d_preview_path(str(same_stem_gltf))
+        if normalized_same_stem_glb:
+            viewer_candidate = normalized_same_stem_glb
+        elif normalized_same_stem_gltf:
+            viewer_candidate = normalized_same_stem_gltf
+        elif final_output_path:
+            normalized_final_output = _normalize_model3d_preview_path(final_output_path)
+            if normalized_final_output:
+                viewer_candidate = normalized_final_output
+        if viewer_candidate == candidate:
+            fallback_preview = _select_rig_preview_source(metadata, None)
+            if fallback_preview:
+                viewer_candidate = fallback_preview
+    elif viewer_candidate == candidate and candidate_path.suffix.lower() in previewable_exts:
+        normalized_candidate = _normalize_model3d_preview_path(str(candidate_path))
+        if normalized_candidate:
+            viewer_candidate = normalized_candidate
 
     viewer_candidate = _norm_path(viewer_candidate)
     status = _append_status(current_status or "", f"➡ Sent to Animation Browser: {Path(viewer_candidate).name}")
     return viewer_candidate, _trim_status(status), gr.Tabs(selected="animation_tab")
+
+
+def _regenerate_animation_preview_for_browser(
+    model_path: Optional[str],
+    animation_style: str,
+    animation_strength: float,
+    frame_end: int,
+    req: gr.Request,
+) -> Tuple[str, str]:
+    """Regenerate animation preview for Animation Browser and persist metadata links."""
+    session = str(req.session_hash)
+
+    if not model_path:
+        return "", "ERROR: No model selected."
+
+    selected_path = Path(model_path)
+    if not selected_path.exists():
+        return "", f"ERROR: Selected model file not found: {model_path}"
+
+    work_dir = _find_rig_work_dir(selected_path)
+    _ensure_rig_workspace_dirs(work_dir)
+    log_path = work_dir / "logs" / "animation_preview_log.txt"
+
+    metadata = _load_rig_metadata(work_dir)
+    paths_meta = metadata.get("paths", {}) if isinstance(metadata, dict) else {}
+
+    source_candidates = [
+        paths_meta.get("textured_preview"),
+        paths_meta.get("final_output"),
+        paths_meta.get("animation_preview"),
+        paths_meta.get("skinning_output"),
+        str(selected_path),
+    ]
+    source_path: Optional[Path] = None
+    for candidate in source_candidates:
+        if not candidate:
+            continue
+        try:
+            path = Path(candidate).resolve()
+        except Exception:
+            continue
+        if path.exists() and path.suffix.lower() in {".fbx", ".glb", ".gltf"}:
+            source_path = path
+            break
+
+    if source_path is None:
+        return "", "ERROR: No valid source model found for animation preview (.fbx/.glb/.gltf)."
+
+    base_stem = source_path.stem
+    skinning_output = paths_meta.get("skinning_output")
+    if skinning_output:
+        try:
+            base_stem = Path(skinning_output).stem
+        except Exception:
+            base_stem = source_path.stem
+    output_glb = work_dir / f"{base_stem}_anim_preview.glb"
+
+    style = str(animation_style or "dance").strip().lower()
+    if style not in {"walk", "dance", "idle"}:
+        style = "dance"
+    strength = float(animation_strength)
+    strength = max(0.4, min(2.5, strength))
+    frames = int(frame_end)
+    frames = max(30, min(240, frames))
+
+    metadata = _load_rig_metadata(work_dir)
+    metadata.setdefault("stages", {})["animation_preview"] = {
+        "status": "running",
+        "started_at": datetime.now().isoformat(),
+        "log_path": str(log_path),
+        "payload_path": str(work_dir / "unirig_animation_preview.payload.json"),
+        "result_path": str(work_dir / "unirig_animation_preview.result.json"),
+        "input_model_path": str(source_path),
+        "output_path": str(output_glb),
+        "animation_style": style,
+        "animation_strength": strength,
+        "frame_end": frames,
+    }
+    _save_rig_metadata(work_dir, metadata)
+
+    payload = {
+        "input_model_path": str(source_path),
+        "output_glb_path": str(output_glb),
+        "frame_end": frames,
+        "animation_style": style,
+        "animation_strength": strength,
+    }
+
+    result = None
+    try:
+        for event in _iter_subprocess_stage("unirig_animation_preview", payload, work_dir, log_path, session=session):
+            if event["type"] == "log":
+                _append_rig_full_log(work_dir, "animation_preview", event["text"])
+            elif event["type"] == "result":
+                result = event["result"]
+    except Exception as e:
+        metadata = _load_rig_metadata(work_dir)
+        metadata.setdefault("stages", {}).setdefault("animation_preview", {}).update(
+            {
+                "status": "failed",
+                "completed_at": datetime.now().isoformat(),
+                "error": f"{type(e).__name__}: {e}",
+            }
+        )
+        _save_rig_metadata(work_dir, metadata)
+        return "", f"ERROR: Animation preview failed: {type(e).__name__}: {e}"
+
+    if not output_glb.exists() or not result:
+        metadata = _load_rig_metadata(work_dir)
+        metadata.setdefault("stages", {}).setdefault("animation_preview", {}).update(
+            {
+                "status": "failed",
+                "completed_at": datetime.now().isoformat(),
+            }
+        )
+        _save_rig_metadata(work_dir, metadata)
+        return "", "ERROR: Animation preview stage completed but no output was found."
+
+    resolved_output = str(output_glb.resolve())
+    metadata = _load_rig_metadata(work_dir)
+    metadata.setdefault("stages", {}).setdefault("animation_preview", {}).update(
+        {
+            "status": "completed",
+            "completed_at": datetime.now().isoformat(),
+            "result": result,
+        }
+    )
+    paths_meta = metadata.setdefault("paths", {})
+    paths_meta["animation_preview"] = resolved_output
+    if source_path.suffix.lower() in {".glb", ".gltf"} or paths_meta.get("textured_preview"):
+        paths_meta["textured_animation_preview"] = resolved_output
+    _save_rig_metadata(work_dir, metadata)
+
+    status = (
+        f"OK: Animation preview regenerated: {Path(resolved_output).name}\n"
+        f"Style: {style} | Strength: {strength:.1f} | Frames: {frames}"
+    )
+    return Path(resolved_output).as_posix(), status
 
 
 # ------------------------------- Cancellation -------------------------------
@@ -4827,6 +5055,7 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
                 list_models_fn=_list_rigged_models,
                 rigging_outputs_dir=OUTPUTS_DIR,
                 open_folder_fn=_open_folder,
+                generate_animation_preview_fn=_regenerate_animation_preview_for_browser,
             )
 
     # Bridge: Rigging -> Animation browser selection.

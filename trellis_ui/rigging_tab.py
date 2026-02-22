@@ -1,4 +1,4 @@
-"""
+﻿"""
 Rigging Tab - UniRig integration for automatic skeleton generation and skinning.
 Allows users to upload 3D models and rig them using the UniRig system.
 """
@@ -104,25 +104,43 @@ def rigging_tab(
             
             # Action Buttons
             gr.Markdown("## Actions")
-            generate_skeleton_btn = gr.Button("🦴 Generate Skeleton", variant="primary", size="lg")
-            add_skinning_btn = gr.Button("🎨 Add Skinning", variant="secondary", size="lg")
-            export_rigged_btn = gr.Button("💾 Export Rigged Model", variant="secondary", size="lg")
-            send_to_animation_btn = gr.Button("➡ Open In Animation Browser", variant="secondary", size="lg")
+            generate_skeleton_btn = gr.Button("ðŸ¦´ Generate Skeleton", variant="primary", size="lg")
+            add_skinning_btn = gr.Button("ðŸŽ¨ Add Skinning", variant="secondary", size="lg")
+            export_rigged_btn = gr.Button("ðŸ’¾ Export Rigged Model", variant="secondary", size="lg")
+            send_to_animation_btn = gr.Button("âž¡ Open In Animation Browser", variant="secondary", size="lg")
             
             with gr.Row():
-                open_outputs_btn = gr.Button("📁 Open Outputs Folder", variant="secondary")
-                clear_btn = gr.Button("🗑️ Clear", variant="secondary")
+                open_outputs_btn = gr.Button("ðŸ“ Open Outputs Folder", variant="secondary")
+                clear_btn = gr.Button("ðŸ—‘ï¸ Clear", variant="secondary")
         
         # Right Column: Preview and Status
         with gr.Column(scale=2, min_width=520):
             gr.Markdown("## Preview")
-            rigged_model_preview = gr.Model3D(
-                label="Rigged Model Preview",
-                height=600,
-                show_label=False,
-                display_mode="solid",
-                clear_color=[0.2, 0.2, 0.25, 1.0]
-            )
+            with gr.Tabs() as rig_preview_tabs:
+                with gr.Tab("Animated", id="rig_preview_tab_animated"):
+                    rig_preview_animated = gr.Model3D(
+                        label="Animated Preview",
+                        height=600,
+                        show_label=False,
+                        display_mode="solid",
+                        clear_color=[0.2, 0.2, 0.25, 1.0],
+                    )
+                with gr.Tab("Textured", id="rig_preview_tab_textured"):
+                    rig_preview_textured = gr.Model3D(
+                        label="Textured Preview",
+                        height=600,
+                        show_label=False,
+                        display_mode="solid",
+                        clear_color=[0.2, 0.2, 0.25, 1.0],
+                    )
+                with gr.Tab("Skeleton", id="rig_preview_tab_skeleton"):
+                    rig_preview_skeleton = gr.Model3D(
+                        label="Skeleton Preview",
+                        height=600,
+                        show_label=False,
+                        display_mode="solid",
+                        clear_color=[0.2, 0.2, 0.25, 1.0],
+                    )
             
             # Status Section
             gr.Markdown("## Status")
@@ -137,7 +155,7 @@ def rigging_tab(
             
             # Download button (hidden until export is complete)
             download_btn = gr.DownloadButton(
-                label="⬇️ Download Rigged Model",
+                label="â¬‡ï¸ Download Rigged Model",
                 visible=False,
                 variant="primary"
             )
@@ -148,6 +166,7 @@ def rigging_tab(
     final_output_state = gr.State(None)
     original_mesh_state = gr.State(None)
     upload_run_dir_state = gr.State(None)
+    rig_preview_source_state = gr.State(None)
     
     # Helper to update seed when randomize is toggled
     def randomize_seed_fn(randomize: bool, current_seed: int):
@@ -219,15 +238,155 @@ def rigging_tab(
         return str(dst), str(work_dir)
 
     def _normalize_model3d_path(path_value: str):
+        previewable_exts = {".glb", ".gltf", ".obj", ".ply", ".stl", ".splat"}
         if not path_value:
             return None
         try:
             path = Path(path_value).resolve()
             if not path.exists() or not path.is_file():
                 return None
+            if path.suffix.lower() not in previewable_exts:
+                return None
             return path.as_posix()
         except Exception:
             return None
+
+    def _load_run_metadata(path_value: str):
+        if not path_value:
+            return {}
+        try:
+            path = Path(path_value).resolve()
+        except Exception:
+            return {}
+        for parent in [path.parent, *path.parents]:
+            meta_path = parent / "run_metadata.json"
+            if meta_path.exists():
+                try:
+                    data = json.loads(meta_path.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        return data
+                except Exception:
+                    return {}
+        return {}
+
+    def _candidate_stems(stem: str):
+        stems = []
+        if stem:
+            stems.append(stem)
+        suffix_tokens = (
+            "_textured_anim_preview",
+            "_skinned_anim_preview",
+            "_anim_preview",
+            "_animation_preview",
+            "_textured_preview",
+            "_skeleton_preview",
+            "_skinned",
+            "_skeleton",
+            "_rigged",
+        )
+        for token in suffix_tokens:
+            if stem.endswith(token):
+                trimmed = stem[: -len(token)]
+                if trimmed:
+                    stems.append(trimmed)
+        dedup = []
+        for item in stems:
+            if item not in dedup:
+                dedup.append(item)
+        return dedup
+
+    def _first_previewable(candidates):
+        for candidate in candidates:
+            normalized = _normalize_model3d_path(candidate)
+            if normalized:
+                return normalized
+        return None
+
+    def _collect_preview_paths(path_value: str):
+        if not path_value:
+            return {"animated": None, "textured": None, "skeleton": None, "selected_tab": "rig_preview_tab_textured"}
+        try:
+            full_path = Path(path_value).resolve()
+        except Exception:
+            return {"animated": None, "textured": None, "skeleton": None, "selected_tab": "rig_preview_tab_textured"}
+
+        run_meta = _load_run_metadata(str(full_path))
+        paths_meta = run_meta.get("paths", {}) if isinstance(run_meta, dict) else {}
+        input_meta = run_meta.get("input", {}) if isinstance(run_meta, dict) else {}
+        stems = _candidate_stems(full_path.stem)
+
+        animated_candidates = [
+            paths_meta.get("textured_animation_preview"),
+            paths_meta.get("animation_preview"),
+        ]
+        textured_candidates = [
+            paths_meta.get("textured_preview"),
+            paths_meta.get("final_output"),
+            input_meta.get("preview_path"),
+            input_meta.get("copied_input_path"),
+            str(full_path),
+        ]
+        skeleton_candidates = [
+            paths_meta.get("skeleton_preview"),
+        ]
+
+        stem_l = full_path.stem.lower()
+        if "_anim_preview" in stem_l or "_animation_preview" in stem_l:
+            animated_candidates.insert(0, str(full_path))
+        if "_textured_preview" in stem_l or "_rigged" in stem_l:
+            textured_candidates.insert(0, str(full_path))
+        if "_skeleton_preview" in stem_l:
+            skeleton_candidates.insert(0, str(full_path))
+
+        for stem in stems:
+            animated_candidates.extend(
+                [
+                    str(full_path.with_name(f"{stem}_textured_anim_preview.glb")),
+                    str(full_path.with_name(f"{stem}_skinned_anim_preview.glb")),
+                    str(full_path.with_name(f"{stem}_anim_preview.glb")),
+                    str(full_path.with_name(f"{stem}_animation_preview.glb")),
+                ]
+            )
+            textured_candidates.extend(
+                [
+                    str(full_path.with_name(f"{stem}_skinned_textured_preview.glb")),
+                    str(full_path.with_name(f"{stem}_textured_preview.glb")),
+                    str(full_path.with_name(f"{stem}_rigged.glb")),
+                    str(full_path.with_name(f"{stem}_rigged.gltf")),
+                    str(full_path.with_name(f"{stem}.glb")),
+                    str(full_path.with_name(f"{stem}.gltf")),
+                ]
+            )
+            skeleton_candidates.append(str(full_path.with_name(f"{stem}_skeleton_preview.glb")))
+
+        animated = _first_previewable(animated_candidates)
+        textured = _first_previewable(textured_candidates)
+        skeleton = _first_previewable(skeleton_candidates)
+
+        if animated:
+            selected_tab = "rig_preview_tab_animated"
+        elif textured:
+            selected_tab = "rig_preview_tab_textured"
+        elif skeleton:
+            selected_tab = "rig_preview_tab_skeleton"
+        else:
+            selected_tab = "rig_preview_tab_textured"
+
+        return {
+            "animated": animated,
+            "textured": textured,
+            "skeleton": skeleton,
+            "selected_tab": selected_tab,
+        }
+
+    def _render_rig_preview_tabs(path_value: str):
+        previews = _collect_preview_paths(path_value)
+        return (
+            gr.update(value=previews["animated"]),
+            gr.update(value=previews["textured"]),
+            gr.update(value=previews["skeleton"]),
+            gr.Tabs(selected=previews["selected_tab"]),
+        )
 
     def _save_preview_metadata(work_dir: str, preview_path: str, preview_note: str):
         metadata_path = Path(work_dir) / "run_metadata.json"
@@ -308,7 +467,7 @@ def rigging_tab(
                 if converted_preview:
                     return (
                         converted_preview,
-                        f"Preview source: converted {preview_glb.name} ({original_faces}→{simplified_faces} faces)",
+                        f"Preview source: converted {preview_glb.name} ({original_faces}â†’{simplified_faces} faces)",
                     )
         except Exception as e:
             note = f"Preview conversion failed ({type(e).__name__}); using uploaded mesh."
@@ -320,15 +479,15 @@ def rigging_tab(
         if not path:
             return (
                 None,
-                gr.update(value=None),
+                None,
                 "Upload a mesh and click 'Generate Skeleton' to begin...",
                 None,
             )
         if not os.path.exists(path):
             return (
                 None,
-                gr.update(value=None),
-                "❌ Uploaded mesh file was not found. Please upload again.",
+                None,
+                "âŒ Uploaded mesh file was not found. Please upload again.",
                 None,
             )
 
@@ -337,8 +496,8 @@ def rigging_tab(
         except Exception as e:
             return (
                 None,
-                gr.update(value=None),
-                f"❌ Failed to prepare upload workspace: {type(e).__name__}: {e}",
+                None,
+                f"âŒ Failed to prepare upload workspace: {type(e).__name__}: {e}",
                 None,
             )
 
@@ -348,7 +507,7 @@ def rigging_tab(
 
         if preview_path:
             status = (
-                f"✅ Mesh uploaded: {Path(copied_path).name}\n"
+                f"âœ… Mesh uploaded: {Path(copied_path).name}\n"
                 f"Workspace: {work_dir}\n"
                 f"Viewer path: {preview_path}\n"
                 f"{preview_note}\n"
@@ -356,19 +515,26 @@ def rigging_tab(
             )
         else:
             status = (
-                f"✅ Mesh uploaded: {Path(copied_path).name}\n"
+                f"âœ… Mesh uploaded: {Path(copied_path).name}\n"
                 f"Workspace: {work_dir}\n"
                 f"{preview_note}\n"
                 "You can still run rigging."
             )
-        return (copied_path, gr.update(value=preview_path), status, work_dir)
+        return (copied_path, preview_path, status, work_dir)
     
-    mesh_upload.change(
+    _upload_evt = mesh_upload.change(
         fn=store_mesh,
         inputs=[mesh_upload],
-        outputs=[original_mesh_state, rigged_model_preview, rig_status, upload_run_dir_state],
+        outputs=[original_mesh_state, rig_preview_source_state, rig_status, upload_run_dir_state],
         queue=False,
         show_progress="hidden"
+    )
+    _upload_evt.then(
+        fn=_render_rig_preview_tabs,
+        inputs=[rig_preview_source_state],
+        outputs=[rig_preview_animated, rig_preview_textured, rig_preview_skeleton, rig_preview_tabs],
+        queue=False,
+        show_progress="hidden",
     )
     
     def auto_skin_after_skeleton(enable_skin: bool, skeleton_path: str, seed: int, prior_status: str, req: gr.Request):
@@ -376,12 +542,12 @@ def rigging_tab(
         base_status = prior_status or ""
 
         if not skeleton_path:
-            msg = "❌ Skeleton generation did not produce an output. Auto-skinning skipped."
+            msg = "âŒ Skeleton generation did not produce an output. Auto-skinning skipped."
             yield (None, None, (base_status + "\n" + msg).strip() if base_status else msg)
             return
 
         if not enable_skin:
-            msg = "ℹ️ Auto-skinning is disabled. Skeleton was saved."
+            msg = "â„¹ï¸ Auto-skinning is disabled. Skeleton was saved."
             yield (None, None, (base_status + "\n" + msg).strip() if base_status else msg)
             return
 
@@ -397,33 +563,74 @@ def rigging_tab(
     _skeleton_evt = generate_skeleton_btn.click(
         fn=run_skeleton_fn,
         inputs=[original_mesh_state, rig_seed, upload_run_dir_state],
-        outputs=[skeleton_path_state, rigged_model_preview, rig_status]
+        outputs=[skeleton_path_state, rig_preview_source_state, rig_status]
     )
     _skeleton_evt.then(
+        fn=_render_rig_preview_tabs,
+        inputs=[rig_preview_source_state],
+        outputs=[rig_preview_animated, rig_preview_textured, rig_preview_skeleton, rig_preview_tabs],
+        queue=False,
+        show_progress="hidden",
+    )
+    _auto_skin_evt = _skeleton_evt.then(
         fn=auto_skin_after_skeleton,
         inputs=[enable_skinning, skeleton_path_state, rig_seed, rig_status],
-        outputs=[skinned_path_state, rigged_model_preview, rig_status],
+        outputs=[skinned_path_state, rig_preview_source_state, rig_status],
+    )
+    _auto_skin_evt.then(
+        fn=_render_rig_preview_tabs,
+        inputs=[rig_preview_source_state],
+        outputs=[rig_preview_animated, rig_preview_textured, rig_preview_skeleton, rig_preview_tabs],
+        queue=False,
+        show_progress="hidden",
     )
     
     # Add Skinning
-    add_skinning_btn.click(
+    _add_skin_evt = add_skinning_btn.click(
         fn=run_skinning_fn,
         inputs=[skeleton_path_state, rig_seed],
-        outputs=[skinned_path_state, rigged_model_preview, rig_status]
+        outputs=[skinned_path_state, rig_preview_source_state, rig_status]
+    )
+    _add_skin_evt.then(
+        fn=_render_rig_preview_tabs,
+        inputs=[rig_preview_source_state],
+        outputs=[rig_preview_animated, rig_preview_textured, rig_preview_skeleton, rig_preview_tabs],
+        queue=False,
+        show_progress="hidden",
     )
     
     # Export Rigged Model
-    def prepare_export(skinned_path, skeleton_path, original_mesh, export_fmt, export_both, auto_merge_enabled, req):
+    def prepare_export(
+        skinned_path,
+        skeleton_path,
+        original_mesh,
+        export_fmt,
+        export_both,
+        auto_merge_enabled,
+        current_preview_source,
+        req,
+    ):
         """Determine which file to use for merge and call merge function."""
-        # Use skinned if available, otherwise skeleton
         source = skinned_path if skinned_path else skeleton_path
-        
+
         if not source:
-            return (None, None, "❌ Please generate skeleton or skinning first.", gr.update(visible=False))
-        
+            return (
+                None,
+                None,
+                "❌ Please generate skeleton or skinning first.",
+                gr.update(visible=False),
+                current_preview_source,
+            )
+
         if not original_mesh:
-            return (None, None, "❌ Original mesh not found.", gr.update(visible=False))
-        
+            return (
+                None,
+                None,
+                "❌ Original mesh not found.",
+                gr.update(visible=False),
+                current_preview_source,
+            )
+
         if auto_merge_enabled:
             chosen_output = None
             chosen_download = None
@@ -439,7 +646,8 @@ def rigging_tab(
                 if out_path and out_download and chosen_output is None:
                     chosen_output = out_path
                     chosen_download = out_download
-                yield (chosen_output, chosen_download, out_status, _download_update(chosen_download))
+                preview_source = chosen_output if chosen_output else current_preview_source
+                yield (chosen_output, chosen_download, out_status, _download_update(chosen_download), preview_source)
 
             # Secondary format export (optional) so both FBX+GLB are saved.
             if export_both:
@@ -449,13 +657,13 @@ def rigging_tab(
                     if out_path and out_download and chosen_output is None:
                         chosen_output = out_path
                         chosen_download = out_download
-                    yield (chosen_output, chosen_download, out_status, _download_update(chosen_download))
+                    preview_source = chosen_output if chosen_output else current_preview_source
+                    yield (chosen_output, chosen_download, out_status, _download_update(chosen_download), preview_source)
         else:
-            # Just export the source file without merging
             final_status = f"✅ Rigged model ready (no merge):\n{source}"
-            yield (source, source, final_status, gr.update(visible=True, value=source))
+            yield (source, source, final_status, gr.update(visible=True, value=source), source)
     
-    export_rigged_btn.click(
+    _export_evt = export_rigged_btn.click(
         fn=prepare_export,
         inputs=[
             skinned_path_state,
@@ -464,17 +672,25 @@ def rigging_tab(
             export_format,
             export_both_formats,
             auto_merge,
+            rig_preview_source_state,
         ],
-        outputs=[final_output_state, download_btn, rig_status, download_btn]
+        outputs=[final_output_state, download_btn, rig_status, download_btn, rig_preview_source_state]
+    )
+    _export_evt.then(
+        fn=_render_rig_preview_tabs,
+        inputs=[rig_preview_source_state],
+        outputs=[rig_preview_animated, rig_preview_textured, rig_preview_skeleton, rig_preview_tabs],
+        queue=False,
+        show_progress="hidden",
     )
     
     # Open Outputs Folder
     def open_outputs():
         try:
             open_folder_fn(rigging_outputs_dir)
-            return "✅ Opened outputs folder"
+            return "âœ… Opened outputs folder"
         except Exception as e:
-            return f"❌ Failed to open folder: {e}"
+            return f"âŒ Failed to open folder: {e}"
     
     open_outputs_btn.click(
         fn=open_outputs,
@@ -487,7 +703,7 @@ def rigging_tab(
     def clear_all():
         return (
             None,  # mesh_upload
-            gr.update(value=None),  # rigged_model_preview
+            None,  # rig_preview_source_state
             "Cleared. Upload a new mesh to begin.",  # rig_status
             None,  # skeleton_path_state
             None,  # skinned_path_state
@@ -497,11 +713,11 @@ def rigging_tab(
             gr.update(visible=False),  # download_btn
         )
     
-    clear_btn.click(
+    _clear_evt = clear_btn.click(
         fn=clear_all,
         outputs=[
             mesh_upload,
-            rigged_model_preview,
+            rig_preview_source_state,
             rig_status,
             skeleton_path_state,
             skinned_path_state,
@@ -513,6 +729,13 @@ def rigging_tab(
         queue=False,
         show_progress="hidden"
     )
+    _clear_evt.then(
+        fn=_render_rig_preview_tabs,
+        inputs=[rig_preview_source_state],
+        outputs=[rig_preview_animated, rig_preview_textured, rig_preview_skeleton, rig_preview_tabs],
+        queue=False,
+        show_progress="hidden",
+    )
 
     return {
         "send_to_animation_btn": send_to_animation_btn,
@@ -521,3 +744,4 @@ def rigging_tab(
         "skeleton_path_state": skeleton_path_state,
         "rig_status": rig_status,
     }
+
