@@ -1902,9 +1902,9 @@ def stage_unirig_animation_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
         input_model_path: Path to rigged model (.fbx/.glb/.gltf)
         input_fbx_path: Backward-compatible alias for FBX source
         output_glb_path: Output animated GLB path
-        frame_end: End frame for looping animation (default: 90)
-        animation_style: walk|dance|idle (default: walk)
-        animation_strength: multiplier for animation intensity (default: 1.0)
+        frame_end: End frame for looping animation (default: 120)
+        animation_style: walk|dance|idle (default: dance)
+        animation_strength: multiplier for animation intensity (default: 1.35)
     """
     import hashlib
 
@@ -1927,12 +1927,12 @@ def stage_unirig_animation_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     input_model = Path(input_model_value)
     output_glb = Path(payload["output_glb_path"])
-    frame_end = int(payload.get("frame_end", 90))
+    frame_end = int(payload.get("frame_end", 120))
     frame_end = max(frame_end, 30)
-    style = str(payload.get("animation_style", "walk")).strip().lower()
+    style = str(payload.get("animation_style", "dance")).strip().lower()
     if style not in {"walk", "dance", "idle"}:
-        style = "walk"
-    strength = float(payload.get("animation_strength", 1.0))
+        style = "dance"
+    strength = float(payload.get("animation_strength", 1.35))
     strength = max(0.2, min(2.5, strength))
 
     if not input_model.exists():
@@ -2000,11 +2000,141 @@ def stage_unirig_animation_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
             return 1
         return 0
 
-    key_a = max(2, frame_end // 3)
-    key_b = max(key_a + 1, (2 * frame_end) // 3)
+    import math
+
+    # Shared built-in clip phases. This keeps behavior deterministic across machines.
+    phase_keys = [i / 8.0 for i in range(9)]  # 0.00 .. 1.00
+    frame_keys = [1 + int(round(ph * (frame_end - 1))) for ph in phase_keys]
+
+    def _bone_role(name_l: str) -> str:
+        if _name_has(name_l, "pelvis", "hip"):
+            return "pelvis"
+        if _name_has(name_l, "spine", "chest", "torso"):
+            return "spine"
+        if _name_has(name_l, "neck", "head"):
+            return "head"
+        if _name_has(name_l, "thigh", "upleg", "upperleg"):
+            return "leg_upper"
+        if _name_has(name_l, "shin", "calf", "lowerleg", "knee"):
+            return "leg_lower"
+        if _name_has(name_l, "foot", "ankle", "toe"):
+            return "foot"
+        if _name_has(name_l, "shoulder", "upperarm", "arm"):
+            return "arm_upper"
+        if _name_has(name_l, "forearm", "lowerarm", "elbow"):
+            return "arm_lower"
+        if _name_has(name_l, "hand", "wrist", "finger", "thumb"):
+            return "hand"
+        return "other"
+
+    def _rot_for_phase(style_name: str, role: str, side: int, phase: float, seed_hash: bytes) -> Tuple[float, float, float]:
+        # left/right opposite timing
+        side_phase = phase + (0.5 if side > 0 else 0.0)
+        w = math.sin(2.0 * math.pi * side_phase)
+        w2 = math.sin(4.0 * math.pi * side_phase)
+        c = math.cos(2.0 * math.pi * phase)
+
+        # deterministic fallback sign for non-sided bones
+        fallback_sign = 1.0 if (seed_hash[2] % 2) == 0 else -1.0
+        side_sign = float(side) if side != 0 else fallback_sign
+
+        # base amplitudes in radians
+        if style_name == "idle":
+            if role in {"pelvis", "spine", "head"}:
+                return (0.03 * c, 0.02 * w, 0.015 * w2)
+            if role in {"arm_upper", "arm_lower", "hand"}:
+                return (0.02 * side_sign * c, 0.0, 0.03 * side_sign * w)
+            if role in {"leg_upper", "leg_lower", "foot"}:
+                return (0.015 * side_sign * w, 0.0, 0.0)
+            return (0.008 * fallback_sign * w, 0.008 * c, 0.008 * w2)
+
+        if style_name == "walk":
+            if role == "pelvis":
+                return (0.04 * c, 0.02 * w, 0.04 * c)
+            if role == "spine":
+                return (0.03 * c, 0.02 * w, 0.08 * c)
+            if role == "head":
+                return (0.02 * c, 0.03 * w, 0.02 * c)
+            if role == "leg_upper":
+                return (0.55 * w, 0.02 * side_sign * c, 0.0)
+            if role == "leg_lower":
+                knee = max(0.0, -w)
+                return (0.70 * knee, 0.0, 0.0)
+            if role == "foot":
+                toe = max(0.0, w)
+                return (-0.28 * w + 0.12 * toe, 0.0, 0.0)
+            if role == "arm_upper":
+                return (-0.42 * w, 0.03 * side_sign * c, 0.10 * side_sign * c)
+            if role == "arm_lower":
+                elbow = max(0.0, w)
+                return (0.18 * elbow, 0.0, 0.0)
+            if role == "hand":
+                return (0.10 * w, 0.0, 0.0)
+            return (0.03 * fallback_sign * w, 0.02 * c, 0.02 * w2)
+
+        # style == "dance"
+        if role == "pelvis":
+            return (0.10 * c, 0.05 * w, 0.18 * w2)
+        if role == "spine":
+            return (0.12 * c, 0.07 * w, 0.22 * w2)
+        if role == "head":
+            return (0.07 * c, 0.10 * w, 0.04 * c)
+        if role == "leg_upper":
+            return (0.85 * w, 0.05 * side_sign * c, 0.18 * w2)
+        if role == "leg_lower":
+            knee = max(0.0, -w)
+            return (0.95 * knee, 0.0, 0.0)
+        if role == "foot":
+            toe = max(0.0, w)
+            return (-0.42 * w + 0.22 * toe, 0.0, 0.0)
+        if role == "arm_upper":
+            return (-0.95 * w, 0.15 * side_sign * c, 0.35 * side_sign * w2)
+        if role == "arm_lower":
+            return (0.45 * max(0.0, w), 0.05 * side_sign * c, 0.0)
+        if role == "hand":
+            return (0.25 * w2, 0.0, 0.0)
+        return (0.10 * fallback_sign * w, 0.06 * c, 0.06 * w2)
+
+    def _root_loc(style_name: str, phase: float) -> Tuple[float, float, float]:
+        if style_name == "idle":
+            return (
+                0.0,
+                0.004 * math.sin(2.0 * math.pi * phase + 0.35),
+                0.01 * math.sin(2.0 * math.pi * phase),
+            )
+        if style_name == "walk":
+            return (
+                0.01 * math.sin(2.0 * math.pi * phase),
+                0.015 * math.sin(2.0 * math.pi * phase + 0.35),
+                0.02 * math.sin(4.0 * math.pi * phase),
+            )
+        # dance
+        return (
+            0.03 * math.sin(2.0 * math.pi * phase),
+            0.03 * math.sin(2.0 * math.pi * phase + 0.45),
+            0.04 * math.sin(4.0 * math.pi * phase),
+        )
+
+    def _root_rot(style_name: str, phase: float) -> Tuple[float, float, float]:
+        w = math.sin(2.0 * math.pi * phase)
+        w2 = math.sin(4.0 * math.pi * phase)
+        c = math.cos(2.0 * math.pi * phase)
+        if style_name == "idle":
+            return (0.01 * w, 0.005 * w2, 0.02 * c)
+        if style_name == "walk":
+            return (0.04 * w, 0.015 * w2, 0.07 * c)
+        # dance
+        return (0.08 * w, 0.05 * w2, 0.20 * c)
+
     animated_bones = 0
 
     for armature in armatures:
+        # Drop imported animation tracks and apply shared clip to this rig.
+        try:
+            armature.animation_data_clear()
+        except Exception:
+            pass
+
         bpy.context.view_layer.objects.active = armature
         try:
             bpy.ops.object.mode_set(mode="POSE")
@@ -2017,109 +2147,31 @@ def stage_unirig_animation_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
 
             lname = pose_bone.name.lower()
             side = _bone_side(lname)
-            is_leg = _name_has(lname, "thigh", "upleg", "leg", "shin", "calf", "knee", "foot", "toe")
-            is_arm = _name_has(lname, "shoulder", "arm", "forearm", "elbow", "wrist", "hand")
-            is_spine = _name_has(lname, "spine", "chest", "torso", "hip", "pelvis")
-            is_head = _name_has(lname, "neck", "head")
-
-            pose_bone.rotation_mode = "XYZ"
+            role = _bone_role(lname)
             seed = hashlib.sha1(pose_bone.name.encode("utf-8")).digest()
-            fallback_sign = 1.0 if (seed[2] % 2) == 0 else -1.0
-            vals_a = [0.0, 0.0, 0.0]
-            vals_b = [0.0, 0.0, 0.0]
-            vals_c = [0.0, 0.0, 0.0]
+            pose_bone.rotation_mode = "XYZ"
 
-            if style == "idle":
-                if is_spine or is_head:
-                    amp = 0.04
-                    vals_a[0] = amp
-                    vals_b[0] = -amp
-                    vals_c[0] = amp * 0.5
-                elif is_arm:
-                    amp = 0.05
-                    sign = float(side) if side != 0 else fallback_sign
-                    vals_a[2] = sign * amp
-                    vals_b[2] = -sign * amp
-                elif is_leg:
-                    amp = 0.025
-                    sign = float(side) if side != 0 else fallback_sign
-                    vals_a[0] = sign * amp
-                    vals_b[0] = -sign * amp
-                else:
-                    amp = 0.02 + (seed[0] / 255.0) * 0.04
-                    axis = seed[1] % 3
-                    vals_a[axis] = fallback_sign * amp
-                    vals_b[axis] = -fallback_sign * amp
-            else:
-                dance_boost = 1.35 if style == "dance" else 1.0
-                if is_leg:
-                    amp = 0.34 * dance_boost
-                    sign = float(side) if side != 0 else fallback_sign
-                    if _name_has(lname, "foot", "toe"):
-                        amp *= 0.55
-                    vals_a[0] = sign * amp
-                    vals_b[0] = -sign * amp * 0.7
-                    vals_c[0] = sign * amp * 0.35
-                elif is_arm:
-                    amp = 0.30 * dance_boost
-                    sign = -float(side) if side != 0 else fallback_sign
-                    vals_a[0] = sign * amp
-                    vals_b[0] = -sign * amp * 0.75
-                    vals_c[0] = sign * amp * 0.4
-                    if style == "dance":
-                        twist = 0.16 * sign
-                        vals_a[2] += twist
-                        vals_b[2] -= twist
-                elif is_spine:
-                    amp = 0.08 * dance_boost
-                    vals_a[2] = amp
-                    vals_b[2] = -amp
-                    vals_c[2] = amp * 0.5
-                    vals_a[0] = 0.025 * dance_boost
-                    vals_b[0] = -0.025 * dance_boost
-                elif is_head:
-                    amp = 0.05 * dance_boost
-                    vals_a[1] = amp
-                    vals_b[1] = -amp
-                else:
-                    amp = 0.05 + (seed[0] / 255.0) * 0.10
-                    axis = seed[1] % 3
-                    vals_a[axis] = fallback_sign * amp
-                    vals_b[axis] = -fallback_sign * amp
-
-            if strength != 1.0:
-                vals_a = [v * strength for v in vals_a]
-                vals_b = [v * strength for v in vals_b]
-                vals_c = [v * strength for v in vals_c]
-
-            pose_bone.rotation_euler = (0.0, 0.0, 0.0)
-            pose_bone.keyframe_insert(data_path="rotation_euler", frame=1)
-            pose_bone.rotation_euler = tuple(vals_a)
-            pose_bone.keyframe_insert(data_path="rotation_euler", frame=key_a)
-            pose_bone.rotation_euler = tuple(vals_b)
-            pose_bone.keyframe_insert(data_path="rotation_euler", frame=key_b)
-            pose_bone.rotation_euler = tuple(vals_c)
-            pose_bone.keyframe_insert(data_path="rotation_euler", frame=frame_end)
+            for frame, phase in zip(frame_keys, phase_keys):
+                rx, ry, rz = _rot_for_phase(style, role, side, phase, seed)
+                pose_bone.rotation_euler = (rx * strength, ry * strength, rz * strength)
+                pose_bone.keyframe_insert(data_path="rotation_euler", frame=frame)
             animated_bones += 1
 
-        if style in {"walk", "dance"}:
-            root_bones = [pb for pb in armature.pose.bones if pb.parent is None]
-            if root_bones:
-                root = root_bones[0]
-                try:
-                    bob = 0.015 if style == "walk" else 0.028
-                    bob *= strength
-                    root.location = (0.0, 0.0, 0.0)
-                    root.keyframe_insert(data_path="location", frame=1)
-                    root.location = (0.0, 0.0, bob)
-                    root.keyframe_insert(data_path="location", frame=key_a)
-                    root.location = (0.0, 0.0, 0.0)
-                    root.keyframe_insert(data_path="location", frame=key_b)
-                    root.location = (0.0, 0.0, -bob)
-                    root.keyframe_insert(data_path="location", frame=frame_end)
-                    animated_bones += 1
-                except Exception:
-                    pass
+        root_bones = [pb for pb in armature.pose.bones if pb.parent is None]
+        if root_bones:
+            root = root_bones[0]
+            try:
+                root.rotation_mode = "XYZ"
+                for frame, phase in zip(frame_keys, phase_keys):
+                    lx, ly, lz = _root_loc(style, phase)
+                    rx, ry, rz = _root_rot(style, phase)
+                    root.location = (lx * strength, ly, lz * strength)
+                    root.rotation_euler = (rx * strength, ry * strength, rz * strength)
+                    root.keyframe_insert(data_path="location", frame=frame)
+                    root.keyframe_insert(data_path="rotation_euler", frame=frame)
+                animated_bones += 1
+            except Exception:
+                pass
 
         try:
             bpy.ops.object.mode_set(mode="OBJECT")
