@@ -620,6 +620,7 @@ def _default_ui_config() -> dict:
             "tex_slat_rescale_t": 3.0,
             "ultrashape_enabled": True,
             "ultrashape_retexture_after_refine": True,
+            "ultrashape_conservative_mode": True,
             "ultrashape_checkpoint": "",
             "ultrashape_config_name": "infer_dit_refine.yaml",
             "ultrashape_dtype": "bfloat16",
@@ -2225,6 +2226,7 @@ def batch_process_folder(
     export_formats: List[str],
     ultrashape_enabled: bool,
     ultrashape_retexture_after_refine: bool,
+    ultrashape_conservative_mode: bool,
     ultrashape_checkpoint: str,
     ultrashape_config_name: str,
     ultrashape_dtype: str,
@@ -2435,6 +2437,7 @@ def batch_process_folder(
                     use_tiled_extraction,
                     ultrashape_enabled,
                     ultrashape_retexture_after_refine,
+                    ultrashape_conservative_mode,
                     ultrashape_checkpoint,
                     ultrashape_config_name,
                     ultrashape_dtype,
@@ -3815,6 +3818,7 @@ def extract_glb(
     extract_use_tiled_extraction: bool,
     ultrashape_enabled: bool,
     ultrashape_retexture_after_refine: bool,
+    ultrashape_conservative_mode: bool,
     ultrashape_checkpoint: str,
     ultrashape_config_name: str,
     ultrashape_dtype: str,
@@ -3897,6 +3901,7 @@ def extract_glb(
         ultrashape_payload = {
             "enabled": bool(ultrashape_enabled),
             "retexture_after_refine": bool(ultrashape_retexture_after_refine),
+            "conservative_mode": bool(ultrashape_conservative_mode),
             "retexture_params": (state.get("_gen_tex_params") if isinstance(state, dict) else None),
             "image_path": reference_image_path,
             "checkpoint": str(ultrashape_checkpoint or "").strip(),
@@ -4191,6 +4196,7 @@ def extract_glb(
                     num_uniform_points=int(ultrashape_num_uniform_points),
                     num_latents=int(ultrashape_num_latents),
                     target_face_count=int(ultrashape_target_face_count),
+                    conservative_mode=bool(ultrashape_conservative_mode),
                     enable_pbar=True,
                 )
                 _log(
@@ -5082,7 +5088,6 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                         value=False,
                                         info="Move models between CPU/GPU during generation. Reduces VRAM usage but slower and may reduce quality. Disable for best results."
                                     )
-                                gr.Markdown("**Mesh Extraction Optimizations (Generate)**")
                                 with gr.Row():
                                     use_chunked_processing = gr.Checkbox(
                                         label="Chunked Triangle Processing (Generate)",
@@ -5094,8 +5099,6 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                         value=False,
                                         info="Extract mesh in spatial tiles during Generate preview. Only enable if you get OOM during Generate. May degrade quality."
                                     )
-                                gr.Markdown("**Mesh Extraction Optimizations (Extract GLB)**")
-                                with gr.Row():
                                     extract_use_chunked_processing = gr.Checkbox(
                                         label="Chunked Triangle Processing (Extract GLB)",
                                         value=False,
@@ -5137,16 +5140,22 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                     tex_slat_guidance_interval_end = gr.Slider(
                                         0.0, 1.0, label="Guidance Interval End", value=0.9, step=0.01, info="⚠️ ADVANCED: Model default is 0.9. Texture uses 0.6-0.9 range. Changing may reduce quality!")
                                 gr.Markdown("**UltraShape Refinement (Extract GLB)**")
-                                ultrashape_enabled = gr.Checkbox(
-                                    label="Enable UltraShape Refinement",
-                                    value=True,
-                                    info="Run UltraShape image-guided mesh refinement before final GLB baking. Improves geometry detail; adds time/VRAM."
-                                )
-                                ultrashape_retexture_after_refine = gr.Checkbox(
-                                    label="Re-generate Texture After UltraShape",
-                                    value=True,
-                                    info="Recommended. Rebuild texture maps after UltraShape mesh changes to keep textures aligned."
-                                )
+                                with gr.Row():
+                                    ultrashape_enabled = gr.Checkbox(
+                                        label="Enable UltraShape Refinement",
+                                        value=True,
+                                        info="Run UltraShape image-guided mesh refinement before final GLB baking. Improves geometry detail; adds time/VRAM."
+                                    )
+                                    ultrashape_retexture_after_refine = gr.Checkbox(
+                                        label="Re-generate Texture After UltraShape",
+                                        value=True,
+                                        info="Recommended. Rebuild texture maps after UltraShape mesh changes to keep textures aligned."
+                                    )
+                                    ultrashape_conservative_mode = gr.Checkbox(
+                                        label="Conservative UltraShape Mode",
+                                        value=True,
+                                        info="Recommended. Reduces geometry drift to preserve TRELLIS texture/shape alignment. Slightly less aggressive refinement."
+                                    )
                                 with gr.Row():
                                     ultrashape_checkpoint = gr.Textbox(
                                         label="UltraShape Checkpoint (optional)",
@@ -5162,6 +5171,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                         ["float16", "bfloat16", "float32"],
                                         label="UltraShape DType",
                                         value="bfloat16",
+                                        info="Precision mode for UltraShape inference. Lower precision usually reduces VRAM and can improve speed; float32 is typically heavier and slower.",
                                     )
                                     ultrashape_low_vram = gr.Checkbox(
                                         label="UltraShape Low VRAM",
@@ -5171,23 +5181,89 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                     ultrashape_remove_bg = gr.Checkbox(
                                         label="UltraShape Remove BG",
                                         value=False,
-                                        info="Apply TRELLIS rembg to the reference image before refinement. This affects image guidance only, not the input mesh."
+                                        info="Apply TRELLIS rembg to the reference image before refinement. Adds an extra preprocessing pass (more runtime, small extra memory). Affects image guidance only, not the input mesh."
                                     )
                                 with gr.Row():
-                                    ultrashape_steps = gr.Slider(10, 200, label="UltraShape Steps", value=50, step=5)
-                                    ultrashape_guidance_scale = gr.Slider(1.0, 15.0, label="UltraShape Guidance", value=5.0, step=0.5)
-                                    ultrashape_octree_resolution = gr.Slider(256, 1024, label="UltraShape Octree Res", value=384, step=64)
+                                    ultrashape_steps = gr.Slider(
+                                        10, 200,
+                                        label="UltraShape Steps",
+                                        value=50,
+                                        step=5,
+                                        info="More diffusion steps increase processing time. VRAM impact is usually modest compared with resolution/token controls."
+                                    )
+                                    ultrashape_guidance_scale = gr.Slider(
+                                        1.0, 15.0,
+                                        label="UltraShape Guidance",
+                                        value=5.0,
+                                        step=0.5,
+                                        info="Conditioning strength. Usually has minor VRAM/runtime impact versus steps and resolution."
+                                    )
+                                    ultrashape_octree_resolution = gr.Slider(
+                                        256, 1024,
+                                        label="UltraShape Octree Res",
+                                        value=384,
+                                        step=64,
+                                        info="Higher octree resolution increases VRAM usage and runtime during geometry decoding."
+                                    )
                                 with gr.Row():
-                                    ultrashape_num_chunks = gr.Slider(1000, 50000, label="UltraShape Chunk Size", value=8000, step=1000)
-                                    ultrashape_target_face_count = gr.Slider(100000, 2000000, label="UltraShape Target Faces", value=500000, step=10000)
-                                    ultrashape_num_latents = gr.Slider(0, 131072, label="UltraShape Num Latents (0=cfg)", value=0, step=1024)
+                                    ultrashape_num_chunks = gr.Slider(
+                                        1000, 50000,
+                                        label="UltraShape Chunk Size",
+                                        value=8000,
+                                        step=1000,
+                                        info="Larger chunks are usually faster but need more VRAM; smaller chunks reduce VRAM pressure but run slower."
+                                    )
+                                    ultrashape_target_face_count = gr.Slider(
+                                        100000, 2000000,
+                                        label="UltraShape Target Faces",
+                                        value=500000,
+                                        step=10000,
+                                        info="Higher face targets increase mesh processing time and can raise memory use in later mesh operations."
+                                    )
+                                    ultrashape_num_latents = gr.Slider(
+                                        0, 131072,
+                                        label="UltraShape Num Latents (0=cfg)",
+                                        value=0,
+                                        step=1024,
+                                        info="More latent tokens increase VRAM usage and runtime during voxel conditioning/sampling."
+                                    )
                                 with gr.Row():
-                                    ultrashape_box_v = gr.Slider(0.5, 2.0, label="UltraShape Box V", value=1.0, step=0.1)
-                                    ultrashape_mc_level = gr.Slider(-0.1, 0.1, label="UltraShape MC Level", value=0.0, step=0.01)
-                                    ultrashape_normalize_scale = gr.Slider(0.5, 1.0, label="UltraShape Normalize Scale", value=0.99, step=0.01)
+                                    ultrashape_box_v = gr.Slider(
+                                        0.5, 2.0,
+                                        label="UltraShape Box V",
+                                        value=1.0,
+                                        step=0.1,
+                                        info="Geometric control parameter. Usually negligible direct VRAM/runtime impact."
+                                    )
+                                    ultrashape_mc_level = gr.Slider(
+                                        -0.1, 0.1,
+                                        label="UltraShape MC Level",
+                                        value=0.0,
+                                        step=0.01,
+                                        info="Surface threshold parameter. Usually negligible direct VRAM/runtime impact."
+                                    )
+                                    ultrashape_normalize_scale = gr.Slider(
+                                        0.5, 1.0,
+                                        label="UltraShape Normalize Scale",
+                                        value=0.99,
+                                        step=0.01,
+                                        info="Input normalization control. Usually negligible direct VRAM/runtime impact."
+                                    )
                                 with gr.Row():
-                                    ultrashape_num_sharp_points = gr.Slider(10000, 500000, label="UltraShape Sharp Points", value=204800, step=10000)
-                                    ultrashape_num_uniform_points = gr.Slider(10000, 500000, label="UltraShape Uniform Points", value=204800, step=10000)
+                                    ultrashape_num_sharp_points = gr.Slider(
+                                        10000, 500000,
+                                        label="UltraShape Sharp Points",
+                                        value=204800,
+                                        step=10000,
+                                        info="More sharp-edge samples improve detail capture but increase sampling/voxelization runtime and memory."
+                                    )
+                                    ultrashape_num_uniform_points = gr.Slider(
+                                        10000, 500000,
+                                        label="UltraShape Uniform Points",
+                                        value=204800,
+                                        step=10000,
+                                        info="More uniform samples improve coverage but increase sampling/voxelization runtime and memory."
+                                    )
                         with gr.Step("Extract", id=1):
                             with gr.Row():
                                 back_to_preview_btn = gr.Button("Back to Preview", variant="secondary")
@@ -5322,6 +5398,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     extract_use_tiled_extraction,
                     ultrashape_enabled,
                     ultrashape_retexture_after_refine,
+                    ultrashape_conservative_mode,
                     ultrashape_checkpoint,
                     ultrashape_config_name,
                     ultrashape_dtype,
@@ -5549,6 +5626,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     export_formats,
                     ultrashape_enabled,
                     ultrashape_retexture_after_refine,
+                    ultrashape_conservative_mode,
                     ultrashape_checkpoint,
                     ultrashape_config_name,
                     ultrashape_dtype,
@@ -5828,28 +5906,103 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 value="infer_dit_refine.yaml",
                             )
                         with gr.Row():
-                            us_dtype = gr.Dropdown(["float16", "bfloat16", "float32"], label="DType", value="bfloat16")
-                            us_low_vram = gr.Checkbox(label="Low VRAM", value=True)
+                            us_dtype = gr.Dropdown(
+                                ["float16", "bfloat16", "float32"],
+                                label="DType",
+                                value="bfloat16",
+                                info="Precision mode for UltraShape inference. Lower precision usually reduces VRAM and can improve speed; float32 is typically heavier and slower.",
+                            )
+                            us_low_vram = gr.Checkbox(
+                                label="Low VRAM",
+                                value=True,
+                                info="Enable CPU offload where supported. Lower VRAM, slower runtime.",
+                            )
                             us_remove_bg = gr.Checkbox(
                                 label="Remove BG (Reference Image)",
                                 value=False,
-                                info="Applies TRELLIS rembg to the guidance image. Not required for the mesh input.",
+                                info="Applies TRELLIS rembg to the guidance image. Adds an extra preprocessing pass (more runtime, small extra memory). Not required for the mesh input.",
                             )
                         with gr.Row():
-                            us_steps = gr.Slider(10, 200, label="Steps", value=50, step=5)
-                            us_guidance_scale = gr.Slider(1.0, 15.0, label="Guidance", value=5.0, step=0.5)
-                            us_octree_resolution = gr.Slider(256, 1024, label="Octree Res", value=384, step=64)
+                            us_steps = gr.Slider(
+                                10, 200,
+                                label="Steps",
+                                value=50,
+                                step=5,
+                                info="More diffusion steps increase processing time. VRAM impact is usually modest compared with resolution/token controls.",
+                            )
+                            us_guidance_scale = gr.Slider(
+                                1.0, 15.0,
+                                label="Guidance",
+                                value=5.0,
+                                step=0.5,
+                                info="Conditioning strength. Usually has minor VRAM/runtime impact versus steps and resolution.",
+                            )
+                            us_octree_resolution = gr.Slider(
+                                256, 1024,
+                                label="Octree Res",
+                                value=384,
+                                step=64,
+                                info="Higher octree resolution increases VRAM usage and runtime during geometry decoding.",
+                            )
                         with gr.Row():
-                            us_num_chunks = gr.Slider(1000, 50000, label="Chunk Size", value=8000, step=1000)
-                            us_target_face_count = gr.Slider(100000, 2000000, label="Target Faces", value=500000, step=10000)
-                            us_num_latents = gr.Slider(0, 131072, label="Num Latents (0=cfg)", value=0, step=1024)
+                            us_num_chunks = gr.Slider(
+                                1000, 50000,
+                                label="Chunk Size",
+                                value=8000,
+                                step=1000,
+                                info="Larger chunks are usually faster but need more VRAM; smaller chunks reduce VRAM pressure but run slower.",
+                            )
+                            us_target_face_count = gr.Slider(
+                                100000, 2000000,
+                                label="Target Faces",
+                                value=500000,
+                                step=10000,
+                                info="Higher face targets increase mesh processing time and can raise memory use in later mesh operations.",
+                            )
+                            us_num_latents = gr.Slider(
+                                0, 131072,
+                                label="Num Latents (0=cfg)",
+                                value=0,
+                                step=1024,
+                                info="More latent tokens increase VRAM usage and runtime during voxel conditioning/sampling.",
+                            )
                         with gr.Row():
-                            us_box_v = gr.Slider(0.5, 2.0, label="Box V", value=1.0, step=0.1)
-                            us_mc_level = gr.Slider(-0.1, 0.1, label="MC Level", value=0.0, step=0.01)
-                            us_normalize_scale = gr.Slider(0.5, 1.0, label="Normalize Scale", value=0.99, step=0.01)
+                            us_box_v = gr.Slider(
+                                0.5, 2.0,
+                                label="Box V",
+                                value=1.0,
+                                step=0.1,
+                                info="Geometric control parameter. Usually negligible direct VRAM/runtime impact.",
+                            )
+                            us_mc_level = gr.Slider(
+                                -0.1, 0.1,
+                                label="MC Level",
+                                value=0.0,
+                                step=0.01,
+                                info="Surface threshold parameter. Usually negligible direct VRAM/runtime impact.",
+                            )
+                            us_normalize_scale = gr.Slider(
+                                0.5, 1.0,
+                                label="Normalize Scale",
+                                value=0.99,
+                                step=0.01,
+                                info="Input normalization control. Usually negligible direct VRAM/runtime impact.",
+                            )
                         with gr.Row():
-                            us_num_sharp_points = gr.Slider(10000, 500000, label="Sharp Points", value=204800, step=10000)
-                            us_num_uniform_points = gr.Slider(10000, 500000, label="Uniform Points", value=204800, step=10000)
+                            us_num_sharp_points = gr.Slider(
+                                10000, 500000,
+                                label="Sharp Points",
+                                value=204800,
+                                step=10000,
+                                info="More sharp-edge samples improve detail capture but increase sampling/voxelization runtime and memory.",
+                            )
+                            us_num_uniform_points = gr.Slider(
+                                10000, 500000,
+                                label="Uniform Points",
+                                value=204800,
+                                step=10000,
+                                info="More uniform samples improve coverage but increase sampling/voxelization runtime and memory.",
+                            )
 
                 with gr.Column(scale=2, min_width=520):
                     us_output = gr.Model3D(
@@ -6411,6 +6564,7 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         ("image_to_3d", "tex_slat_rescale_t"),
         ("image_to_3d", "ultrashape_enabled"),
         ("image_to_3d", "ultrashape_retexture_after_refine"),
+        ("image_to_3d", "ultrashape_conservative_mode"),
         ("image_to_3d", "ultrashape_checkpoint"),
         ("image_to_3d", "ultrashape_config_name"),
         ("image_to_3d", "ultrashape_dtype"),
@@ -6506,6 +6660,7 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         tex_slat_rescale_t,
         ultrashape_enabled,
         ultrashape_retexture_after_refine,
+        ultrashape_conservative_mode,
         ultrashape_checkpoint,
         ultrashape_config_name,
         ultrashape_dtype,

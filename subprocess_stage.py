@@ -1301,6 +1301,7 @@ def stage_extract_ultrashape_refine(payload: Dict[str, Any]) -> Dict[str, Any]:
             num_uniform_points=int(ultrashape_cfg.get("num_uniform_points", 204800)),
             num_latents=int(ultrashape_cfg.get("num_latents", 0)),
             target_face_count=int(ultrashape_cfg.get("target_face_count", 500000)),
+            conservative_mode=bool(ultrashape_cfg.get("conservative_mode", True)),
             enable_pbar=True,
         )
         _save_mesh_blob(mesh_blob_out, refined)
@@ -1573,6 +1574,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
                     num_uniform_points=int(ultrashape_cfg.get("num_uniform_points", 204800)),
                     num_latents=int(ultrashape_cfg.get("num_latents", 0)),
                     target_face_count=int(ultrashape_cfg.get("target_face_count", 500000)),
+                    conservative_mode=bool(ultrashape_cfg.get("conservative_mode", True)),
                     enable_pbar=True,
                 )
                 print(
@@ -1773,6 +1775,7 @@ def stage_ultrashape_refine_mesh(payload: Dict[str, Any]) -> Dict[str, Any]:
         num_uniform_points=int(payload.get("num_uniform_points", 204800)),
         num_latents=int(payload.get("num_latents", 0)),
         target_face_count=int(payload.get("target_face_count", 500000)),
+        conservative_mode=bool(payload.get("conservative_mode", True)),
         enable_pbar=True,
     )
 

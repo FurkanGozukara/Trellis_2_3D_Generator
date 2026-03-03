@@ -87,6 +87,28 @@ def _outside_ratio(vertices: np.ndarray, bmin: np.ndarray, bmax: np.ndarray, pad
     return float(np.mean(outside))
 
 
+def _conservative_surface_snap_blend(
+    vertices: np.ndarray,
+    source_mesh: trimesh.Trimesh,
+    *,
+    blend: float = 0.20,
+) -> tuple[np.ndarray, str]:
+    """
+    Pull refined vertices slightly toward the source mesh surface to reduce large topology drift.
+    Falls back gracefully if trimesh proximity backends are unavailable.
+    """
+    alpha = float(max(0.0, min(1.0, blend)))
+    if alpha <= 0.0:
+        return vertices, "blend=0.0 (disabled)"
+    try:
+        pq = trimesh.proximity.ProximityQuery(source_mesh)
+        closest, _, _ = pq.on_surface(vertices)
+        out = vertices * (1.0 - alpha) + np.asarray(closest, dtype=np.float32) * alpha
+        return out.astype(np.float32), f"applied nearest-surface blend alpha={alpha:.2f}"
+    except Exception as e:
+        return vertices, f"surface-snap unavailable ({type(e).__name__}: {e})"
+
+
 def _candidate_ultrashape_roots(app_dir: Path) -> list[Path]:
     return [
         app_dir / "UltraShape-1.0",
@@ -171,6 +193,7 @@ def refine_mesh_with_ultrashape(
     num_uniform_points: int = 204800,
     num_latents: int = 0,
     target_face_count: int = 500000,
+    conservative_mode: bool = True,
     enable_pbar: bool = False,
 ) -> trimesh.Trimesh:
     def _ulog(msg: str) -> None:
@@ -292,6 +315,21 @@ def refine_mesh_with_ultrashape(
     denorm_center, denorm_inv_scale = _mesh_denorm_params(mesh_tri, float(normalize_scale))
     _ulog(f"Input mesh prepared (v={len(mesh_tri.vertices)}, f={len(mesh_tri.faces)}).")
 
+    # Conservative mode: keep refinement closer to TRELLIS shape/texture alignment.
+    if bool(conservative_mode):
+        in_steps = int(steps)
+        in_guidance = float(guidance_scale)
+        in_faces = int(target_face_count)
+        steps = min(int(steps), 35)
+        guidance_scale = min(float(guidance_scale), 4.0)
+        target_face_count = min(int(target_face_count), 400000)
+        _ulog(
+            "Conservative mode ON: "
+            f"steps {in_steps}->{int(steps)}, "
+            f"guidance {in_guidance:.2f}->{float(guidance_scale):.2f}, "
+            f"target_faces {in_faces}->{int(target_face_count)}."
+        )
+
     loader = SharpEdgeSurfaceLoader(
         num_sharp_points=int(num_sharp_points),
         num_uniform_points=int(num_uniform_points),
@@ -396,6 +434,15 @@ def refine_mesh_with_ultrashape(
             rv = _fit_vertices_per_axis_to_bounds(rv, orig_min, orig_max)
             out_ratio = _outside_ratio(rv, orig_min, orig_max, pad_ratio=0.02)
         _ulog(f"Bounds check after alignment: outside ratio={out_ratio:.2%}.")
+        if bool(conservative_mode):
+            rv, snap_msg = _conservative_surface_snap_blend(rv, mesh_tri, blend=0.20)
+            _ulog(f"Conservative mode: {snap_msg}.")
+            rv = _fit_vertices_uniform_to_bounds(rv, orig_min, orig_max)
+            out_ratio2 = _outside_ratio(rv, orig_min, orig_max, pad_ratio=0.02)
+            if out_ratio2 > 0.03:
+                rv = _fit_vertices_per_axis_to_bounds(rv, orig_min, orig_max)
+                out_ratio2 = _outside_ratio(rv, orig_min, orig_max, pad_ratio=0.02)
+            _ulog(f"Conservative mode bounds check: outside ratio={out_ratio2:.2%}.")
         refined = trimesh.Trimesh(vertices=rv, faces=refined.faces, process=False)
         _ulog(
             f"Refined mesh denormalized to TRELLIS space (inv_scale={denorm_inv_scale:.6f})."
