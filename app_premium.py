@@ -3,7 +3,8 @@ import gradio as gr
 import argparse
 import os
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+if "PYTORCH_ALLOC_CONF" not in os.environ and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 
 import sys
 import subprocess
@@ -78,7 +79,11 @@ import trimesh
 from PIL import Image
 
 from trellis2.modules.sparse import SparseTensor
-from trellis2.pipelines import Trellis2ImageTo3DPipeline, Trellis2TexturingPipeline
+from trellis2.pipelines import (
+    Trellis2ImageTo3DPipeline,
+    Trellis2MultiViewPipeline,
+    Trellis2TexturingPipeline,
+)
 from trellis2.renderers import EnvMap
 from trellis2.utils import render_utils
 import o_voxel
@@ -457,10 +462,35 @@ empty_html = """
 </div>
 """
 
+APP_THEME = gr.themes.Soft(
+    primary_hue="indigo",
+    secondary_hue="sky",
+    neutral_hue="slate",
+    radius_size="lg",
+    font=(
+        "'Segoe UI Variable Display'",
+        "'Segoe UI Variable'",
+        "'Segoe UI'",
+        "'Inter'",
+        "ui-sans-serif",
+        "system-ui",
+        "sans-serif",
+    ),
+    font_mono=(
+        "'Cascadia Mono'",
+        "'Cascadia Code'",
+        "'JetBrains Mono'",
+        "'Consolas'",
+        "ui-monospace",
+        "monospace",
+    ),
+)
+
 
 # ------------------------------- Model Loading ------------------------------
 
 _image_pipeline = None
+_multiview_pipeline = None
 _texturing_pipeline = None
 _envmap = None
 _mode_icons_ready = False
@@ -581,12 +611,30 @@ def _default_ui_config() -> dict:
             "shape_slat_sampling_steps": 12,
             "shape_slat_rescale_t": 3.0,
             "max_num_tokens": 49152,  # Restored to original for quality (was 32768)
+            "multiview_mode": "stochastic",
             "tex_slat_guidance_strength": 1.0,
             "tex_slat_guidance_rescale": 0.0,
             "tex_slat_guidance_interval_start": 0.6,  # Model default: CFG in middle 30% range
             "tex_slat_guidance_interval_end": 0.9,
             "tex_slat_sampling_steps": 12,
             "tex_slat_rescale_t": 3.0,
+            "ultrashape_enabled": True,
+            "ultrashape_checkpoint": "",
+            "ultrashape_config_name": "infer_dit_refine.yaml",
+            "ultrashape_dtype": "bfloat16",
+            "ultrashape_low_vram": True,
+            "ultrashape_remove_bg": False,
+            "ultrashape_steps": 50,
+            "ultrashape_guidance_scale": 5.0,
+            "ultrashape_octree_resolution": 384,
+            "ultrashape_num_chunks": 8000,
+            "ultrashape_target_face_count": 500000,
+            "ultrashape_num_latents": 0,
+            "ultrashape_box_v": 1.0,
+            "ultrashape_mc_level": 0.0,
+            "ultrashape_normalize_scale": 0.99,
+            "ultrashape_num_sharp_points": 204800,
+            "ultrashape_num_uniform_points": 204800,
         },
         "texturing": {
             "resolution": "1024",
@@ -601,12 +649,35 @@ def _default_ui_config() -> dict:
             "sampling_steps": 12,
             "rescale_t": 3.0,
         },
+        "ultrashape_refine": {
+            "seed": 99,
+            "randomize_seed": False,
+            "output_format": "glb",
+            "export_formats": ["glb"],
+            "checkpoint": "",
+            "config_name": "infer_dit_refine.yaml",
+            "dtype": "bfloat16",
+            "low_vram": True,
+            "remove_bg": False,
+            "steps": 50,
+            "guidance_scale": 5.0,
+            "octree_resolution": 384,
+            "num_chunks": 8000,
+            "target_face_count": 500000,
+            "num_latents": 0,
+            "box_v": 1.0,
+            "mc_level": 0.0,
+            "normalize_scale": 0.99,
+            "num_sharp_points": 204800,
+            "num_uniform_points": 204800,
+        },
         "rigging": {
             "seed": 12345,
             "randomize_seed": False,
             "skeleton_task": "configs/task/quick_inference_skeleton_articulationxl_ar_256.yaml",
             "skin_task": "configs/task/quick_inference_unirig_skin.yaml",
             "export_format": "fbx",  # or "glb"
+            "export_both_formats": True,
             "faces_target_count": 50000,
             "enable_skinning": True,
             "auto_merge": True,
@@ -626,7 +697,7 @@ def _merge_ui_config(cfg: Optional[dict]) -> dict:
     if isinstance(meta, dict):
         base["_meta"].update(meta)
 
-    for section in ("global", "image_to_3d", "texturing", "rigging"):
+    for section in ("global", "image_to_3d", "texturing", "ultrashape_refine", "rigging"):
         section_data = cfg.get(section)
         if isinstance(section_data, dict):
             base[section].update(section_data)
@@ -865,12 +936,31 @@ def _get_envmap():
 
 
 def get_image_pipeline():
-    global _image_pipeline
+    global _image_pipeline, _multiview_pipeline
     if _image_pipeline is None:
+        if _multiview_pipeline is not None:
+            _multiview_pipeline.cpu()
+            del _multiview_pipeline
+            _multiview_pipeline = None
+            torch.cuda.empty_cache()
         _image_pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
         _image_pipeline.low_vram = False  # Keep models in VRAM for best quality and speed
         _image_pipeline.cuda()
     return _image_pipeline
+
+
+def get_multiview_pipeline():
+    global _image_pipeline, _multiview_pipeline
+    if _multiview_pipeline is None:
+        if _image_pipeline is not None:
+            _image_pipeline.cpu()
+            del _image_pipeline
+            _image_pipeline = None
+            torch.cuda.empty_cache()
+        _multiview_pipeline = Trellis2MultiViewPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
+        _multiview_pipeline.low_vram = False  # Keep models in VRAM for best quality and speed
+        _multiview_pipeline.cuda()
+    return _multiview_pipeline
 
 
 def get_texturing_pipeline():
@@ -886,7 +976,7 @@ def get_texturing_pipeline():
 
 def unload_global_pipelines():
     """Unload any global pipelines to free VRAM before subprocess mode."""
-    global _image_pipeline, _texturing_pipeline
+    global _image_pipeline, _multiview_pipeline, _texturing_pipeline
     import gc
 
     if _image_pipeline is not None:
@@ -894,6 +984,12 @@ def unload_global_pipelines():
         _image_pipeline.cpu()
         del _image_pipeline
         _image_pipeline = None
+
+    if _multiview_pipeline is not None:
+        print("[main] Unloading global multi-view pipeline to free VRAM...", flush=True)
+        _multiview_pipeline.cpu()
+        del _multiview_pipeline
+        _multiview_pipeline = None
 
     if _texturing_pipeline is not None:
         print("[main] Unloading global texturing pipeline to free VRAM...", flush=True)
@@ -2119,12 +2215,30 @@ def batch_process_folder(
     tex_slat_rescale_t: float,
     no_texture_gen: bool,
     max_num_tokens: int,
+    multiview_mode: str,
     decimation_target: int,
     texture_size: int,
     remesh_method: str,
     simplify_method: str,
     prune_invisible_faces: bool,
     export_formats: List[str],
+    ultrashape_enabled: bool,
+    ultrashape_checkpoint: str,
+    ultrashape_config_name: str,
+    ultrashape_dtype: str,
+    ultrashape_low_vram: bool,
+    ultrashape_remove_bg: bool,
+    ultrashape_steps: int,
+    ultrashape_guidance_scale: float,
+    ultrashape_octree_resolution: int,
+    ultrashape_num_chunks: int,
+    ultrashape_target_face_count: int,
+    ultrashape_num_latents: int,
+    ultrashape_box_v: float,
+    ultrashape_mc_level: float,
+    ultrashape_normalize_scale: float,
+    ultrashape_num_sharp_points: int,
+    ultrashape_num_uniform_points: int,
     subprocess_mode: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
@@ -2257,6 +2371,7 @@ def batch_process_folder(
                 state: Optional[dict] = None
                 for s, _html, _st in image_to_3d(
                     pil_img,
+                    None,
                     int(run_seed),
                     resolution,
                     custom_resolution,
@@ -2284,6 +2399,7 @@ def batch_process_folder(
                     tex_slat_rescale_t,
                     no_texture_gen,
                     max_num_tokens,
+                    multiview_mode,
                     subprocess_mode,
                     req,
                     skip_preview=True,
@@ -2315,6 +2431,23 @@ def batch_process_folder(
                     export_formats,
                     use_chunked_processing,
                     use_tiled_extraction,
+                    ultrashape_enabled,
+                    ultrashape_checkpoint,
+                    ultrashape_config_name,
+                    ultrashape_dtype,
+                    ultrashape_low_vram,
+                    ultrashape_remove_bg,
+                    ultrashape_steps,
+                    ultrashape_guidance_scale,
+                    ultrashape_octree_resolution,
+                    ultrashape_num_chunks,
+                    ultrashape_target_face_count,
+                    ultrashape_num_latents,
+                    ultrashape_box_v,
+                    ultrashape_mc_level,
+                    ultrashape_normalize_scale,
+                    ultrashape_num_sharp_points,
+                    ultrashape_num_uniform_points,
                     subprocess_mode,
                     req=req,
                     progress=_scaled_progress,
@@ -2427,6 +2560,31 @@ def preprocess_image_capture_raw(
     raw = image.copy()
     processed = preprocess_image(image, subprocess_mode, req, progress)
     return processed, raw
+
+
+def _coerce_uploaded_file_to_path(file_obj: Any) -> Optional[str]:
+    if file_obj is None:
+        return None
+    if isinstance(file_obj, str):
+        return file_obj
+    if isinstance(file_obj, dict):
+        return file_obj.get("path") or file_obj.get("name")
+    return getattr(file_obj, "name", None) or str(file_obj)
+
+
+def _coerce_uploaded_files_to_paths(files_obj: Any) -> List[str]:
+    if not files_obj:
+        return []
+    if isinstance(files_obj, (str, dict)):
+        files = [files_obj]
+    else:
+        files = list(files_obj)
+    out: List[str] = []
+    for item in files:
+        p = _coerce_uploaded_file_to_path(item)
+        if p:
+            out.append(str(p))
+    return out
 
 
 # ------------------------------- Preview Rendering ---------------------------
@@ -2609,6 +2767,7 @@ def _get_pipeline_type(resolution_str: str) -> tuple[str, int]:
 
 def image_to_3d(
     image: Image.Image,
+    multi_view_files: Optional[List[Any]],
     seed: int,
     resolution: str,
     custom_resolution: int,
@@ -2636,6 +2795,7 @@ def image_to_3d(
     tex_slat_rescale_t: float,
     no_texture_gen: bool,
     max_num_tokens: int,
+    multiview_mode: str,
     subprocess_mode: bool,
     req: gr.Request,
     skip_preview: bool = False,
@@ -2669,6 +2829,22 @@ def image_to_3d(
     if image is None:
         raise gr.Error("Please provide an image (upload or pick an example).")
 
+    mv_mode = str(multiview_mode or "stochastic").strip().lower()
+    if mv_mode not in {"stochastic", "multidiffusion"}:
+        mv_mode = "stochastic"
+
+    # Optional extra views for multi-view generation.
+    # Main image is always view #1.
+    source_images: List[Image.Image] = [image.convert("RGBA")]
+    extra_view_paths = _coerce_uploaded_files_to_paths(multi_view_files)
+    for p in extra_view_paths:
+        try:
+            with Image.open(str(p)) as im:
+                source_images.append(im.convert("RGBA").copy())
+        except Exception as e:
+            raise gr.Error(f"Could not read multi-view image: {p} ({type(e).__name__}: {e})")
+    use_multiview = len(source_images) > 1
+
     # Handle custom resolution override
     if custom_resolution and custom_resolution > 0:
         resolution = str(custom_resolution)
@@ -2691,13 +2867,34 @@ def image_to_3d(
     input_path = run_dir / "00_input.png"
     preprocessed_path = run_dir / "01_preprocessed.png"
     try:
-        image.save(str(input_path))
+        source_images[0].save(str(input_path))
     except Exception:
         # Don't fail the run just because saving failed; continue.
         pass
+    if use_multiview:
+        for i, img in enumerate(source_images[1:], start=2):
+            try:
+                img.save(str(run_dir / f"00_input_view{i:02d}.png"))
+            except Exception:
+                pass
 
     _log(f"Starting Image → 3D generation (resolution: {resolution}, pipeline: {pipeline_type})…", 0.0)
+    if use_multiview:
+        _log(
+            f"Multi-view input detected: {len(source_images)} views (mode={mv_mode}). "
+            "View #1 is the main Image Prompt.",
+            0.0,
+        )
     yield None, empty_html, gr.update(value=_trim_status(status), visible=True)
+
+    if subprocess_mode and use_multiview:
+        _log(
+            "Subprocess mode is not yet wired for multi-view generation. "
+            "Falling back to in-process for this run.",
+            0.01,
+        )
+        subprocess_mode = False
+        yield None, empty_html, status
 
     if subprocess_mode:
         # Unload any global pipelines to free VRAM for subprocess
@@ -2955,7 +3152,10 @@ def image_to_3d(
                 "_mode": "subprocess",
                 "_run_id": run_id,
                 "_run_dir": str(run_dir),
+                "_input_image_path": str(input_path),
+                "_preprocessed_image_path": str(preprocessed_path),
                 "_pipeline_type": pipeline_type,
+                "seed": int(seed),
                 "res": int(res),
                 "shape_slat_path": str(shape_slat_path),
                 "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
@@ -3047,7 +3247,10 @@ def image_to_3d(
             "_mode": "subprocess",
             "_run_id": run_id,
             "_run_dir": str(run_dir),
+            "_input_image_path": str(input_path),
+            "_preprocessed_image_path": str(preprocessed_path),
             "_pipeline_type": pipeline_type,
+            "seed": int(seed),
             "res": int(res),
             "shape_slat_path": str(shape_slat_path),
             "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
@@ -3058,8 +3261,12 @@ def image_to_3d(
         yield state, full_html, gr.update(value=_trim_status(status), visible=False)
         return
 
-    _log("Loading TRELLIS.2 pipeline (first run can take a while)…", 0.01)
-    pipe = get_image_pipeline()
+    if use_multiview:
+        _log("Loading TRELLIS.2 multi-view pipeline (first run can take a while)…", 0.01)
+        pipe = get_multiview_pipeline()
+    else:
+        _log("Loading TRELLIS.2 pipeline (first run can take a while)…", 0.01)
+        pipe = get_image_pipeline()
     yield None, empty_html, status
 
     pbr_supported = _has_nvdiffrec_render()
@@ -3110,14 +3317,211 @@ def image_to_3d(
     }
 
     # Preprocess (rembg + crop) at generate-time so examples/uploads behave consistently.
-    _log("Preprocessing image (background removal / crop)…", 0.06)
-    image = pipe.preprocess_image(image)
-    try:
-        image.save(str(preprocessed_path))
-    except Exception:
-        pass
+    preprocessed_views: List[Image.Image] = []
+    n_views = len(source_images)
+    if use_multiview:
+        _log(f"Preprocessing {n_views} views (background removal / crop)…", 0.06)
+    else:
+        _log("Preprocessing image (background removal / crop)…", 0.06)
+    for i, src in enumerate(source_images, start=1):
+        if use_multiview:
+            p = 0.06 + 0.02 * ((i - 1) / max(1, n_views - 1))
+            _log(f"Preprocessing view {i}/{n_views}…", p)
+        out = pipe.preprocess_image(src)
+        preprocessed_views.append(out)
+        try:
+            if i == 1:
+                out.save(str(preprocessed_path))
+            else:
+                out.save(str(run_dir / f"01_preprocessed_view{i:02d}.png"))
+        except Exception:
+            pass
+    image = preprocessed_views[0]
+    yield None, empty_html, status
 
-    # Run the pipeline step-by-step so we can update status between stages.
+    mesh = None
+    if use_multiview:
+        _log(f"Running multi-view generation ({n_views} views, mode={mv_mode})…", 0.18)
+        mv_out, latent = pipe.run_multi_image(
+            preprocessed_views,
+            num_samples=1,
+            seed=int(seed),
+            sparse_structure_sampler_params=ss_params,
+            shape_slat_sampler_params=shape_params,
+            tex_slat_sampler_params=tex_params,
+            preprocess_image=False,
+            return_latent=True,
+            pipeline_type=pipeline_type,
+            max_num_tokens=int(max_num_tokens),
+            mode=mv_mode,
+            no_texture_gen=bool(no_texture_gen),
+        )
+        mesh = mv_out[0] if isinstance(mv_out, list) else mv_out
+        shape_slat, tex_slat, res = latent
+        _log("Multi-view latent sampling complete.", 0.62)
+        yield None, empty_html, status
+
+        # Save latents for inspection / later extraction.
+        try:
+            np.savez_compressed(
+                str(shape_slat_path),
+                feats=shape_slat.feats.detach().cpu().numpy(),
+                coords=shape_slat.coords.detach().cpu().numpy(),
+            )
+            _write_json(
+                str(shape_res_path),
+                {
+                    "res": int(res),
+                    "pipeline_type": pipeline_type,
+                    "multiview": True,
+                    "view_count": int(n_views),
+                    "multiview_mode": mv_mode,
+                },
+            )
+            if tex_slat is not None and tex_slat_path is not None:
+                np.savez_compressed(
+                    str(tex_slat_path),
+                    feats=tex_slat.feats.detach().cpu().numpy(),
+                    coords=tex_slat.coords.detach().cpu().numpy(),
+                )
+        except Exception:
+            pass
+
+        # run_multi_image already decodes; only re-decode when user explicitly requested decode options.
+        if use_tiled_extraction or use_chunked_processing:
+            _log("Applying decode settings to multiview latents…", 0.75)
+            mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
+            yield None, empty_html, status
+        else:
+            _log("Using multiview decoded mesh.", 0.75)
+            yield None, empty_html, status
+
+        _log("Simplifying mesh…", 0.82)
+        mesh.simplify(16777216)  # nvdiffrast limit
+        yield None, empty_html, status
+
+        _log("Rendering preview snapshots…", 0.88)
+        try:
+            images = _render_preview_snapshots_incremental(
+                mesh,
+                resolution=1024,
+                r=2,
+                fov=36,
+                nviews=STEPS,
+                envmap=envmap,
+                pbr_supported=pbr_supported,
+                progress=progress,
+                log_fn=_log,
+            )
+        except Exception as e:
+            _log(f"Preview rendering failed ({type(e).__name__}: {e}). Continuing without preview.", 0.92)
+            images = {m["render_key"]: [np.zeros((1024, 1024, 3), dtype=np.uint8) for _ in range(STEPS)] for m in MODES}
+        yield None, empty_html, status
+
+        # Save preview frames to disk + manifest.
+        try:
+            preview_dir.mkdir(parents=True, exist_ok=True)
+            manifest_files: Dict[str, List[str]] = {}
+            for m_idx, mode in enumerate(MODES):
+                key = mode["render_key"]
+                manifest_files[key] = []
+                for s_idx in range(STEPS):
+                    path = preview_dir / f"view-m{m_idx}-s{s_idx}.jpg"
+                    Image.fromarray(images[key][s_idx]).save(str(path), format="JPEG", quality=85)
+                    manifest_files[key].append(str(path))
+            _write_json(
+                str(preview_manifest_path),
+                {
+                    "modes": [{"name": m["name"], "render_key": m["render_key"]} for m in MODES],
+                    "steps": STEPS,
+                    "files": manifest_files,
+                },
+            )
+        except Exception:
+            pass
+
+        _log("Packing generation state (for GLB extraction)…", 0.93)
+        state = pack_state((shape_slat, tex_slat, res))
+        torch.cuda.empty_cache()
+        yield None, empty_html, status
+
+        _log("Building preview UI…", 0.97)
+        images_html = ""
+        for m_idx, mode in enumerate(MODES):
+            for s_idx in range(STEPS):
+                p = 0.97 + 0.02 * ((m_idx * STEPS + s_idx) / max(1, (len(MODES) * STEPS - 1)))
+                progress(p, desc="Building preview UI…")
+                unique_id = f"view-m{m_idx}-s{s_idx}"
+                is_visible = (m_idx == DEFAULT_MODE and s_idx == DEFAULT_STEP)
+                vis_class = "visible" if is_visible else ""
+                img_base64 = _image_to_base64(Image.fromarray(images[mode["render_key"]][s_idx]))
+                images_html += f"""
+                    <img id="{unique_id}"
+                         class="previewer-main-image {vis_class}"
+                         src="{img_base64}"
+                         loading="eager">
+                """
+
+        btns_html = ""
+        for idx, mode in enumerate(MODES):
+            active_class = "active" if idx == DEFAULT_MODE else ""
+            btns_html += f"""
+                <img src="{mode['icon_base64']}"
+                     class="mode-btn {active_class}"
+                     onclick="selectMode({idx})"
+                     title="{mode['name']}">
+            """
+
+        full_html = f"""
+        <div class="previewer-container">
+            <div class="tips-wrapper">
+                <div class="tips-icon">Tips</div>
+                <div class="tips-text">
+                    <p>● <b>Render Mode</b> — Click a circular button to switch render modes.</p>
+                    <p>● <b>View Angle</b> — Drag the slider to change view angle.</p>
+                </div>
+            </div>
+
+            <div class="display-row">
+                {images_html}
+            </div>
+
+            <div class="mode-row" id="btn-group">
+                {btns_html}
+            </div>
+
+            <div class="slider-row">
+                <input type="range" id="custom-slider" min="0" max="{STEPS - 1}" value="{DEFAULT_STEP}" step="1" oninput="onSliderChange(this.value)">
+            </div>
+        </div>
+        """
+
+        try:
+            preview_html_path.write_text(full_html, encoding="utf-8")
+        except Exception:
+            pass
+        try:
+            state["_mode"] = "inproc"
+            state["_run_id"] = run_id
+            state["_run_dir"] = str(run_dir)
+            state["_input_image_path"] = str(input_path)
+            state["_preprocessed_image_path"] = str(preprocessed_path)
+            state["_pipeline_type"] = pipeline_type
+            state["seed"] = int(seed)
+            state["shape_slat_path"] = str(shape_slat_path)
+            state["tex_slat_path"] = str(tex_slat_path) if tex_slat_path is not None else None
+            state["preview_manifest_path"] = str(preview_manifest_path)
+            state["_multiview"] = True
+            state["_multiview_mode"] = mv_mode
+            state["_multiview_count"] = int(n_views)
+        except Exception:
+            pass
+
+        _log("Done. You can now click “Extract GLB”.", 1.0)
+        yield state, full_html, gr.update(value=_trim_status(status), visible=False)
+        return
+
+    # Single-view path keeps explicit stage-by-stage sampling for granular progress.
     images = [image]
     torch.manual_seed(seed)
 
@@ -3339,7 +3743,10 @@ def image_to_3d(
         state["_mode"] = "inproc"
         state["_run_id"] = run_id
         state["_run_dir"] = str(run_dir)
+        state["_input_image_path"] = str(input_path)
+        state["_preprocessed_image_path"] = str(preprocessed_path)
         state["_pipeline_type"] = pipeline_type
+        state["seed"] = int(seed)
         state["shape_slat_path"] = str(shape_slat_path)
         state["tex_slat_path"] = str(tex_slat_path) if tex_slat_path is not None else None
         state["preview_manifest_path"] = str(preview_manifest_path)
@@ -3362,6 +3769,23 @@ def extract_glb(
     export_formats: List[str],
     extract_use_chunked_processing: bool,
     extract_use_tiled_extraction: bool,
+    ultrashape_enabled: bool,
+    ultrashape_checkpoint: str,
+    ultrashape_config_name: str,
+    ultrashape_dtype: str,
+    ultrashape_low_vram: bool,
+    ultrashape_remove_bg: bool,
+    ultrashape_steps: int,
+    ultrashape_guidance_scale: float,
+    ultrashape_octree_resolution: int,
+    ultrashape_num_chunks: int,
+    ultrashape_target_face_count: int,
+    ultrashape_num_latents: int,
+    ultrashape_box_v: float,
+    ultrashape_mc_level: float,
+    ultrashape_normalize_scale: float,
+    ultrashape_num_sharp_points: int,
+    ultrashape_num_uniform_points: int,
     subprocess_mode: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
@@ -3422,6 +3846,7 @@ def extract_glb(
             "model_repo": "microsoft/TRELLIS.2-4B",
             "shape_slat_path": str(shape_slat_path),
             "tex_slat_path": str(tex_slat_path) if tex_slat_path else None,
+            "preprocessed_image_path": state.get("_preprocessed_image_path") or state.get("_input_image_path"),
             "res": int(res),
             "decimation_target": int(decimation_target),
             "texture_size": int(texture_size),
@@ -3434,6 +3859,27 @@ def extract_glb(
             "export_formats": list(export_formats),
             "extract_use_chunked_processing": bool(extract_use_chunked_processing),
             "extract_use_tiled_extraction": bool(extract_use_tiled_extraction),
+            "ultrashape": {
+                "enabled": bool(ultrashape_enabled),
+                "image_path": state.get("_preprocessed_image_path") or state.get("_input_image_path"),
+                "checkpoint": str(ultrashape_checkpoint or "").strip(),
+                "config_name": str(ultrashape_config_name or "infer_dit_refine.yaml").strip(),
+                "dtype": str(ultrashape_dtype or "bfloat16").strip(),
+                "low_vram": bool(ultrashape_low_vram),
+                "remove_bg": bool(ultrashape_remove_bg),
+                "steps": int(ultrashape_steps),
+                "guidance_scale": float(ultrashape_guidance_scale),
+                "octree_resolution": int(ultrashape_octree_resolution),
+                "num_chunks": int(ultrashape_num_chunks),
+                "target_face_count": int(ultrashape_target_face_count),
+                "num_latents": int(ultrashape_num_latents),
+                "box_v": float(ultrashape_box_v),
+                "mc_level": float(ultrashape_mc_level),
+                "normalize_scale": float(ultrashape_normalize_scale),
+                "num_sharp_points": int(ultrashape_num_sharp_points),
+                "num_uniform_points": int(ultrashape_num_uniform_points),
+                "seed": int(state.get("seed", 42) if isinstance(state, dict) else 42),
+            },
         }
 
         last_ui_update = 0.0
@@ -3500,6 +3946,52 @@ def extract_glb(
     _log("Decoding latent to mesh…", 0.15)
     mesh = pipe.decode_latent(shape_slat, tex_slat, res, extract_use_tiled_extraction, extract_use_chunked_processing)[0]
     yield None, None, status
+
+    if ultrashape_enabled:
+        image_path = state.get("_preprocessed_image_path") or state.get("_input_image_path")
+        image_file = Path(str(image_path)) if image_path else None
+        if image_file is None or not image_file.is_file():
+            _log("UltraShape enabled, but no valid reference image path was found. Skipping UltraShape.", 0.22)
+            yield None, None, status
+        else:
+            _log("Running UltraShape mesh refinementâ€¦", 0.24)
+            try:
+                from ultrashape_integration import refine_mesh_with_ultrashape
+
+                mesh = refine_mesh_with_ultrashape(
+                    mesh,
+                    image_path=str(image_file),
+                    app_dir=str(APP_DIR),
+                    models_dir=str(MODELS_DIR),
+                    checkpoint=str(ultrashape_checkpoint or "").strip(),
+                    config_name=str(ultrashape_config_name or "infer_dit_refine.yaml").strip(),
+                    dtype=str(ultrashape_dtype or "bfloat16").strip(),
+                    low_vram=bool(ultrashape_low_vram),
+                    steps=int(ultrashape_steps),
+                    guidance_scale=float(ultrashape_guidance_scale),
+                    octree_resolution=int(ultrashape_octree_resolution),
+                    num_chunks=int(ultrashape_num_chunks),
+                    mc_level=float(ultrashape_mc_level),
+                    box_v=float(ultrashape_box_v),
+                    seed=int(state.get("seed", 42)),
+                    remove_bg=bool(ultrashape_remove_bg),
+                    normalize_scale=float(ultrashape_normalize_scale),
+                    num_sharp_points=int(ultrashape_num_sharp_points),
+                    num_uniform_points=int(ultrashape_num_uniform_points),
+                    num_latents=int(ultrashape_num_latents),
+                    target_face_count=int(ultrashape_target_face_count),
+                    enable_pbar=True,
+                )
+                _log(
+                    f"UltraShape refinement complete (vertices={len(mesh.vertices)}, faces={len(mesh.faces)}).",
+                    0.28,
+                )
+            except Exception as e:
+                _log(
+                    f"UltraShape refinement failed ({type(e).__name__}: {e}). Continuing with base TRELLIS mesh.",
+                    0.28,
+                )
+            yield None, None, status
 
     _log("Post-processing + baking GLB (this can take a while)…", 0.3)
     yield None, None, status
@@ -3902,35 +4394,249 @@ def shapeimage_to_tex(
     yield glb_path, glb_path, status
 
 
+def _coerce_file_to_path(f: Any) -> Optional[str]:
+    if f is None:
+        return None
+    if isinstance(f, str):
+        return f
+    if isinstance(f, dict):
+        return f.get("name") or f.get("path")
+    return getattr(f, "name", None) or str(f)
+
+
+def ultrashape_refine_mesh(
+    mesh_file: Any,
+    image: Image.Image,
+    seed: int,
+    output_format: str,
+    export_formats: List[str],
+    checkpoint: str,
+    config_name: str,
+    dtype: str,
+    low_vram: bool,
+    remove_bg: bool,
+    steps: int,
+    guidance_scale: float,
+    octree_resolution: int,
+    num_chunks: int,
+    target_face_count: int,
+    num_latents: int,
+    box_v: float,
+    mc_level: float,
+    normalize_scale: float,
+    num_sharp_points: int,
+    num_uniform_points: int,
+    subprocess_mode: bool,
+    req: gr.Request,
+    progress=gr.Progress(track_tqdm=True),
+) -> Tuple[Optional[str], Optional[str], str]:
+    status = ""
+    session = _session_key(req)
+
+    def _log(msg: str, p: Optional[float] = None) -> str:
+        nonlocal status
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        status = (status + "\n" if status else "") + line
+        print(line, flush=True)
+        if p is not None:
+            progress(p, desc=msg)
+        return status
+
+    mesh_path = _coerce_file_to_path(mesh_file)
+    if not mesh_path:
+        raise gr.Error("Please upload a mesh file.")
+    if image is None:
+        raise gr.Error("Please provide a reference image.")
+
+    src_mesh = Path(mesh_path)
+    if not src_mesh.is_file():
+        raise gr.Error(f"Mesh file not found: {mesh_path}")
+
+    out_fmt = str(output_format or "glb").lower().strip()
+    if out_fmt not in {"glb", "obj", "ply", "stl"}:
+        out_fmt = "glb"
+    ex_fmts = export_formats or [out_fmt]
+    ex_fmts = [str(x).lower().strip() for x in ex_fmts if str(x).lower().strip() in {"glb", "obj", "ply", "stl"}]
+    if out_fmt not in ex_fmts:
+        ex_fmts = [out_fmt] + ex_fmts
+
+    run = allocate_run_dir(OUTPUTS_DIR, digits=4)
+    run_dir = run.run_dir
+    run_id = run.run_id
+    out_dir = run_dir / "08_ultrashape_refine"
+
+    mesh_copy = run_dir / f"00_mesh{src_mesh.suffix.lower() or '.ply'}"
+    try:
+        shutil.copyfile(str(src_mesh), str(mesh_copy))
+    except Exception:
+        mesh_copy = src_mesh
+
+    img_path = run_dir / "01_reference.png"
+    try:
+        image.save(str(img_path))
+    except Exception:
+        pass
+
+    _write_json(
+        str(run_dir / "run.json"),
+        {
+            "run_id": run_id,
+            "type": "ultrashape_refine",
+            "subprocess_mode": bool(subprocess_mode),
+            "seed": int(seed),
+            "output_format": out_fmt,
+            "export_formats": list(ex_fmts),
+            "checkpoint": str(checkpoint or "").strip(),
+            "config_name": str(config_name or "infer_dit_refine.yaml").strip(),
+            "dtype": str(dtype or "bfloat16").strip(),
+            "low_vram": bool(low_vram),
+            "remove_bg": bool(remove_bg),
+            "steps": int(steps),
+            "guidance_scale": float(guidance_scale),
+            "octree_resolution": int(octree_resolution),
+            "num_chunks": int(num_chunks),
+            "target_face_count": int(target_face_count),
+            "num_latents": int(num_latents),
+            "box_v": float(box_v),
+            "mc_level": float(mc_level),
+            "normalize_scale": float(normalize_scale),
+            "num_sharp_points": int(num_sharp_points),
+            "num_uniform_points": int(num_uniform_points),
+        },
+    )
+
+    _log(f"Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.0)
+    yield None, None, status
+
+    if subprocess_mode:
+        unload_global_pipelines()
+        work_dir = Path(TMP_DIR) / str(req.session_hash) / "subprocess" / run_id
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "mesh_path": str(mesh_copy),
+            "image_path": str(img_path),
+            "out_dir": str(out_dir),
+            "prefix": "ultrashape_refined",
+            "output_format": out_fmt,
+            "export_formats": list(ex_fmts),
+            "checkpoint": str(checkpoint or "").strip(),
+            "config_name": str(config_name or "infer_dit_refine.yaml").strip(),
+            "dtype": str(dtype or "bfloat16").strip(),
+            "low_vram": bool(low_vram),
+            "remove_bg": bool(remove_bg),
+            "steps": int(steps),
+            "guidance_scale": float(guidance_scale),
+            "octree_resolution": int(octree_resolution),
+            "num_chunks": int(num_chunks),
+            "target_face_count": int(target_face_count),
+            "num_latents": int(num_latents),
+            "box_v": float(box_v),
+            "mc_level": float(mc_level),
+            "normalize_scale": float(normalize_scale),
+            "num_sharp_points": int(num_sharp_points),
+            "num_uniform_points": int(num_uniform_points),
+            "seed": int(seed),
+        }
+        log_path = run_dir / "ultrashape_refine_logs.txt"
+        last_ui_update = 0.0
+        result = None
+
+        _log("Running UltraShape refinement (subprocess)…", 0.05)
+        yield None, None, status
+
+        try:
+            for ev in _iter_subprocess_stage("ultrashape_refine_mesh", payload, work_dir, log_path, session=session):
+                if ev["type"] == "log":
+                    line = ev["text"]
+                    if line:
+                        status = _trim_status(status + "\n" + line)
+                    now = time.time()
+                    if now - last_ui_update > 0.6:
+                        last_ui_update = now
+                        yield None, None, status
+                else:
+                    result = ev["result"]
+        except UserCancelled:
+            _log("CANCELLED by user.", 0.0)
+            yield None, None, status
+            _clear_cancel_all(session)
+            _clear_cancel_batch(session)
+            return
+
+        if not result or "mesh_path" not in result:
+            raise gr.Error("UltraShape refinement failed (no output mesh path).")
+        mesh_out = str(result["mesh_path"])
+        preview_out = str(result.get("preview_path") or mesh_out)
+        _log(f"Saved: {safe_relpath(mesh_out, APP_DIR)}", 0.98)
+        _log("Done.", 1.0)
+        yield preview_out, mesh_out, status
+        return
+
+    _log("Loading mesh…", 0.08)
+    mesh = trimesh.load(str(mesh_copy))
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.to_mesh()
+    yield None, None, status
+
+    _log("Running UltraShape refinement…", 0.2)
+    from ultrashape_integration import refine_mesh_with_ultrashape
+
+    refined = refine_mesh_with_ultrashape(
+        mesh,
+        image_path=str(img_path),
+        app_dir=str(APP_DIR),
+        models_dir=str(MODELS_DIR),
+        checkpoint=str(checkpoint or "").strip(),
+        config_name=str(config_name or "infer_dit_refine.yaml").strip(),
+        dtype=str(dtype or "bfloat16").strip(),
+        low_vram=bool(low_vram),
+        remove_bg=bool(remove_bg),
+        steps=int(steps),
+        guidance_scale=float(guidance_scale),
+        octree_resolution=int(octree_resolution),
+        num_chunks=int(num_chunks),
+        target_face_count=int(target_face_count),
+        num_latents=int(num_latents),
+        box_v=float(box_v),
+        mc_level=float(mc_level),
+        normalize_scale=float(normalize_scale),
+        num_sharp_points=int(num_sharp_points),
+        num_uniform_points=int(num_uniform_points),
+        seed=int(seed),
+        enable_pbar=True,
+    )
+    yield None, None, status
+
+    _log("Saving refined mesh…", 0.9)
+    _, out_path = next_indexed_path(out_dir, prefix="ultrashape_refined", ext=out_fmt, digits=4, start=1)
+    refined.export(str(out_path))
+    preview_path = out_path
+    if out_fmt != "glb":
+        try:
+            preview_path = out_dir / f"{out_path.stem}_preview.glb"
+            refined.export(str(preview_path))
+        except Exception:
+            preview_path = out_path
+    for fmt in ex_fmts:
+        if fmt == out_fmt:
+            continue
+        try:
+            p = out_dir / f"{fmt}_{out_path.stem.split('_')[-1]}.{fmt}"
+            refined.export(str(p))
+        except Exception:
+            pass
+    torch.cuda.empty_cache()
+    _log(f"Saved: {safe_relpath(str(out_path), APP_DIR)}", 0.98)
+    _log("Done.", 1.0)
+    yield str(preview_path), str(out_path), status
+
+
 # --------------------------------- App UI -----------------------------------
 
 with gr.Blocks(
     title="TRELLIS.2 Premium",
-    theme=gr.themes.Soft(
-        primary_hue="indigo",
-        secondary_hue="sky",
-        neutral_hue="slate",
-        radius_size="lg",
-        font=(
-            "'Segoe UI Variable Display'",
-            "'Segoe UI Variable'",
-            "'Segoe UI'",
-            "'Inter'",
-            "ui-sans-serif",
-            "system-ui",
-            "sans-serif",
-        ),
-        font_mono=(
-            "'Cascadia Mono'",
-            "'Cascadia Code'",
-            "'JetBrains Mono'",
-            "'Consolas'",
-            "ui-monospace",
-            "monospace",
-        ),
-    ),
-    css=css,
-    head=head,
     delete_cache=(600, 600),
 ) as demo:
     gr.Markdown(
@@ -3955,6 +4661,24 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
             with gr.Row():
                 with gr.Column(scale=1, min_width=380):
                     image_prompt = gr.Image(label="Image Prompt", format="png", image_mode="RGBA", type="pil", height=400)
+                    multi_view_images = gr.Files(
+                        label="Optional Extra Views (Multi-View)",
+                        file_types=["image"],
+                        file_count="multiple",
+                    )
+                    gr.Markdown(
+                        "Upload additional views of the same object (front/back/side). "
+                        "You can add one image or many. Leave empty for single-image generation."
+                    )
+                    multiview_mode = gr.Dropdown(
+                        choices=["stochastic", "multidiffusion"],
+                        value="stochastic",
+                        label="Multi-View Fusion Mode (Generate)",
+                        info=(
+                            "stochastic: rotates conditioning views across steps (faster). "
+                            "multidiffusion: averages all views each step (more consistent, slower)."
+                        ),
+                    )
 
                     with gr.Row():
                         resolution = gr.Radio(["512", "768", "1024", "1280", "1536", "2048"], label="Resolution (Generate)", value="1024", info="Output mesh resolution. Higher = finer detail but more VRAM. 512 uses direct sampling; 768+ use cascade for quality. ⬆Quality ⬆VRAM", scale=3)
@@ -3978,15 +4702,14 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                         value=["glb", "gltf", "obj", "ply", "stl"],
                         label="Export Formats (Extract GLB)",
                     )
-
                     with gr.Accordion("⚙️ Config Presets (Save / Load)", open=True):
                         gr.Markdown(
-                            "Saves/loads **all settings** from **both** tabs (inputs like images/files are not included)."
+                            "Saves/loads **all settings** from Image->3D, Texturing, UltraShape Refine, and Rigging tabs (uploaded images/files are not included)."
                         )
                         ui_preset_dropdown = gr.Dropdown(
                             label="Select Preset",
                             choices=_list_ui_presets(),
-                            value=_get_last_used_ui_preset() or "",
+                            value=_get_last_used_ui_preset(),
                             allow_custom_value=False,
                         )
                         with gr.Row():
@@ -4046,7 +4769,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                     lines=12,
                                     interactive=False,
                                 )
-                            with gr.Accordion(label="Advanced Settings (Generate)", open=True):
+                            with gr.Accordion(label="Advanced Settings Trellis2 (Generate)", open=True):
                                 gr.Markdown("**Stage 1: Sparse Structure Generation (Generate)**")
                                 with gr.Row():
                                     ss_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1, info="CFG scale - how strongly model follows image. Higher = more faithful but can oversaturate. 7.5 default. Slight ⬆VRAM (2 forward passes).")
@@ -4123,6 +4846,53 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                         0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="⚠️ ADVANCED: Model default is 0.6. Apply CFG in middle refinement phase. Changing may reduce quality!")
                                     tex_slat_guidance_interval_end = gr.Slider(
                                         0.0, 1.0, label="Guidance Interval End", value=0.9, step=0.01, info="⚠️ ADVANCED: Model default is 0.9. Texture uses 0.6-0.9 range. Changing may reduce quality!")
+                                gr.Markdown("**UltraShape Refinement (Extract GLB)**")
+                                ultrashape_enabled = gr.Checkbox(
+                                    label="Enable UltraShape Refinement",
+                                    value=True,
+                                    info="Run UltraShape image-guided mesh refinement before final GLB baking. Improves geometry detail; adds time/VRAM."
+                                )
+                                with gr.Row():
+                                    ultrashape_checkpoint = gr.Textbox(
+                                        label="UltraShape Checkpoint (optional)",
+                                        value="",
+                                        placeholder="Leave empty to auto-pick first file in models/UltraShape",
+                                    )
+                                    ultrashape_config_name = gr.Textbox(
+                                        label="UltraShape Config",
+                                        value="infer_dit_refine.yaml",
+                                    )
+                                with gr.Row():
+                                    ultrashape_dtype = gr.Dropdown(
+                                        ["float16", "bfloat16", "float32"],
+                                        label="UltraShape DType",
+                                        value="bfloat16",
+                                    )
+                                    ultrashape_low_vram = gr.Checkbox(
+                                        label="UltraShape Low VRAM",
+                                        value=True,
+                                        info="Enable CPU offload where supported. Lower VRAM, slower runtime."
+                                    )
+                                    ultrashape_remove_bg = gr.Checkbox(
+                                        label="UltraShape Remove BG",
+                                        value=False,
+                                        info="Apply TRELLIS rembg to the reference image before refinement. This affects image guidance only, not the input mesh."
+                                    )
+                                with gr.Row():
+                                    ultrashape_steps = gr.Slider(10, 200, label="UltraShape Steps", value=50, step=5)
+                                    ultrashape_guidance_scale = gr.Slider(1.0, 15.0, label="UltraShape Guidance", value=5.0, step=0.5)
+                                    ultrashape_octree_resolution = gr.Slider(256, 1024, label="UltraShape Octree Res", value=384, step=64)
+                                with gr.Row():
+                                    ultrashape_num_chunks = gr.Slider(1000, 50000, label="UltraShape Chunk Size", value=8000, step=1000)
+                                    ultrashape_target_face_count = gr.Slider(100000, 2000000, label="UltraShape Target Faces", value=500000, step=10000)
+                                    ultrashape_num_latents = gr.Slider(0, 131072, label="UltraShape Num Latents (0=cfg)", value=0, step=1024)
+                                with gr.Row():
+                                    ultrashape_box_v = gr.Slider(0.5, 2.0, label="UltraShape Box V", value=1.0, step=0.1)
+                                    ultrashape_mc_level = gr.Slider(-0.1, 0.1, label="UltraShape MC Level", value=0.0, step=0.01)
+                                    ultrashape_normalize_scale = gr.Slider(0.5, 1.0, label="UltraShape Normalize Scale", value=0.99, step=0.01)
+                                with gr.Row():
+                                    ultrashape_num_sharp_points = gr.Slider(10000, 500000, label="UltraShape Sharp Points", value=204800, step=10000)
+                                    ultrashape_num_uniform_points = gr.Slider(10000, 500000, label="UltraShape Uniform Points", value=204800, step=10000)
                         with gr.Step("Extract", id=1):
                             with gr.Row():
                                 back_to_preview_btn = gr.Button("Back to Preview", variant="secondary")
@@ -4180,6 +4950,11 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 inputs=[],
                 outputs=[output_buf, preview_output, extract_btn, view_extract_btn, walkthrough, glb_output, download_btn, status_box, logs_visible_state, view_logs_btn],
             )
+            multi_view_images.change(
+                _reset_image_to_3d_ui,
+                inputs=[],
+                outputs=[output_buf, preview_output, extract_btn, view_extract_btn, walkthrough, glb_output, download_btn, status_box, logs_visible_state, view_logs_btn],
+            )
 
             generate_btn.click(
                 get_seed,
@@ -4195,6 +4970,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 image_to_3d,
                 inputs=[
                     image_prompt,
+                    multi_view_images,
                     seed,
                     resolution,
                     custom_resolution,
@@ -4222,6 +4998,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     tex_slat_rescale_t,
                     no_texture_gen,
                     max_num_tokens,
+                    multiview_mode,
                     subprocess_mode,
                 ],
                 outputs=[output_buf, preview_output, status_box],
@@ -4248,6 +5025,23 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     export_formats,
                     extract_use_chunked_processing,
                     extract_use_tiled_extraction,
+                    ultrashape_enabled,
+                    ultrashape_checkpoint,
+                    ultrashape_config_name,
+                    ultrashape_dtype,
+                    ultrashape_low_vram,
+                    ultrashape_remove_bg,
+                    ultrashape_steps,
+                    ultrashape_guidance_scale,
+                    ultrashape_octree_resolution,
+                    ultrashape_num_chunks,
+                    ultrashape_target_face_count,
+                    ultrashape_num_latents,
+                    ultrashape_box_v,
+                    ultrashape_mc_level,
+                    ultrashape_normalize_scale,
+                    ultrashape_num_sharp_points,
+                    ultrashape_num_uniform_points,
                     subprocess_mode,
                 ],
                 outputs=[glb_output, download_btn, status_box],
@@ -4450,12 +5244,30 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     tex_slat_rescale_t,
                     no_texture_gen,
                     max_num_tokens,
+                    multiview_mode,
                     decimation_target,
                     texture_size,
                     remesh_method,
                     simplify_method,
                     prune_invisible_faces,
                     export_formats,
+                    ultrashape_enabled,
+                    ultrashape_checkpoint,
+                    ultrashape_config_name,
+                    ultrashape_dtype,
+                    ultrashape_low_vram,
+                    ultrashape_remove_bg,
+                    ultrashape_steps,
+                    ultrashape_guidance_scale,
+                    ultrashape_octree_resolution,
+                    ultrashape_num_chunks,
+                    ultrashape_target_face_count,
+                    ultrashape_num_latents,
+                    ultrashape_box_v,
+                    ultrashape_mc_level,
+                    ultrashape_normalize_scale,
+                    ultrashape_num_sharp_points,
+                    ultrashape_num_uniform_points,
                     subprocess_mode,
                 ],
                 outputs=[batch_status_box],
@@ -4677,7 +5489,184 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 show_progress="hidden",
             )
 
-        # ---------------------------- Tab 3: View 3D Files ----------------------------
+        # ---------------------------- Tab 3: UltraShape Refine ----------------------------
+        with gr.Tab("UltraShape Refine"):
+            with gr.Row():
+                with gr.Column(scale=1, min_width=380):
+                    us_mesh_file = gr.File(
+                        label="Upload Coarse Mesh",
+                        file_types=[".glb", ".gltf", ".obj", ".ply", ".stl"],
+                        file_count="single",
+                    )
+                    us_image = gr.Image(
+                        label="Reference Image",
+                        format="png",
+                        image_mode="RGBA",
+                        type="pil",
+                        height=400,
+                    )
+                    with gr.Row():
+                        us_seed = gr.Slider(0, MAX_SEED, label="Seed", value=99, step=1, scale=4)
+                        us_randomize_seed = gr.Checkbox(label="Randomize Seed", value=False, scale=1)
+                    with gr.Row():
+                        us_output_format = gr.Dropdown(
+                            ["glb", "obj", "ply", "stl"],
+                            label="Primary Output Format",
+                            value="glb",
+                        )
+                        us_export_formats = gr.CheckboxGroup(
+                            choices=["glb", "obj", "ply", "stl"],
+                            value=["glb"],
+                            label="Extra Export Formats",
+                        )
+                    with gr.Accordion("Advanced Settings", open=True):
+                        with gr.Row():
+                            us_checkpoint = gr.Textbox(
+                                label="Checkpoint (optional)",
+                                value="",
+                                placeholder="Leave empty to auto-pick models/UltraShape/*.pt",
+                            )
+                            us_config_name = gr.Textbox(
+                                label="Config",
+                                value="infer_dit_refine.yaml",
+                            )
+                        with gr.Row():
+                            us_dtype = gr.Dropdown(["float16", "bfloat16", "float32"], label="DType", value="bfloat16")
+                            us_low_vram = gr.Checkbox(label="Low VRAM", value=True)
+                            us_remove_bg = gr.Checkbox(
+                                label="Remove BG (Reference Image)",
+                                value=False,
+                                info="Applies TRELLIS rembg to the guidance image. Not required for the mesh input.",
+                            )
+                        with gr.Row():
+                            us_steps = gr.Slider(10, 200, label="Steps", value=50, step=5)
+                            us_guidance_scale = gr.Slider(1.0, 15.0, label="Guidance", value=5.0, step=0.5)
+                            us_octree_resolution = gr.Slider(256, 1024, label="Octree Res", value=384, step=64)
+                        with gr.Row():
+                            us_num_chunks = gr.Slider(1000, 50000, label="Chunk Size", value=8000, step=1000)
+                            us_target_face_count = gr.Slider(100000, 2000000, label="Target Faces", value=500000, step=10000)
+                            us_num_latents = gr.Slider(0, 131072, label="Num Latents (0=cfg)", value=0, step=1024)
+                        with gr.Row():
+                            us_box_v = gr.Slider(0.5, 2.0, label="Box V", value=1.0, step=0.1)
+                            us_mc_level = gr.Slider(-0.1, 0.1, label="MC Level", value=0.0, step=0.01)
+                            us_normalize_scale = gr.Slider(0.5, 1.0, label="Normalize Scale", value=0.99, step=0.01)
+                        with gr.Row():
+                            us_num_sharp_points = gr.Slider(10000, 500000, label="Sharp Points", value=204800, step=10000)
+                            us_num_uniform_points = gr.Slider(10000, 500000, label="Uniform Points", value=204800, step=10000)
+
+                with gr.Column(scale=2, min_width=520):
+                    us_output = gr.Model3D(
+                        label="Refined Mesh Preview",
+                        height=724,
+                        show_label=True,
+                        display_mode="solid",
+                        clear_color=(0.25, 0.25, 0.25, 1.0),
+                        elem_id="ultrashape_refined_viewer",
+                    )
+                    us_status_box = gr.Textbox(
+                        value="Upload a coarse mesh + reference image, then click Refine Mesh.",
+                        lines=20,
+                        max_lines=20,
+                        interactive=False,
+                        show_label=False,
+                        container=False,
+                        visible=False,
+                    )
+                    with gr.Row():
+                        us_refine_btn = gr.Button("Refine Mesh", variant="primary")
+                        us_download_btn = gr.DownloadButton(label="Download Refined Mesh", variant="primary")
+                    with gr.Row():
+                        us_cancel_btn = gr.Button("Cancel processing", variant="stop")
+                        us_open_outputs_btn = gr.Button("Open outputs folder", variant="secondary")
+                        us_view_logs_btn = gr.Button("View Logs", variant="secondary")
+
+            us_logs_visible_state = gr.State(False)
+
+            us_mesh_file.change(
+                fn=_coerce_file_to_path,
+                inputs=[us_mesh_file],
+                outputs=[us_output],
+                queue=False,
+                show_progress="hidden",
+            )
+
+            def _us_toggle_logs(current_visible: bool) -> tuple:
+                new_visible = not current_visible
+                return (
+                    gr.update(visible=new_visible),
+                    new_visible,
+                    gr.update(value="Hide Logs" if new_visible else "View Logs"),
+                )
+
+            us_view_logs_btn.click(
+                fn=_us_toggle_logs,
+                inputs=[us_logs_visible_state],
+                outputs=[us_status_box, us_logs_visible_state, us_view_logs_btn],
+                queue=False,
+                show_progress="hidden",
+            )
+
+            def _us_cancel(current_status: str, req: gr.Request) -> str:
+                ts = datetime.now().strftime("%H:%M:%S")
+                msg = _cancel_now(_session_key(req), scope="all")
+                return _append_status(current_status, f"[{ts}] {msg}")
+
+            us_cancel_btn.click(
+                fn=_us_cancel,
+                inputs=[us_status_box],
+                outputs=[us_status_box],
+                queue=False,
+                show_progress="hidden",
+            )
+
+            us_refine_btn.click(
+                get_seed,
+                inputs=[us_randomize_seed, us_seed],
+                outputs=[us_seed],
+            ).then(
+                lambda: (gr.update(visible=True), True, gr.update(value="Hide Logs")),
+                outputs=[us_status_box, us_logs_visible_state, us_view_logs_btn],
+            ).then(
+                ultrashape_refine_mesh,
+                inputs=[
+                    us_mesh_file,
+                    us_image,
+                    us_seed,
+                    us_output_format,
+                    us_export_formats,
+                    us_checkpoint,
+                    us_config_name,
+                    us_dtype,
+                    us_low_vram,
+                    us_remove_bg,
+                    us_steps,
+                    us_guidance_scale,
+                    us_octree_resolution,
+                    us_num_chunks,
+                    us_target_face_count,
+                    us_num_latents,
+                    us_box_v,
+                    us_mc_level,
+                    us_normalize_scale,
+                    us_num_sharp_points,
+                    us_num_uniform_points,
+                    subprocess_mode,
+                ],
+                outputs=[us_output, us_download_btn, us_status_box],
+            ).then(
+                lambda: (gr.update(visible=False), False, gr.update(value="View Logs")),
+                outputs=[us_status_box, us_logs_visible_state, us_view_logs_btn],
+            )
+
+            us_open_outputs_btn.click(
+                fn=_open_outputs_from_texturing_tab,
+                inputs=[us_status_box],
+                outputs=[us_status_box],
+                queue=False,
+                show_progress="hidden",
+            )
+
+        # ---------------------------- Tab 4: View 3D Files ----------------------------
         with gr.Tab("View 3D Files"):
             gr.Markdown(
                 "Drag & drop / upload a 3D file to preview it.\n\n"
@@ -4797,6 +5786,14 @@ Upload the input image you want to convert to 3D.
 **Examples**:
 - Good: a centered product photo on a plain background.
 - Risky: multiple characters, cluttered scenery, tiny object in the distance.
+
+### Optional Extra Views (Multi-View)
+You can upload one or multiple additional views of the same object (front/back/side).
+
+**Behavior**:
+- If only **Image Prompt** is provided, generation runs in single-view mode.
+- If extra views are uploaded, generation runs in multi-view mode.
+- `stochastic` mode is faster; `multidiffusion` is usually more consistent but slower.
 
 ### Resolution
 Choose the target generation quality/speed level. Higher resolutions produce more detail but cost more VRAM/time.
@@ -5029,7 +6026,7 @@ Upload a 3D file to preview it locally. This does not run the ML pipeline.
 
 ## Config Presets (Save / Load)
 
-Presets save **all settings** from **both tabs**, but do **not** include uploaded images/files.
+Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and Rigging tabs, but do **not** include uploaded images/files.
 
 **Where presets are stored**: `./presets/<name>.json`
 
@@ -5108,12 +6105,30 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         ("image_to_3d", "shape_slat_sampling_steps"),
         ("image_to_3d", "shape_slat_rescale_t"),
         ("image_to_3d", "max_num_tokens"),
+        ("image_to_3d", "multiview_mode"),
         ("image_to_3d", "tex_slat_guidance_strength"),
         ("image_to_3d", "tex_slat_guidance_rescale"),
         ("image_to_3d", "tex_slat_guidance_interval_start"),
         ("image_to_3d", "tex_slat_guidance_interval_end"),
         ("image_to_3d", "tex_slat_sampling_steps"),
         ("image_to_3d", "tex_slat_rescale_t"),
+        ("image_to_3d", "ultrashape_enabled"),
+        ("image_to_3d", "ultrashape_checkpoint"),
+        ("image_to_3d", "ultrashape_config_name"),
+        ("image_to_3d", "ultrashape_dtype"),
+        ("image_to_3d", "ultrashape_low_vram"),
+        ("image_to_3d", "ultrashape_remove_bg"),
+        ("image_to_3d", "ultrashape_steps"),
+        ("image_to_3d", "ultrashape_guidance_scale"),
+        ("image_to_3d", "ultrashape_octree_resolution"),
+        ("image_to_3d", "ultrashape_num_chunks"),
+        ("image_to_3d", "ultrashape_target_face_count"),
+        ("image_to_3d", "ultrashape_num_latents"),
+        ("image_to_3d", "ultrashape_box_v"),
+        ("image_to_3d", "ultrashape_mc_level"),
+        ("image_to_3d", "ultrashape_normalize_scale"),
+        ("image_to_3d", "ultrashape_num_sharp_points"),
+        ("image_to_3d", "ultrashape_num_uniform_points"),
         ("texturing", "resolution"),
         ("texturing", "seed"),
         ("texturing", "randomize_seed"),
@@ -5125,6 +6140,32 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         ("texturing", "sampling_steps"),
         ("texturing", "rescale_t"),
         ("texturing", "low_vram"),
+        ("ultrashape_refine", "seed"),
+        ("ultrashape_refine", "randomize_seed"),
+        ("ultrashape_refine", "output_format"),
+        ("ultrashape_refine", "export_formats"),
+        ("ultrashape_refine", "checkpoint"),
+        ("ultrashape_refine", "config_name"),
+        ("ultrashape_refine", "dtype"),
+        ("ultrashape_refine", "low_vram"),
+        ("ultrashape_refine", "remove_bg"),
+        ("ultrashape_refine", "steps"),
+        ("ultrashape_refine", "guidance_scale"),
+        ("ultrashape_refine", "octree_resolution"),
+        ("ultrashape_refine", "num_chunks"),
+        ("ultrashape_refine", "target_face_count"),
+        ("ultrashape_refine", "num_latents"),
+        ("ultrashape_refine", "box_v"),
+        ("ultrashape_refine", "mc_level"),
+        ("ultrashape_refine", "normalize_scale"),
+        ("ultrashape_refine", "num_sharp_points"),
+        ("ultrashape_refine", "num_uniform_points"),
+        ("rigging", "seed"),
+        ("rigging", "randomize_seed"),
+        ("rigging", "export_format"),
+        ("rigging", "export_both_formats"),
+        ("rigging", "enable_skinning"),
+        ("rigging", "auto_merge"),
     ]
 
     _CONFIG_COMPONENTS = [
@@ -5158,12 +6199,30 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         shape_slat_sampling_steps,
         shape_slat_rescale_t,
         max_num_tokens,
+        multiview_mode,
         tex_slat_guidance_strength,
         tex_slat_guidance_rescale,
         tex_slat_guidance_interval_start,
         tex_slat_guidance_interval_end,
         tex_slat_sampling_steps,
         tex_slat_rescale_t,
+        ultrashape_enabled,
+        ultrashape_checkpoint,
+        ultrashape_config_name,
+        ultrashape_dtype,
+        ultrashape_low_vram,
+        ultrashape_remove_bg,
+        ultrashape_steps,
+        ultrashape_guidance_scale,
+        ultrashape_octree_resolution,
+        ultrashape_num_chunks,
+        ultrashape_target_face_count,
+        ultrashape_num_latents,
+        ultrashape_box_v,
+        ultrashape_mc_level,
+        ultrashape_normalize_scale,
+        ultrashape_num_sharp_points,
+        ultrashape_num_uniform_points,
         tex_resolution,
         tex_seed,
         tex_randomize_seed,
@@ -5175,6 +6234,32 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         t_sampling_steps,
         t_rescale_t,
         tex_low_vram,
+        us_seed,
+        us_randomize_seed,
+        us_output_format,
+        us_export_formats,
+        us_checkpoint,
+        us_config_name,
+        us_dtype,
+        us_low_vram,
+        us_remove_bg,
+        us_steps,
+        us_guidance_scale,
+        us_octree_resolution,
+        us_num_chunks,
+        us_target_face_count,
+        us_num_latents,
+        us_box_v,
+        us_mc_level,
+        us_normalize_scale,
+        us_num_sharp_points,
+        us_num_uniform_points,
+        rigging_ui["seed"],
+        rigging_ui["randomize_seed"],
+        rigging_ui["export_format"],
+        rigging_ui["export_both_formats"],
+        rigging_ui["enable_skinning"],
+        rigging_ui["auto_merge"],
     ]
 
     def _values_to_ui_config(*values) -> dict:
@@ -5191,7 +6276,7 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
         defaults = _default_ui_config()
 
         # Image→3D resolution
-        if merged["image_to_3d"]["resolution"] not in ["512", "1024", "1536", "2048"]:
+        if merged["image_to_3d"]["resolution"] not in ["512", "768", "1024", "1280", "1536", "2048"]:
             merged["image_to_3d"]["resolution"] = defaults["image_to_3d"]["resolution"]
         # Texturing resolution
         if merged["texturing"]["resolution"] not in ["512", "1024", "1536"]:
@@ -5208,6 +6293,24 @@ Presets save **all settings** from **both tabs**, but do **not** include uploade
             ef = defaults["image_to_3d"]["export_formats"]
         ef = [str(x) for x in ef if str(x) in {"glb", "gltf", "obj", "ply", "stl"}]
         merged["image_to_3d"]["export_formats"] = ef or defaults["image_to_3d"]["export_formats"]
+
+        if merged["image_to_3d"].get("ultrashape_dtype") not in {"float16", "bfloat16", "float32"}:
+            merged["image_to_3d"]["ultrashape_dtype"] = defaults["image_to_3d"]["ultrashape_dtype"]
+        if merged["image_to_3d"].get("multiview_mode") not in {"stochastic", "multidiffusion"}:
+            merged["image_to_3d"]["multiview_mode"] = defaults["image_to_3d"]["multiview_mode"]
+
+        # UltraShape tab output format / export formats / dtype
+        if merged["ultrashape_refine"].get("output_format") not in {"glb", "obj", "ply", "stl"}:
+            merged["ultrashape_refine"]["output_format"] = defaults["ultrashape_refine"]["output_format"]
+        uef = merged["ultrashape_refine"].get("export_formats")
+        if not isinstance(uef, list):
+            uef = defaults["ultrashape_refine"]["export_formats"]
+        uef = [str(x) for x in uef if str(x) in {"glb", "obj", "ply", "stl"}]
+        merged["ultrashape_refine"]["export_formats"] = uef or defaults["ultrashape_refine"]["export_formats"]
+        if merged["ultrashape_refine"].get("dtype") not in {"float16", "bfloat16", "float32"}:
+            merged["ultrashape_refine"]["dtype"] = defaults["ultrashape_refine"]["dtype"]
+        if merged["rigging"].get("export_format") not in {"fbx", "glb"}:
+            merged["rigging"]["export_format"] = defaults["rigging"]["export_format"]
 
         def _clamp01(v, d):
             try:
@@ -5350,6 +6453,9 @@ if __name__ == "__main__":
         launch_kwargs["server_port"] = args.port
     try:
         launch_sig = inspect.signature(demo.launch)
+        for k, v in (("theme", APP_THEME), ("css", css), ("head", head)):
+            if k in launch_sig.parameters:
+                launch_kwargs[k] = v
         if "allowed_paths" in launch_sig.parameters:
             launch_kwargs["allowed_paths"] = _discover_allowed_paths_all_drives()
             print(

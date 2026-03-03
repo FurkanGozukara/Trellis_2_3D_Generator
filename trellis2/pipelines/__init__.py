@@ -2,6 +2,7 @@ import importlib
 
 __attributes = {
     "Trellis2ImageTo3DPipeline": "trellis2_image_to_3d",
+    "Trellis2MultiViewPipeline": "trellis2_multiview",
     "Trellis2TexturingPipeline": "trellis2_texturing",
 }
 
@@ -64,4 +65,5 @@ def from_pretrained(path: str):
 if __name__ == '__main__':
     from . import samplers, rembg
     from .trellis2_image_to_3d import Trellis2ImageTo3DPipeline
+    from .trellis2_multiview import Trellis2MultiViewPipeline
     from .trellis2_texturing import Trellis2TexturingPipeline

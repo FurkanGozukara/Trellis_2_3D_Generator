@@ -21,6 +21,12 @@ parts/
 sdist/
 var/
 wheels/
+ComfyUI-TRELLIS2_v2/
+ComfyUI-Trellis2/
+ComfyUI-UltraShape1/
+TRELLIS.2MV/
+UltraShape-1.0/
+UltraShape_v2/
 a.png
 b.png
 tmp_test_alpha.glb

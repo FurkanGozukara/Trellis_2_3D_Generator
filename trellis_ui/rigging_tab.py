@@ -608,7 +608,7 @@ def rigging_tab(
         export_both,
         auto_merge_enabled,
         current_preview_source,
-        req,
+        req: gr.Request,
     ):
         """Determine which file to use for merge and call merge function."""
         source = skinned_path if skinned_path else skeleton_path
@@ -743,5 +743,11 @@ def rigging_tab(
         "skinned_path_state": skinned_path_state,
         "skeleton_path_state": skeleton_path_state,
         "rig_status": rig_status,
+        "seed": rig_seed,
+        "randomize_seed": rig_randomize_seed,
+        "enable_skinning": enable_skinning,
+        "export_format": export_format,
+        "export_both_formats": export_both_formats,
+        "auto_merge": auto_merge,
     }
 

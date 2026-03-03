@@ -22,7 +22,8 @@ except Exception:
 
 # Keep env consistent with the Gradio app.
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+if "PYTORCH_ALLOC_CONF" not in os.environ and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 # UniRig checkpoints are trusted local files but may include custom objects.
 # PyTorch 2.6+ defaults torch.load(weights_only=True), which can fail on these ckpts.
 os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
@@ -277,6 +278,7 @@ def _ignore_except_texturing_models(keep: List[str]) -> List[str]:
 
 
 def stage_preprocess_image(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import torch
     from PIL import Image
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
@@ -300,7 +302,8 @@ def stage_preprocess_image(payload: Dict[str, Any]) -> Dict[str, Any]:
     pipe.cuda()
 
     print("[preprocess] removing background / cropping…", flush=True)
-    out = pipe.preprocess_image(img)
+    with torch.inference_mode():
+        out = pipe.preprocess_image(img)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out.save(str(out_path))
     print(f"[preprocess] saved: {out_path}", flush=True)
@@ -308,6 +311,7 @@ def stage_preprocess_image(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def stage_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import torch
     from PIL import Image
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
@@ -336,7 +340,8 @@ def stage_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Use 1024 resolution for sparse structure conditioning if force_high_res_conditional is enabled
     cond_512_res = 1024 if force_high_res_conditional else 512
     print(f"[cond] computing image embeddings ({cond_512_res}px for sparse structure)…", flush=True)
-    cond_512 = pipe.get_cond([img], cond_512_res)
+    with torch.inference_mode():
+        cond_512 = pipe.get_cond([img], cond_512_res)
     _save_cond(cond_512_path, cond_512)
     print(f"[cond] saved: {cond_512_path}", flush=True)
 
@@ -344,7 +349,8 @@ def stage_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
         if cond_1024_path is None:
             raise ValueError("cond_1024_path is required for non-512 pipeline types.")
         print("[cond] computing image embeddings (1024px)…", flush=True)
-        cond_1024 = pipe.get_cond([img], 1024)
+        with torch.inference_mode():
+            cond_1024 = pipe.get_cond([img], 1024)
         _save_cond(cond_1024_path, cond_1024)
         print(f"[cond] saved: {cond_1024_path}", flush=True)
         return {
@@ -409,7 +415,8 @@ def stage_sample_sparse_structure(payload: Dict[str, Any]) -> Dict[str, Any]:
         torch.manual_seed(seed)
     
     print(f"[sparse] sampling sparse structure (ss_res={ss_res})…", flush=True)
-    coords = pipe.sample_sparse_structure(cond, ss_res, 1, ss_params)
+    with torch.inference_mode():
+        coords = pipe.sample_sparse_structure(cond, ss_res, 1, ss_params)
     coords_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(coords.detach().cpu(), str(coords_path))
     print(f"[sparse] saved coords: {coords_path}", flush=True)
@@ -483,7 +490,8 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         cond = _load_cond(cond_512_path, device=device)
         print("[shape] sampling shape SLat (512)…", flush=True)
-        slat = pipe.sample_shape_slat(cond, pipe.models["shape_slat_flow_model_512"], coords, shape_params)
+        with torch.inference_mode():
+            slat = pipe.sample_shape_slat(cond, pipe.models["shape_slat_flow_model_512"], coords, shape_params)
         res = 512
 
     elif pipeline_type == "1024":
@@ -501,7 +509,8 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         cond = _load_cond(cond_1024_path, device=device)
         print("[shape] sampling shape SLat (1024)…", flush=True)
-        slat = pipe.sample_shape_slat(cond, pipe.models["shape_slat_flow_model_1024"], coords, shape_params)
+        with torch.inference_mode():
+            slat = pipe.sample_shape_slat(cond, pipe.models["shape_slat_flow_model_1024"], coords, shape_params)
         res = 1024
 
     elif "_cascade" in pipeline_type:
@@ -530,17 +539,18 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
         torch.cuda.empty_cache()
         _log_vram_usage("Before cascade sampling")
         
-        slat, res = pipe.sample_shape_slat_cascade(
-            lr_cond,
-            cond,
-            pipe.models["shape_slat_flow_model_512"],
-            pipe.models["shape_slat_flow_model_1024"],
-            512,
-            target_res,
-            coords,
-            shape_params,
-            max_num_tokens,
-        )
+        with torch.inference_mode():
+            slat, res = pipe.sample_shape_slat_cascade(
+                lr_cond,
+                cond,
+                pipe.models["shape_slat_flow_model_512"],
+                pipe.models["shape_slat_flow_model_1024"],
+                512,
+                target_res,
+                coords,
+                shape_params,
+                max_num_tokens,
+            )
         
         # Immediate cleanup after cascade
         torch.cuda.empty_cache()
@@ -625,7 +635,8 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     cond = _load_cond(cond_path, device=device)
 
     print(f"[tex] sampling texture SLat ({flow_key})…", flush=True)
-    tex_slat = pipe.sample_tex_slat(cond, pipe.models[flow_key], shape_slat, tex_params)
+    with torch.inference_mode():
+        tex_slat = pipe.sample_tex_slat(cond, pipe.models[flow_key], shape_slat, tex_params)
     _save_npz_sparse(tex_slat_path, tex_slat.feats, tex_slat.coords)
     print(f"[tex] saved: {tex_slat_path}", flush=True)
 
@@ -724,7 +735,8 @@ def stage_render_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     _log_vram_usage("Before decode_latent")
 
     print("[preview] decoding latent to mesh…", flush=True)
-    mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
+    with torch.inference_mode():
+        mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
     
     # Clear memory after decode
     torch.cuda.empty_cache()
@@ -857,6 +869,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     simplify_method = str(payload["simplify_method"])
     prune_invisible_faces = bool(payload["prune_invisible_faces"])
     no_texture_gen = bool(payload["no_texture_gen"])
+    ultrashape_cfg = payload.get("ultrashape") or {}
     
     # Extract GLB mesh extraction settings (user-configurable)
     extract_use_tiled_extraction = bool(payload.get("extract_use_tiled_extraction", False))
@@ -900,7 +913,8 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     _log_vram_usage("Before extract decode_latent")
 
     print("[extract] decoding latent to mesh…", flush=True)
-    mesh = pipe.decode_latent(shape_slat, tex_slat, res, extract_use_tiled_extraction, extract_use_chunked_processing)[0]
+    with torch.inference_mode():
+        mesh = pipe.decode_latent(shape_slat, tex_slat, res, extract_use_tiled_extraction, extract_use_chunked_processing)[0]
     
     # Save values needed later before unloading pipeline
     pbr_attr_layout = pipe.pbr_attr_layout
@@ -914,6 +928,60 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     gc.collect()
     torch.cuda.empty_cache()
     _log_vram_usage("After pipeline unload, before to_glb")
+
+    ultrashape_enabled = bool(ultrashape_cfg.get("enabled", False))
+    if ultrashape_enabled:
+        image_path = ultrashape_cfg.get("image_path") or payload.get("preprocessed_image_path")
+        image_file = Path(str(image_path)) if image_path else None
+        if image_file is None or not image_file.is_file():
+            print(
+                "[extract] UltraShape refinement requested, but no valid reference image path was provided. "
+                "Skipping UltraShape.",
+                flush=True,
+            )
+        else:
+            print("[extract] running UltraShape refinement…", flush=True)
+            try:
+                from ultrashape_integration import refine_mesh_with_ultrashape
+
+                mesh = refine_mesh_with_ultrashape(
+                    mesh,
+                    image_path=str(image_file),
+                    app_dir=str(APP_DIR),
+                    models_dir=str(MODELS_DIR),
+                    checkpoint=str(ultrashape_cfg.get("checkpoint", "")),
+                    config_name=str(ultrashape_cfg.get("config_name", "infer_dit_refine.yaml")),
+                    dtype=str(ultrashape_cfg.get("dtype", "bfloat16")),
+                    low_vram=bool(ultrashape_cfg.get("low_vram", True)),
+                    steps=int(ultrashape_cfg.get("steps", 50)),
+                    guidance_scale=float(ultrashape_cfg.get("guidance_scale", 5.0)),
+                    octree_resolution=int(ultrashape_cfg.get("octree_resolution", 384)),
+                    num_chunks=int(ultrashape_cfg.get("num_chunks", 8000)),
+                    mc_level=float(ultrashape_cfg.get("mc_level", 0.0)),
+                    box_v=float(ultrashape_cfg.get("box_v", 1.0)),
+                    seed=int(ultrashape_cfg.get("seed", 42)),
+                    remove_bg=bool(ultrashape_cfg.get("remove_bg", False)),
+                    normalize_scale=float(ultrashape_cfg.get("normalize_scale", 0.99)),
+                    num_sharp_points=int(ultrashape_cfg.get("num_sharp_points", 204800)),
+                    num_uniform_points=int(ultrashape_cfg.get("num_uniform_points", 204800)),
+                    num_latents=int(ultrashape_cfg.get("num_latents", 0)),
+                    target_face_count=int(ultrashape_cfg.get("target_face_count", 500000)),
+                    enable_pbar=True,
+                )
+                print(
+                    f"[extract] UltraShape refinement done (vertices={len(mesh.vertices)}, faces={len(mesh.faces)}).",
+                    flush=True,
+                )
+            except Exception as e:
+                print(
+                    f"[extract] UltraShape refinement failed: {type(e).__name__}: {e}. "
+                    "Continuing with base TRELLIS mesh.",
+                    flush=True,
+                )
+            finally:
+                gc.collect()
+                torch.cuda.empty_cache()
+                _log_vram_usage("After UltraShape refinement")
 
     print("[extract] converting to GLB…", flush=True)
     # NOTE: `faithful_contouring` remeshing depends on optional FaithC packages
@@ -997,6 +1065,86 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"glb_path": str(glb_path)}
 
 
+def stage_ultrashape_refine_mesh(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import trimesh
+    from ultrashape_integration import refine_mesh_with_ultrashape
+    from subprocess_utils import next_indexed_path
+
+    mesh_path = Path(payload["mesh_path"])
+    image_path = Path(payload["image_path"])
+    out_dir = Path(payload["out_dir"])
+    prefix = str(payload.get("prefix", "ultrashape_refined"))
+    output_format = str(payload.get("output_format", "glb")).lower().strip()
+    export_formats = payload.get("export_formats") or [output_format]
+    export_formats = [str(f).lower().strip() for f in export_formats]
+    if output_format not in {"glb", "obj", "ply", "stl"}:
+        output_format = "glb"
+    if output_format not in export_formats:
+        export_formats = [output_format] + export_formats
+
+    if not mesh_path.is_file():
+        raise FileNotFoundError(f"Mesh file not found: {mesh_path}")
+    if not image_path.is_file():
+        raise FileNotFoundError(f"Reference image file not found: {image_path}")
+
+    print(f"[ultrashape] loading mesh: {mesh_path}", flush=True)
+    mesh = trimesh.load(str(mesh_path))
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.to_mesh()
+
+    print("[ultrashape] refining mesh…", flush=True)
+    refined = refine_mesh_with_ultrashape(
+        mesh,
+        image_path=str(image_path),
+        app_dir=str(APP_DIR),
+        models_dir=str(MODELS_DIR),
+        checkpoint=str(payload.get("checkpoint", "")),
+        config_name=str(payload.get("config_name", "infer_dit_refine.yaml")),
+        dtype=str(payload.get("dtype", "bfloat16")),
+        low_vram=bool(payload.get("low_vram", True)),
+        steps=int(payload.get("steps", 50)),
+        guidance_scale=float(payload.get("guidance_scale", 5.0)),
+        octree_resolution=int(payload.get("octree_resolution", 384)),
+        num_chunks=int(payload.get("num_chunks", 8000)),
+        mc_level=float(payload.get("mc_level", 0.0)),
+        box_v=float(payload.get("box_v", 1.0)),
+        seed=int(payload.get("seed", 42)),
+        remove_bg=bool(payload.get("remove_bg", False)),
+        normalize_scale=float(payload.get("normalize_scale", 0.99)),
+        num_sharp_points=int(payload.get("num_sharp_points", 204800)),
+        num_uniform_points=int(payload.get("num_uniform_points", 204800)),
+        num_latents=int(payload.get("num_latents", 0)),
+        target_face_count=int(payload.get("target_face_count", 500000)),
+        enable_pbar=True,
+    )
+
+    idx, out_path = next_indexed_path(out_dir, prefix=prefix, ext=output_format, digits=4, start=1)
+    refined.export(str(out_path))
+    print(f"[ultrashape] saved primary: {out_path}", flush=True)
+
+    preview_path = out_path
+    if output_format != "glb":
+        preview_path = out_dir / f"{prefix}_{idx:04d}_preview.glb"
+        try:
+            refined.export(str(preview_path))
+            print(f"[ultrashape] saved preview: {preview_path}", flush=True)
+        except Exception as e:
+            print(f"[ultrashape] preview export failed: {type(e).__name__}: {e}", flush=True)
+            preview_path = out_path
+
+    for fmt in export_formats:
+        if fmt == output_format:
+            continue
+        try:
+            p = out_dir / f"{fmt}_{idx:04d}.{fmt}"
+            refined.export(str(p))
+            print(f"[ultrashape] saved extra '{fmt}': {p}", flush=True)
+        except Exception as e:
+            print(f"[ultrashape] extra export '{fmt}' failed: {type(e).__name__}: {e}", flush=True)
+
+    return {"mesh_path": str(out_path), "preview_path": str(preview_path)}
+
+
 def stage_tex_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Stage 1: Load image conditioning model, compute embeddings, save, exit."""
     import torch
@@ -1039,7 +1187,8 @@ def stage_tex_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
     torch.manual_seed(seed)
     cond_res = 512 if resolution == 512 else 1024
     print(f"[tex_cond] computing image embeddings ({cond_res}px)...", flush=True)
-    cond = pipe.get_cond([img], cond_res)
+    with torch.inference_mode():
+        cond = pipe.get_cond([img], cond_res)
     
     # Save conditioning
     cond_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1156,7 +1305,8 @@ def stage_tex_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     torch.manual_seed(seed)
     print(f"[tex_sample] sampling texture latent ({tex_model_key})...", flush=True)
-    tex_slat = pipe.sample_tex_slat(cond, pipe.models[tex_model_key], shape_slat, tex_params)
+    with torch.inference_mode():
+        tex_slat = pipe.sample_tex_slat(cond, pipe.models[tex_model_key], shape_slat, tex_params)
 
     # Save texture latent with spatial cache (needed for decoding)
     _save_sparse_tensor_full(tex_slat_path, tex_slat)
@@ -2228,6 +2378,7 @@ def main() -> int:
             "unirig_merge",
             "unirig_skeleton_preview",
             "unirig_animation_preview",
+            "ultrashape_refine_mesh",
         }:
             _ensure_o_voxel_available()
 
@@ -2251,6 +2402,8 @@ def main() -> int:
             result = stage_render_preview(payload)
         elif stage == "extract_glb":
             result = stage_extract_glb(payload)
+        elif stage == "ultrashape_refine_mesh":
+            result = stage_ultrashape_refine_mesh(payload)
         elif stage == "tex_encode_cond":
             result = stage_tex_encode_cond(payload)
         elif stage == "tex_encode_shape":
