@@ -826,6 +826,179 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"tex_slat_path": str(tex_slat_path)}
 
 
+def stage_sample_multiview_latents(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import gc
+    import torch
+    from PIL import Image
+    from trellis2.pipelines import Trellis2MultiViewPipeline
+
+    model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    seed = int(payload.get("seed", 42))
+    resolution = str(payload["resolution"])
+    pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
+    mode = str(payload.get("multiview_mode", "stochastic")).strip().lower()
+    if mode not in {"stochastic", "multidiffusion"}:
+        mode = "stochastic"
+    max_num_tokens = int(payload.get("max_num_tokens", 49152))
+    no_texture_gen = bool(payload.get("no_texture_gen", False))
+    low_vram = bool(payload.get("low_vram", False))
+
+    image_paths = [Path(p) for p in payload.get("image_paths", [])]
+    if len(image_paths) < 2:
+        raise ValueError("sample_multiview_latents requires at least 2 preprocessed views.")
+
+    shape_slat_path = Path(payload["shape_slat_path"])
+    out_res_path = Path(payload["out_res_path"])
+    tex_slat_path = Path(payload["tex_slat_path"]) if payload.get("tex_slat_path") else None
+    if not no_texture_gen and tex_slat_path is None:
+        raise ValueError("tex_slat_path is required when no_texture_gen is False.")
+
+    ss_params = payload.get("ss_params", {}) or {}
+    shape_params = payload.get("shape_params", {}) or {}
+    tex_params = payload.get("tex_params", {}) or {}
+
+    images: List[Image.Image] = []
+    for p in image_paths:
+        print(f"[multiview] loading preprocessed view: {p}", flush=True)
+        with Image.open(str(p)) as im:
+            images.append(im.convert("RGB").copy())
+    num_images = len(images)
+
+    keep_models = ["sparse_structure_flow_model", "sparse_structure_decoder", "shape_slat_flow_model_512"]
+    if pipeline_type != "512":
+        keep_models.append("shape_slat_flow_model_1024")
+    if "_cascade" in pipeline_type:
+        keep_models.append("shape_slat_decoder")
+    if not no_texture_gen:
+        keep_models.append("tex_slat_flow_model_512" if pipeline_type == "512" else "tex_slat_flow_model_1024")
+
+    print(
+        f"[multiview] loading pipeline (type={pipeline_type}, views={num_images}, mode={mode}, low_vram={low_vram})...",
+        flush=True,
+    )
+    pipe = Trellis2MultiViewPipeline.from_pretrained(
+        model_repo,
+        ignore_models=_ignore_except_image_models(keep_models),
+        load_texture_models=not no_texture_gen,
+        load_image_cond_model=True,
+        load_rembg_model=False,
+    )
+    pipe.low_vram = low_vram
+    pipe.cuda()
+
+    try:
+        torch.manual_seed(seed)
+        with torch.inference_mode():
+            print("[multiview] computing image condition embeddings (512px)...", flush=True)
+            cond_512 = pipe.get_cond_multi(images, 512)
+            cond_1024 = None
+            if pipeline_type != "512":
+                print("[multiview] computing image condition embeddings (1024px)...", flush=True)
+                cond_1024 = pipe.get_cond_multi(images, 1024)
+
+            ss_steps = int({**pipe.sparse_structure_sampler_params, **ss_params}.get("steps", 12))
+            shape_steps = int({**pipe.shape_slat_sampler_params, **shape_params}.get("steps", 12))
+            tex_steps = int({**pipe.tex_slat_sampler_params, **tex_params}.get("steps", 12))
+            ss_res = _ss_res_from_pipeline_type(pipeline_type)
+
+            print(f"[multiview] sampling sparse structure (ss_res={ss_res})...", flush=True)
+            with pipe.inject_sampler_multi_image(pipe.sparse_structure_sampler, num_images, ss_steps, mode):
+                coords = pipe.sample_sparse_structure(cond_512, ss_res, 1, ss_params)
+
+            if pipeline_type == "512":
+                print("[multiview] sampling shape SLat (512)...", flush=True)
+                with pipe.inject_sampler_multi_image(pipe.shape_slat_sampler, num_images, shape_steps, mode):
+                    shape_slat = pipe.sample_shape_slat(
+                        cond_512,
+                        pipe.models["shape_slat_flow_model_512"],
+                        coords,
+                        shape_params,
+                    )
+                res = 512
+            elif pipeline_type == "1024":
+                if cond_1024 is None:
+                    raise ValueError("cond_1024 is required for 1024 pipeline type.")
+                print("[multiview] sampling shape SLat (1024)...", flush=True)
+                with pipe.inject_sampler_multi_image(pipe.shape_slat_sampler, num_images, shape_steps, mode):
+                    shape_slat = pipe.sample_shape_slat(
+                        cond_1024,
+                        pipe.models["shape_slat_flow_model_1024"],
+                        coords,
+                        shape_params,
+                    )
+                res = 1024
+            elif "_cascade" in pipeline_type:
+                if cond_1024 is None:
+                    raise ValueError("cond_1024 is required for cascade pipeline type.")
+                cascade_target_res = _target_res_from_pipeline_type(pipeline_type, target_res)
+                print(f"[multiview] sampling shape SLat cascade (target_res={cascade_target_res})...", flush=True)
+                with pipe.inject_sampler_multi_image(pipe.shape_slat_sampler, num_images, shape_steps * 2, mode):
+                    shape_slat, res = pipe.sample_shape_slat_cascade(
+                        cond_512,
+                        cond_1024,
+                        pipe.models["shape_slat_flow_model_512"],
+                        pipe.models["shape_slat_flow_model_1024"],
+                        512,
+                        cascade_target_res,
+                        coords,
+                        shape_params,
+                        max_num_tokens,
+                    )
+            else:
+                raise ValueError(f"Unsupported pipeline type for multiview: {pipeline_type}")
+
+            if no_texture_gen:
+                tex_slat = None
+                print("[multiview] skipping texture latent sampling.", flush=True)
+            else:
+                tex_cond = cond_512 if pipeline_type == "512" else cond_1024
+                tex_model_key = "tex_slat_flow_model_512" if pipeline_type == "512" else "tex_slat_flow_model_1024"
+                print(f"[multiview] sampling texture SLat ({tex_model_key})...", flush=True)
+                with pipe.inject_sampler_multi_image(pipe.tex_slat_sampler, num_images, tex_steps, mode):
+                    tex_slat = pipe.sample_tex_slat(tex_cond, pipe.models[tex_model_key], shape_slat, tex_params)
+
+        _save_npz_sparse(shape_slat_path, shape_slat.feats, shape_slat.coords)
+        _write_json(
+            out_res_path,
+            {
+                "res": int(res),
+                "pipeline_type": pipeline_type,
+                "multiview": True,
+                "view_count": int(num_images),
+                "multiview_mode": mode,
+            },
+        )
+        print(f"[multiview] saved shape SLat: {shape_slat_path}", flush=True)
+        print(f"[multiview] saved shape metadata: {out_res_path} (res={int(res)})", flush=True)
+
+        if tex_slat is not None and tex_slat_path is not None:
+            _save_npz_sparse(tex_slat_path, tex_slat.feats, tex_slat.coords)
+            print(f"[multiview] saved tex SLat: {tex_slat_path}", flush=True)
+
+        return {
+            "shape_slat_path": str(shape_slat_path),
+            "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
+            "out_res_path": str(out_res_path),
+            "res": int(res),
+            "pipeline_type": pipeline_type,
+            "multiview_mode": mode,
+            "view_count": int(num_images),
+        }
+    finally:
+        try:
+            pipe.cpu()
+        except Exception:
+            pass
+        try:
+            del pipe
+        except Exception:
+            pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        _log_vram_usage("After multiview latent sampling")
+
+
 def stage_preview_decode_mesh(payload: Dict[str, Any]) -> Dict[str, Any]:
     import gc
     import torch
@@ -3061,6 +3234,8 @@ def main() -> int:
             result = stage_sample_shape_slat(payload)
         elif stage == "sample_tex_slat":
             result = stage_sample_tex_slat(payload)
+        elif stage == "sample_multiview_latents":
+            result = stage_sample_multiview_latents(payload)
         elif stage == "preview_decode_mesh":
             result = stage_preview_decode_mesh(payload)
         elif stage == "preview_render_mesh":
