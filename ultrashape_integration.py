@@ -7,6 +7,7 @@ import time
 from contextlib import nullcontext
 from pathlib import Path
 
+import numpy as np
 import torch
 import trimesh
 from PIL import Image
@@ -34,6 +35,25 @@ def _as_trimesh(mesh_obj) -> trimesh.Trimesh:
     v_np = _torch_or_numpy_to_numpy(mesh_obj.vertices)
     f_np = _torch_or_numpy_to_numpy(mesh_obj.faces)
     return trimesh.Trimesh(vertices=v_np, faces=f_np, process=False)
+
+
+def _mesh_denorm_params(mesh_tri: trimesh.Trimesh, normalize_scale: float) -> tuple[np.ndarray, float]:
+    """
+    UltraShape surface loader normalizes mesh as:
+      p_norm = (p - center) * (2*normalize_scale / max_extent)
+    Return inverse transform (center, inv_scale) to map refined vertices back.
+    """
+    bounds = np.asarray(mesh_tri.bounds, dtype=np.float64)
+    center = (bounds[1] + bounds[0]) / 2.0
+    extents = bounds[1] - bounds[0]
+    max_extent = float(np.max(extents))
+    if max_extent <= 1e-8:
+        return center.astype(np.float32), 1.0
+    norm_scale = (2.0 * float(normalize_scale)) / max_extent
+    if abs(norm_scale) <= 1e-12:
+        return center.astype(np.float32), 1.0
+    inv_scale = 1.0 / norm_scale
+    return center.astype(np.float32), float(inv_scale)
 
 
 def _candidate_ultrashape_roots(app_dir: Path) -> list[Path]:
@@ -236,6 +256,7 @@ def refine_mesh_with_ultrashape(
         }
 
     mesh_tri = _as_trimesh(mesh)
+    denorm_center, denorm_inv_scale = _mesh_denorm_params(mesh_tri, float(normalize_scale))
     _ulog(f"Input mesh prepared (v={len(mesh_tri.vertices)}, f={len(mesh_tri.faces)}).")
 
     loader = SharpEdgeSurfaceLoader(
@@ -327,6 +348,14 @@ def refine_mesh_with_ultrashape(
     refined = result[0] if isinstance(result, list) else result
     if isinstance(refined, trimesh.Scene):
         refined = refined.to_mesh()
+    if isinstance(refined, trimesh.Trimesh):
+        # UltraShape outputs in normalized coordinate space; restore original TRELLIS mesh space.
+        rv = np.asarray(refined.vertices, dtype=np.float32)
+        rv = rv * denorm_inv_scale + denorm_center
+        refined = trimesh.Trimesh(vertices=rv, faces=refined.faces, process=False)
+        _ulog(
+            f"Refined mesh denormalized to TRELLIS space (inv_scale={denorm_inv_scale:.6f})."
+        )
 
     if voxel_payload is not None:
         from trellis2.representations import MeshWithVoxel
