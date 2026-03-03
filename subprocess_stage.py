@@ -277,6 +277,180 @@ def _ignore_except_texturing_models(keep: List[str]) -> List[str]:
     return [n for n in names if n not in set(keep)]
 
 
+def _normalize_tex_params_for_retexture(raw: Dict[str, Any]) -> Dict[str, Any]:
+    params = raw or {}
+    interval = params.get("guidance_interval", [0.6, 0.9])
+    try:
+        if not isinstance(interval, (list, tuple)) or len(interval) != 2:
+            interval = [0.6, 0.9]
+    except Exception:
+        interval = [0.6, 0.9]
+    return {
+        "steps": int(params.get("steps", 12)),
+        "guidance_strength": float(params.get("guidance_strength", 1.0)),
+        "guidance_rescale": float(params.get("guidance_rescale", 0.0)),
+        "guidance_interval": [float(interval[0]), float(interval[1])],
+        "rescale_t": float(params.get("rescale_t", 3.0)),
+    }
+
+
+def _retexture_mesh_with_reference(
+    mesh: "trimesh.Trimesh",
+    image_path: Path,
+    *,
+    model_repo: str,
+    config_file: str,
+    resolution: int,
+    texture_size: int,
+    seed: int,
+    tex_params: Dict[str, Any],
+    low_vram: bool,
+) -> "trimesh.Trimesh":
+    import gc
+    import trimesh
+    import torch
+    from PIL import Image
+    from trellis2.pipelines import Trellis2TexturingPipeline
+
+    tex_model_key = "tex_slat_flow_model_512" if int(resolution) == 512 else "tex_slat_flow_model_1024"
+    ignore_models = _ignore_except_texturing_models(["shape_slat_encoder", "tex_slat_decoder", tex_model_key])
+
+    print("[extract][retexture] loading texturing pipeline...", flush=True)
+    tex_pipe = Trellis2TexturingPipeline.from_pretrained(
+        model_repo,
+        config_file=config_file,
+        ignore_models=ignore_models,
+    )
+    tex_pipe.low_vram = bool(low_vram)
+    tex_pipe.cuda()
+
+    try:
+        if isinstance(mesh, trimesh.Scene):
+            mesh = mesh.to_mesh()
+
+        with Image.open(str(image_path)) as im:
+            ref = im.convert("RGBA")
+        ref = tex_pipe.preprocess_image(ref)
+
+        print("[extract][retexture] preprocessing mesh...", flush=True)
+        mesh_in = tex_pipe.preprocess_mesh(mesh)
+
+        tex_res = int(resolution)
+        if tex_res != 512:
+            tex_res = min(tex_res, 1536)
+        cond_res = 512 if tex_res == 512 else 1024
+
+        torch.manual_seed(int(seed))
+        print(f"[extract][retexture] computing image cond ({cond_res}px)...", flush=True)
+        cond = tex_pipe.get_cond([ref], cond_res)
+
+        print("[extract][retexture] encoding shape latent...", flush=True)
+        shape_slat = tex_pipe.encode_shape_slat(mesh_in, tex_res)
+
+        print("[extract][retexture] sampling texture latent...", flush=True)
+        tex_model = tex_pipe.models[tex_model_key]
+        tex_slat = tex_pipe.sample_tex_slat(cond, tex_model, shape_slat, tex_params)
+
+        print("[extract][retexture] decoding + baking texture...", flush=True)
+        pbr_voxel = tex_pipe.decode_tex_slat(tex_slat)
+        out_mesh = tex_pipe.postprocess_mesh(mesh_in, pbr_voxel, tex_res, int(texture_size))
+        return out_mesh
+    finally:
+        try:
+            tex_pipe.cpu()
+        except Exception:
+            pass
+        try:
+            del tex_pipe
+        except Exception:
+            pass
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _to_cpu_tensor(x, *, dtype: Optional["torch.dtype"] = None) -> "torch.Tensor":
+    import numpy as np
+    import torch
+
+    if torch.is_tensor(x):
+        t = x.detach().cpu()
+        if dtype is not None:
+            t = t.to(dtype=dtype)
+        return t
+    arr = np.asarray(x)
+    t = torch.from_numpy(arr)
+    if dtype is not None:
+        t = t.to(dtype=dtype)
+    return t.cpu()
+
+
+def _save_mesh_blob(path: Path, mesh: Any) -> None:
+    import torch
+    import trimesh
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.to_mesh()
+
+    if hasattr(mesh, "attrs") and hasattr(mesh, "coords") and hasattr(mesh, "origin"):
+        origin = mesh.origin
+        if torch.is_tensor(origin):
+            origin = origin.detach().cpu().tolist()
+        data = {
+            "kind": "mesh_voxel",
+            "vertices": _to_cpu_tensor(mesh.vertices, dtype=torch.float32),
+            "faces": _to_cpu_tensor(mesh.faces, dtype=torch.int32),
+            "attrs": _to_cpu_tensor(mesh.attrs, dtype=torch.float32),
+            "coords": _to_cpu_tensor(mesh.coords, dtype=torch.int32),
+            "origin": list(origin),
+            "voxel_size": float(mesh.voxel_size),
+            "voxel_shape": tuple(mesh.voxel_shape) if getattr(mesh, "voxel_shape", None) is not None else None,
+            "layout": getattr(mesh, "layout", {}),
+        }
+    else:
+        data = {
+            "kind": "trimesh",
+            "vertices": _to_cpu_tensor(mesh.vertices, dtype=torch.float32),
+            "faces": _to_cpu_tensor(mesh.faces, dtype=torch.int32),
+        }
+    torch.save(data, str(path))
+
+
+def _load_mesh_blob(path: Path) -> Dict[str, Any]:
+    import torch
+
+    # weights_only=False for broad compatibility across torch versions.
+    return torch.load(str(path), map_location="cpu", weights_only=False)
+
+
+def _blob_to_mesh_obj(blob: Dict[str, Any], device: str = "cpu") -> Any:
+    import trimesh
+    import torch
+
+    kind = str(blob.get("kind", ""))
+    if kind == "mesh_voxel":
+        from trellis2.representations import MeshWithVoxel
+
+        origin = blob.get("origin", [-0.5, -0.5, -0.5])
+        return MeshWithVoxel(
+            vertices=blob["vertices"].to(device=device, dtype=torch.float32),
+            faces=blob["faces"].to(device=device, dtype=torch.int32),
+            origin=origin,
+            voxel_size=float(blob["voxel_size"]),
+            coords=blob["coords"].to(device=device, dtype=torch.int32),
+            attrs=blob["attrs"].to(device=device, dtype=torch.float32),
+            voxel_shape=torch.Size(blob.get("voxel_shape") or []),
+            layout=blob.get("layout", {}),
+        )
+    if kind == "trimesh":
+        return trimesh.Trimesh(
+            vertices=blob["vertices"].cpu().numpy(),
+            faces=blob["faces"].cpu().numpy(),
+            process=False,
+        )
+    raise ValueError(f"Unsupported mesh blob kind: {kind}")
+
+
 def stage_preprocess_image(payload: Dict[str, Any]) -> Dict[str, Any]:
     import torch
     from PIL import Image
@@ -652,6 +826,67 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"tex_slat_path": str(tex_slat_path)}
 
 
+def stage_preview_decode_mesh(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import gc
+    import torch
+    from trellis2.modules.sparse import SparseTensor
+    from trellis2.pipelines import Trellis2ImageTo3DPipeline
+
+    model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    low_vram = bool(payload.get("low_vram", False))
+    shape_slat_path = Path(payload["shape_slat_path"])
+    tex_slat_path = Path(payload["tex_slat_path"]) if payload.get("tex_slat_path") else None
+    res = int(payload["res"])
+    no_texture_gen = bool(payload.get("no_texture_gen", False))
+    use_tiled_extraction = bool(payload.get("use_tiled_extraction", False))
+    use_chunked_processing = bool(payload.get("use_chunked_processing", False))
+    mesh_blob_path = Path(payload["mesh_blob_path"])
+
+    device = "cuda"
+
+    feats, coords = _load_npz_sparse(shape_slat_path)
+    shape_slat = SparseTensor(feats=feats.to(device), coords=coords.to(device))
+    if tex_slat_path is not None and not no_texture_gen:
+        t_feats, _ = _load_npz_sparse(tex_slat_path)
+        tex_slat = shape_slat.replace(t_feats.to(device))
+    else:
+        tex_slat = None
+
+    keep = ["shape_slat_decoder"]
+    if tex_slat is not None:
+        keep.append("tex_slat_decoder")
+
+    print("[preview_decode] loading image pipeline decoder...", flush=True)
+    pipe = Trellis2ImageTo3DPipeline.from_pretrained(
+        model_repo,
+        ignore_models=_ignore_except_image_models(keep),
+        load_texture_models=False,
+        load_image_cond_model=False,
+        load_rembg_model=False,
+    )
+    pipe.low_vram = low_vram
+    pipe.cuda()
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    _log_vram_usage("Before preview decode_latent")
+
+    print("[preview_decode] decoding latent to mesh...", flush=True)
+    with torch.inference_mode():
+        mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
+
+    _save_mesh_blob(mesh_blob_path, mesh)
+    print(f"[preview_decode] saved mesh blob: {mesh_blob_path}", flush=True)
+
+    del mesh, shape_slat, tex_slat
+    pipe.cpu()
+    del pipe
+    gc.collect()
+    torch.cuda.empty_cache()
+    _log_vram_usage("After preview_decode stage")
+    return {"mesh_blob_path": str(mesh_blob_path)}
+
+
 def _has_nvdiffrec_render() -> bool:
     try:
         import nvdiffrec_render  # noqa: F401
@@ -684,6 +919,123 @@ def _simple_shaded(base_color: "torch.Tensor", normal_01: "torch.Tensor", tint: 
     shaded = base_color * (ambient + (1.0 - ambient) * lambert)
     shaded = shaded * tint.view(3, 1, 1).clamp(0.0, 2.0)
     return shaded.clamp(0.0, 1.0)
+
+
+def stage_preview_render_mesh(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import numpy as np
+    import torch
+    from PIL import Image
+    from trellis2.utils import render_utils
+
+    mesh_blob_path = Path(payload["mesh_blob_path"])
+    preview_dir = Path(payload["preview_dir"])
+    manifest_path = Path(payload["preview_manifest_path"])
+    simplify_face_limit = int(payload.get("simplify_face_limit", 16777216))
+
+    blob = _load_mesh_blob(mesh_blob_path)
+    mesh = _blob_to_mesh_obj(blob, device="cuda")
+
+    print("[preview_render] simplifying mesh...", flush=True)
+    try:
+        mesh.simplify(simplify_face_limit)
+    except Exception as e:
+        print(f"[preview_render] simplify failed: {type(e).__name__}: {e}", flush=True)
+
+    MODES = [
+        {"name": "Normal", "render_key": "normal"},
+        {"name": "Clay render", "render_key": "clay"},
+        {"name": "Base color", "render_key": "base_color"},
+        {"name": "HDRI forest", "render_key": "shaded_forest"},
+        {"name": "HDRI sunset", "render_key": "shaded_sunset"},
+        {"name": "HDRI courtyard", "render_key": "shaded_courtyard"},
+    ]
+    STEPS = 8
+
+    pbr_supported = _has_nvdiffrec_render()
+    images: Dict[str, List[np.ndarray]] = {m["render_key"]: [] for m in MODES}
+
+    yaw = np.linspace(0, 2 * np.pi, STEPS, endpoint=False)
+    yaw = [float(y - 16 / 180 * np.pi) for y in yaw]
+    pitch = [float(20 / 180 * np.pi) for _ in range(STEPS)]
+    extrinsics, intrinsics = render_utils.yaw_pitch_r_fov_to_extrinsics_intrinsics(yaw, pitch, 2.0, 36.0)
+
+    if pbr_supported:
+        print("[preview_render] PBR preview enabled (nvdiffrec_render found).", flush=True)
+        import cv2
+        from trellis2.renderers import EnvMap, PbrMeshRenderer
+
+        def _load_env(name: str) -> EnvMap:
+            path = ASSETS_DIR / "hdri" / f"{name}.exr"
+            img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise FileNotFoundError(str(path))
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            return EnvMap(torch.tensor(img, dtype=torch.float32, device="cuda"))
+
+        envmap = {"forest": _load_env("forest"), "sunset": _load_env("sunset"), "courtyard": _load_env("courtyard")}
+        renderer = PbrMeshRenderer(
+            rendering_options={"resolution": 1024, "near": 1, "far": 100, "ssaa": 2, "peel_layers": 8}
+        )
+
+        for j, (extr, intr) in enumerate(zip(extrinsics, intrinsics)):
+            print(f"[preview_render] rendering view {j + 1}/{STEPS}...", flush=True)
+            res_dict = renderer.render(mesh, extr, intr, envmap=envmap)
+            for mode in MODES:
+                key = mode["render_key"]
+                if key not in res_dict:
+                    fallback = res_dict.get("base_color", res_dict.get("clay"))
+                    images[key].append(_tensor_chw01_to_uint8_hwc(fallback))
+                else:
+                    images[key].append(_tensor_chw01_to_uint8_hwc(res_dict[key]))
+    else:
+        print("[preview_render] PBR preview disabled (missing nvdiffrec_render). Using simple shading.", flush=True)
+        from trellis2.renderers import MeshRenderer
+
+        renderer = MeshRenderer(
+            rendering_options={"resolution": 1024, "near": 1, "far": 100, "ssaa": 2, "chunk_size": None}
+        )
+        t_forest = torch.tensor([0.85, 1.05, 0.85], device="cuda")
+        t_sunset = torch.tensor([1.10, 0.90, 0.75], device="cuda")
+        t_court = torch.tensor([0.85, 0.95, 1.10], device="cuda")
+
+        for j, (extr, intr) in enumerate(zip(extrinsics, intrinsics)):
+            print(f"[preview_render] rendering view {j + 1}/{STEPS}...", flush=True)
+            res_dict = renderer.render(mesh, extr, intr, return_types=["mask", "normal", "attr"])
+            normal = res_dict["normal"]
+            base_color = res_dict.get("base_color", torch.full_like(normal, 0.8))
+
+            clay_base = torch.full_like(base_color, 0.78)
+            clay = _simple_shaded(clay_base, normal, torch.tensor([1.0, 1.0, 1.0], device=normal.device))
+            shaded_forest = _simple_shaded(base_color, normal, t_forest)
+            shaded_sunset = _simple_shaded(base_color, normal, t_sunset)
+            shaded_courtyard = _simple_shaded(base_color, normal, t_court)
+
+            mode_map = {
+                "normal": normal,
+                "clay": clay,
+                "base_color": base_color,
+                "shaded_forest": shaded_forest,
+                "shaded_sunset": shaded_sunset,
+                "shaded_courtyard": shaded_courtyard,
+            }
+            for mode in MODES:
+                key = mode["render_key"]
+                images[key].append(_tensor_chw01_to_uint8_hwc(mode_map[key]))
+
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    manifest: Dict[str, List[str]] = {}
+    for m_idx, mode in enumerate(MODES):
+        key = mode["render_key"]
+        manifest[key] = []
+        for s_idx in range(STEPS):
+            fname = f"view-m{m_idx}-s{s_idx}.jpg"
+            path = preview_dir / fname
+            Image.fromarray(images[key][s_idx]).save(str(path), format="JPEG", quality=85)
+            manifest[key].append(str(path))
+
+    _write_json(manifest_path, {"modes": MODES, "steps": STEPS, "files": manifest})
+    print(f"[preview_render] saved manifest: {manifest_path}", flush=True)
+    return {"preview_manifest_path": str(manifest_path), "preview_dir": str(preview_dir)}
 
 
 def stage_render_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -848,6 +1200,259 @@ def stage_render_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"preview_manifest_path": str(manifest_path), "preview_dir": str(preview_dir)}
 
 
+def stage_extract_decode_mesh(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import gc
+    import torch
+    from trellis2.modules.sparse import SparseTensor
+    from trellis2.pipelines import Trellis2ImageTo3DPipeline
+
+    model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    low_vram = bool(payload.get("low_vram", False))
+    shape_slat_path = Path(payload["shape_slat_path"])
+    tex_slat_path = Path(payload["tex_slat_path"]) if payload.get("tex_slat_path") else None
+    res = int(payload["res"])
+    no_texture_gen = bool(payload.get("no_texture_gen", False))
+    extract_use_tiled_extraction = bool(payload.get("extract_use_tiled_extraction", False))
+    extract_use_chunked_processing = bool(payload.get("extract_use_chunked_processing", False))
+    mesh_blob_path = Path(payload["mesh_blob_path"])
+
+    device = "cuda"
+    feats, coords = _load_npz_sparse(shape_slat_path)
+    shape_slat = SparseTensor(feats=feats.to(device), coords=coords.to(device))
+    if tex_slat_path is not None and (not no_texture_gen):
+        t_feats, _ = _load_npz_sparse(tex_slat_path)
+        tex_slat = shape_slat.replace(t_feats.to(device))
+    else:
+        tex_slat = None
+
+    keep = ["shape_slat_decoder"]
+    if tex_slat is not None:
+        keep.append("tex_slat_decoder")
+
+    print("[extract_decode] loading image pipeline decoder...", flush=True)
+    pipe = Trellis2ImageTo3DPipeline.from_pretrained(
+        model_repo,
+        ignore_models=_ignore_except_image_models(keep),
+        load_texture_models=False,
+        load_image_cond_model=False,
+        load_rembg_model=False,
+    )
+    pipe.low_vram = low_vram
+    pipe.cuda()
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    _log_vram_usage("Before extract_decode decode_latent")
+
+    print("[extract_decode] decoding latent to mesh...", flush=True)
+    with torch.inference_mode():
+        mesh = pipe.decode_latent(shape_slat, tex_slat, res, extract_use_tiled_extraction, extract_use_chunked_processing)[0]
+
+    _save_mesh_blob(mesh_blob_path, mesh)
+    print(f"[extract_decode] saved mesh blob: {mesh_blob_path}", flush=True)
+
+    del mesh, shape_slat, tex_slat
+    pipe.cpu()
+    del pipe
+    gc.collect()
+    torch.cuda.empty_cache()
+    _log_vram_usage("After extract_decode stage")
+    return {"mesh_blob_path": str(mesh_blob_path)}
+
+
+def stage_extract_ultrashape_refine(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import gc
+    import torch
+
+    mesh_blob_in = Path(payload["mesh_blob_in"])
+    mesh_blob_out = Path(payload["mesh_blob_out"])
+    image_path = Path(payload["image_path"])
+    ultrashape_cfg = payload.get("ultrashape") or {}
+
+    if not image_path.is_file():
+        raise FileNotFoundError(f"UltraShape reference image not found: {image_path}")
+
+    blob = _load_mesh_blob(mesh_blob_in)
+    mesh = _blob_to_mesh_obj(blob, device="cuda")
+
+    print("[extract_ultra] running UltraShape refinement...", flush=True)
+    try:
+        from ultrashape_integration import refine_mesh_with_ultrashape
+
+        refined = refine_mesh_with_ultrashape(
+            mesh,
+            image_path=str(image_path),
+            app_dir=str(APP_DIR),
+            models_dir=str(MODELS_DIR),
+            checkpoint=str(ultrashape_cfg.get("checkpoint", "")),
+            config_name=str(ultrashape_cfg.get("config_name", "infer_dit_refine.yaml")),
+            dtype=str(ultrashape_cfg.get("dtype", "bfloat16")),
+            low_vram=bool(ultrashape_cfg.get("low_vram", True)),
+            steps=int(ultrashape_cfg.get("steps", 50)),
+            guidance_scale=float(ultrashape_cfg.get("guidance_scale", 5.0)),
+            octree_resolution=int(ultrashape_cfg.get("octree_resolution", 384)),
+            num_chunks=int(ultrashape_cfg.get("num_chunks", 8000)),
+            mc_level=float(ultrashape_cfg.get("mc_level", 0.0)),
+            box_v=float(ultrashape_cfg.get("box_v", 1.0)),
+            seed=int(ultrashape_cfg.get("seed", 42)),
+            remove_bg=bool(ultrashape_cfg.get("remove_bg", False)),
+            normalize_scale=float(ultrashape_cfg.get("normalize_scale", 0.99)),
+            num_sharp_points=int(ultrashape_cfg.get("num_sharp_points", 204800)),
+            num_uniform_points=int(ultrashape_cfg.get("num_uniform_points", 204800)),
+            num_latents=int(ultrashape_cfg.get("num_latents", 0)),
+            target_face_count=int(ultrashape_cfg.get("target_face_count", 500000)),
+            enable_pbar=True,
+        )
+        _save_mesh_blob(mesh_blob_out, refined)
+        print(f"[extract_ultra] saved refined mesh blob: {mesh_blob_out}", flush=True)
+    except Exception as e:
+        print(
+            f"[extract_ultra] refinement failed: {type(e).__name__}: {e}. "
+            "Falling back to input mesh blob.",
+            flush=True,
+        )
+        _save_mesh_blob(mesh_blob_out, mesh)
+    finally:
+        gc.collect()
+        torch.cuda.empty_cache()
+        _log_vram_usage("After extract_ultra stage")
+    return {"mesh_blob_path": str(mesh_blob_out)}
+
+
+def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import o_voxel
+    from subprocess_utils import next_indexed_path
+
+    mesh_blob_path = Path(payload["mesh_blob_path"])
+    res = int(payload["res"])
+    decimation_target = int(payload["decimation_target"])
+    texture_size = int(payload["texture_size"])
+    requested_remesh_method = str(payload["remesh_method"])
+    remesh_method = requested_remesh_method
+    simplify_method = str(payload["simplify_method"])
+    prune_invisible_faces = bool(payload["prune_invisible_faces"])
+    texture_extraction = bool(payload.get("texture_extraction", True))
+    out_dir = Path(payload["out_dir"])
+    prefix = str(payload.get("prefix", "glb"))
+    export_formats = payload.get("export_formats") or ["glb"]
+    export_formats = [str(f).lower().strip() for f in export_formats if str(f).lower().strip() in {"glb", "gltf", "obj", "ply", "stl"}]
+    if "glb" not in export_formats:
+        export_formats = ["glb"] + export_formats
+
+    blob = _load_mesh_blob(mesh_blob_path)
+    if str(blob.get("kind")) != "mesh_voxel":
+        raise RuntimeError("extract_to_glb requires a mesh_voxel blob (with attrs/coords).")
+
+    vertices = blob["vertices"].cuda()
+    faces = blob["faces"].cuda()
+    attrs = blob["attrs"].cuda()
+    coords = blob["coords"].cuda()
+    attr_layout = blob.get("layout", {}) or {
+        "base_color": slice(0, 3),
+        "metallic": slice(3, 4),
+        "roughness": slice(4, 5),
+        "alpha": slice(5, 6),
+    }
+
+    print("[extract_to_glb] converting mesh blob to GLB...", flush=True)
+    if remesh_method == "faithful_contouring":
+        try:
+            import importlib
+
+            importlib.import_module("faithcontour")
+            importlib.import_module("atom3d")
+        except Exception as e:
+            print(
+                "[extract_to_glb] warning: faithful_contouring unavailable "
+                f"({type(e).__name__}: {e}). Falling back to dual_contouring.",
+                flush=True,
+            )
+            remesh_method = "dual_contouring"
+
+    to_glb_kwargs = {
+        "vertices": vertices,
+        "faces": faces,
+        "attr_volume": attrs,
+        "coords": coords,
+        "attr_layout": attr_layout,
+        "grid_size": res,
+        "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        "decimation_target": decimation_target,
+        "simplify_method": simplify_method,
+        "texture_extraction": texture_extraction,
+        "texture_size": texture_size,
+        "remesh": True,
+        "remesh_band": 1,
+        "remesh_project": 0,
+        "remesh_method": remesh_method,
+        "prune_invisible": prune_invisible_faces,
+        "use_tqdm": True,
+    }
+    try:
+        glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
+    except ImportError as e:
+        if requested_remesh_method == "faithful_contouring" and "Faithful Contouring is not installed" in str(e):
+            print(f"[extract_to_glb] warning: {e} Falling back to dual_contouring.", flush=True)
+            to_glb_kwargs["remesh_method"] = "dual_contouring"
+            glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
+        else:
+            raise
+
+    idx, glb_path = next_indexed_path(out_dir, prefix=prefix, ext="glb", digits=4, start=1)
+    glb.export(str(glb_path), extension_webp=False)
+
+    for fmt in export_formats:
+        if fmt == "glb":
+            continue
+        try:
+            if fmt == "gltf":
+                p = out_dir / f"gltf_{idx:04d}.gltf"
+            else:
+                p = out_dir / f"{fmt}_{idx:04d}.{fmt}"
+            glb.export(str(p))
+            print(f"[extract_to_glb] saved extra '{fmt}': {p}", flush=True)
+        except Exception as e:
+            print(f"[extract_to_glb] extra export '{fmt}' failed: {type(e).__name__}: {e}", flush=True)
+
+    print(f"[extract_to_glb] saved: {glb_path}", flush=True)
+    return {"glb_path": str(glb_path)}
+
+
+def stage_mesh_export_formats(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import re
+    import trimesh
+
+    mesh_path = Path(payload["mesh_path"])
+    out_dir = Path(payload.get("out_dir") or mesh_path.parent)
+    export_formats = payload.get("export_formats") or []
+    export_formats = [str(f).lower().strip() for f in export_formats if str(f).lower().strip() in {"gltf", "obj", "ply", "stl"}]
+
+    if not mesh_path.is_file():
+        raise FileNotFoundError(f"Mesh path not found for export: {mesh_path}")
+    if not export_formats:
+        return {"mesh_path": str(mesh_path), "exported": []}
+
+    mesh = trimesh.load(str(mesh_path))
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.to_mesh()
+
+    m = re.search(r"(\d+)$", mesh_path.stem)
+    idx = int(m.group(1)) if m else 1
+    exported: List[str] = []
+    for fmt in export_formats:
+        try:
+            if fmt == "gltf":
+                p = out_dir / f"gltf_{idx:04d}.gltf"
+            else:
+                p = out_dir / f"{fmt}_{idx:04d}.{fmt}"
+            mesh.export(str(p))
+            exported.append(str(p))
+            print(f"[mesh_export] saved '{fmt}': {p}", flush=True)
+        except Exception as e:
+            print(f"[mesh_export] export '{fmt}' failed: {type(e).__name__}: {e}", flush=True)
+    return {"mesh_path": str(mesh_path), "exported": exported}
+
+
 def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     import torch
     from trellis2.modules.sparse import SparseTensor
@@ -870,6 +1475,8 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     prune_invisible_faces = bool(payload["prune_invisible_faces"])
     no_texture_gen = bool(payload["no_texture_gen"])
     ultrashape_cfg = payload.get("ultrashape") or {}
+    ultrashape_retexture_after_refine = bool(ultrashape_cfg.get("retexture_after_refine", True))
+    ultrashape_retexture_params = _normalize_tex_params_for_retexture(ultrashape_cfg.get("retexture_params") or {})
     
     # Extract GLB mesh extraction settings (user-configurable)
     extract_use_tiled_extraction = bool(payload.get("extract_use_tiled_extraction", False))
@@ -983,6 +1590,24 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
                 torch.cuda.empty_cache()
                 _log_vram_usage("After UltraShape refinement")
 
+    do_ultrashape_retexture = bool(ultrashape_enabled and ultrashape_retexture_after_refine and (not no_texture_gen))
+    image_file_for_retexture: Optional[Path] = None
+    if do_ultrashape_retexture:
+        image_path = ultrashape_cfg.get("image_path") or payload.get("preprocessed_image_path")
+        image_file_for_retexture = Path(str(image_path)) if image_path else None
+        if image_file_for_retexture is None or (not image_file_for_retexture.is_file()):
+            do_ultrashape_retexture = False
+            print(
+                "[extract] UltraShape re-texture requested, but no valid reference image path was provided. "
+                "Continuing with default texture extraction.",
+                flush=True,
+            )
+        else:
+            print(
+                "[extract] UltraShape re-texture enabled: running shape extraction first, then regenerating texture.",
+                flush=True,
+            )
+
     print("[extract] converting to GLB…", flush=True)
     # NOTE: `faithful_contouring` remeshing depends on optional FaithC packages
     # (`faithcontour` + `atom3d`). These are not installed by default on many
@@ -1013,7 +1638,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
         "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         "decimation_target": decimation_target,
         "simplify_method": simplify_method,
-        "texture_extraction": not no_texture_gen,
+        "texture_extraction": (False if do_ultrashape_retexture else (not no_texture_gen)),
         "texture_size": texture_size,
         "remesh": True,
         "remesh_band": 1,
@@ -1037,6 +1662,39 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
             glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
         else:
             raise
+
+    if do_ultrashape_retexture and image_file_for_retexture is not None:
+        try:
+            print("[extract] re-texturing extracted mesh with TRELLIS texturing pipeline...", flush=True)
+            glb = _retexture_mesh_with_reference(
+                glb,
+                image_file_for_retexture,
+                model_repo=model_repo,
+                config_file="texturing_pipeline.json",
+                resolution=res,
+                texture_size=texture_size,
+                seed=int(ultrashape_cfg.get("seed", 42)),
+                tex_params=ultrashape_retexture_params,
+                low_vram=bool(ultrashape_cfg.get("low_vram", True)),
+            )
+            print("[extract] UltraShape re-texture complete.", flush=True)
+        except Exception as e:
+            print(
+                f"[extract] UltraShape re-texture failed: {type(e).__name__}: {e}. "
+                "Falling back to standard attribute-volume texture extraction.",
+                flush=True,
+            )
+            try:
+                fallback_kwargs = dict(to_glb_kwargs)
+                fallback_kwargs["texture_extraction"] = True
+                glb = o_voxel.postprocess.to_glb(**fallback_kwargs)
+                print("[extract] fallback texture extraction complete.", flush=True)
+            except Exception as e2:
+                print(
+                    f"[extract] fallback texture extraction also failed: {type(e2).__name__}: {e2}. "
+                    "Keeping shape-only extracted mesh.",
+                    flush=True,
+                )
 
     idx, glb_path = next_indexed_path(out_dir, prefix=prefix, ext="glb", digits=4, start=1)
     glb.export(str(glb_path), extension_webp=False)
@@ -2379,6 +3037,8 @@ def main() -> int:
             "unirig_skeleton_preview",
             "unirig_animation_preview",
             "ultrashape_refine_mesh",
+            "extract_ultrashape_refine",
+            "mesh_export_formats",
         }:
             _ensure_o_voxel_available()
 
@@ -2398,8 +3058,20 @@ def main() -> int:
             result = stage_sample_shape_slat(payload)
         elif stage == "sample_tex_slat":
             result = stage_sample_tex_slat(payload)
+        elif stage == "preview_decode_mesh":
+            result = stage_preview_decode_mesh(payload)
+        elif stage == "preview_render_mesh":
+            result = stage_preview_render_mesh(payload)
         elif stage == "render_preview":
             result = stage_render_preview(payload)
+        elif stage == "extract_decode_mesh":
+            result = stage_extract_decode_mesh(payload)
+        elif stage == "extract_ultrashape_refine":
+            result = stage_extract_ultrashape_refine(payload)
+        elif stage == "extract_to_glb":
+            result = stage_extract_to_glb(payload)
+        elif stage == "mesh_export_formats":
+            result = stage_mesh_export_formats(payload)
         elif stage == "extract_glb":
             result = stage_extract_glb(payload)
         elif stage == "ultrashape_refine_mesh":

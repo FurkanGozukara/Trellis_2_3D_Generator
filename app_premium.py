@@ -619,6 +619,7 @@ def _default_ui_config() -> dict:
             "tex_slat_sampling_steps": 12,
             "tex_slat_rescale_t": 3.0,
             "ultrashape_enabled": True,
+            "ultrashape_retexture_after_refine": True,
             "ultrashape_checkpoint": "",
             "ultrashape_config_name": "infer_dit_refine.yaml",
             "ultrashape_dtype": "bfloat16",
@@ -2223,6 +2224,7 @@ def batch_process_folder(
     prune_invisible_faces: bool,
     export_formats: List[str],
     ultrashape_enabled: bool,
+    ultrashape_retexture_after_refine: bool,
     ultrashape_checkpoint: str,
     ultrashape_config_name: str,
     ultrashape_dtype: str,
@@ -2432,6 +2434,7 @@ def batch_process_folder(
                     use_chunked_processing,
                     use_tiled_extraction,
                     ultrashape_enabled,
+                    ultrashape_retexture_after_refine,
                     ultrashape_checkpoint,
                     ultrashape_config_name,
                     ultrashape_dtype,
@@ -2914,6 +2917,7 @@ def image_to_3d(
         shape_slat_path = run_dir / "05_shape_slat.npz"
         shape_res_path = run_dir / "05_shape_res.json"
         tex_slat_path = None if no_texture_gen else (run_dir / "06_tex_slat.npz")
+        preview_mesh_blob_path = run_dir / "07_preview_mesh_voxel.pt"
         preview_dir = run_dir / "07_preview"
         preview_manifest_path = run_dir / "07_preview_manifest.json"
         preview_html_path = run_dir / "07_preview.html"
@@ -3116,18 +3120,30 @@ def image_to_3d(
         preview_error_msg = "Preview skipped (batch mode)" if skip_preview else ""
         
         if not skip_preview:
-            preview_payload = {
-                "model_repo": "microsoft/TRELLIS.2-4B",
-                "shape_slat_path": str(shape_slat_path),
-                "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
-                "res": int(res),
-                "preview_dir": str(preview_dir),
-                "preview_manifest_path": str(preview_manifest_path),
-                "use_chunked_processing": bool(use_chunked_processing),
-                "use_tiled_extraction": bool(use_tiled_extraction),
-            }
             try:
-                _ = yield from _stage("render_preview", preview_payload, 0.82)
+                _ = yield from _stage(
+                    "preview_decode_mesh",
+                    {
+                        "model_repo": "microsoft/TRELLIS.2-4B",
+                        "shape_slat_path": str(shape_slat_path),
+                        "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
+                        "res": int(res),
+                        "no_texture_gen": bool(no_texture_gen),
+                        "use_chunked_processing": bool(use_chunked_processing),
+                        "use_tiled_extraction": bool(use_tiled_extraction),
+                        "mesh_blob_path": str(preview_mesh_blob_path),
+                    },
+                    0.78,
+                )
+                _ = yield from _stage(
+                    "preview_render_mesh",
+                    {
+                        "mesh_blob_path": str(preview_mesh_blob_path),
+                        "preview_dir": str(preview_dir),
+                        "preview_manifest_path": str(preview_manifest_path),
+                    },
+                    0.82,
+                )
             except UserCancelled:
                 yield from _cancelled_exit()
                 return
@@ -3159,6 +3175,13 @@ def image_to_3d(
                 "res": int(res),
                 "shape_slat_path": str(shape_slat_path),
                 "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
+                "_gen_tex_params": {
+                    "steps": int(tex_slat_sampling_steps),
+                    "guidance_strength": float(tex_slat_guidance_strength),
+                    "guidance_rescale": float(tex_slat_guidance_rescale),
+                    "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
+                    "rescale_t": float(tex_slat_rescale_t),
+                },
                 "preview_manifest_path": None,  # No preview available
                 "_preview_failed": True,
                 "_preview_error": preview_error_msg,
@@ -3254,6 +3277,13 @@ def image_to_3d(
             "res": int(res),
             "shape_slat_path": str(shape_slat_path),
             "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
+            "_gen_tex_params": {
+                "steps": int(tex_slat_sampling_steps),
+                "guidance_strength": float(tex_slat_guidance_strength),
+                "guidance_rescale": float(tex_slat_guidance_rescale),
+                "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
+                "rescale_t": float(tex_slat_rescale_t),
+            },
             "preview_manifest_path": str(preview_manifest_path),
         }
         _log("Done. You can now click “Extract GLB”.", 1.0)
@@ -3510,6 +3540,13 @@ def image_to_3d(
             state["seed"] = int(seed)
             state["shape_slat_path"] = str(shape_slat_path)
             state["tex_slat_path"] = str(tex_slat_path) if tex_slat_path is not None else None
+            state["_gen_tex_params"] = {
+                "steps": int(tex_slat_sampling_steps),
+                "guidance_strength": float(tex_slat_guidance_strength),
+                "guidance_rescale": float(tex_slat_guidance_rescale),
+                "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
+                "rescale_t": float(tex_slat_rescale_t),
+            }
             state["preview_manifest_path"] = str(preview_manifest_path)
             state["_multiview"] = True
             state["_multiview_mode"] = mv_mode
@@ -3749,6 +3786,13 @@ def image_to_3d(
         state["seed"] = int(seed)
         state["shape_slat_path"] = str(shape_slat_path)
         state["tex_slat_path"] = str(tex_slat_path) if tex_slat_path is not None else None
+        state["_gen_tex_params"] = {
+            "steps": int(tex_slat_sampling_steps),
+            "guidance_strength": float(tex_slat_guidance_strength),
+            "guidance_rescale": float(tex_slat_guidance_rescale),
+            "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
+            "rescale_t": float(tex_slat_rescale_t),
+        }
         state["preview_manifest_path"] = str(preview_manifest_path)
     except Exception:
         pass
@@ -3770,6 +3814,7 @@ def extract_glb(
     extract_use_chunked_processing: bool,
     extract_use_tiled_extraction: bool,
     ultrashape_enabled: bool,
+    ultrashape_retexture_after_refine: bool,
     ultrashape_checkpoint: str,
     ultrashape_config_name: str,
     ultrashape_dtype: str,
@@ -3799,7 +3844,11 @@ def extract_glb(
 
     # If the run was generated in subprocess mode (or the checkbox is enabled),
     # do extraction in a short-lived worker process to ensure VRAM goes back to 0.
-    if subprocess_mode or (isinstance(state, dict) and state.get("_mode") == "subprocess"):
+    if (
+        subprocess_mode
+        or (isinstance(state, dict) and state.get("_mode") == "subprocess")
+        or (bool(ultrashape_enabled) and bool(ultrashape_retexture_after_refine))
+    ):
         status = ""
 
         def _log(msg: str, p: Optional[float] = None) -> str:
@@ -3842,62 +3891,224 @@ def extract_glb(
             )
             yield None, None, status
 
-        payload = {
-            "model_repo": "microsoft/TRELLIS.2-4B",
-            "shape_slat_path": str(shape_slat_path),
-            "tex_slat_path": str(tex_slat_path) if tex_slat_path else None,
-            "preprocessed_image_path": state.get("_preprocessed_image_path") or state.get("_input_image_path"),
-            "res": int(res),
-            "decimation_target": int(decimation_target),
-            "texture_size": int(texture_size),
-            "remesh_method": remesh_method,
-            "simplify_method": simplify_method,
-            "prune_invisible_faces": bool(prune_invisible_faces),
-            "no_texture_gen": bool(no_texture_gen),
-            "out_dir": str(out_dir),
-            "prefix": "glb",
-            "export_formats": list(export_formats),
-            "extract_use_chunked_processing": bool(extract_use_chunked_processing),
-            "extract_use_tiled_extraction": bool(extract_use_tiled_extraction),
-            "ultrashape": {
-                "enabled": bool(ultrashape_enabled),
-                "image_path": state.get("_preprocessed_image_path") or state.get("_input_image_path"),
-                "checkpoint": str(ultrashape_checkpoint or "").strip(),
-                "config_name": str(ultrashape_config_name or "infer_dit_refine.yaml").strip(),
-                "dtype": str(ultrashape_dtype or "bfloat16").strip(),
-                "low_vram": bool(ultrashape_low_vram),
-                "remove_bg": bool(ultrashape_remove_bg),
-                "steps": int(ultrashape_steps),
-                "guidance_scale": float(ultrashape_guidance_scale),
-                "octree_resolution": int(ultrashape_octree_resolution),
-                "num_chunks": int(ultrashape_num_chunks),
-                "target_face_count": int(ultrashape_target_face_count),
-                "num_latents": int(ultrashape_num_latents),
-                "box_v": float(ultrashape_box_v),
-                "mc_level": float(ultrashape_mc_level),
-                "normalize_scale": float(ultrashape_normalize_scale),
-                "num_sharp_points": int(ultrashape_num_sharp_points),
-                "num_uniform_points": int(ultrashape_num_uniform_points),
-                "seed": int(state.get("seed", 42) if isinstance(state, dict) else 42),
-            },
-        }
-
         last_ui_update = 0.0
         log_path = Path(logs_dir) / "extract_glb.log"
-        result = None
-        try:
-            for ev in _iter_subprocess_stage("extract_glb", payload, work_dir, log_path, session=session):
+        reference_image_path = state.get("_preprocessed_image_path") or state.get("_input_image_path")
+        ultrashape_payload = {
+            "enabled": bool(ultrashape_enabled),
+            "retexture_after_refine": bool(ultrashape_retexture_after_refine),
+            "retexture_params": (state.get("_gen_tex_params") if isinstance(state, dict) else None),
+            "image_path": reference_image_path,
+            "checkpoint": str(ultrashape_checkpoint or "").strip(),
+            "config_name": str(ultrashape_config_name or "infer_dit_refine.yaml").strip(),
+            "dtype": str(ultrashape_dtype or "bfloat16").strip(),
+            "low_vram": bool(ultrashape_low_vram),
+            "remove_bg": bool(ultrashape_remove_bg),
+            "steps": int(ultrashape_steps),
+            "guidance_scale": float(ultrashape_guidance_scale),
+            "octree_resolution": int(ultrashape_octree_resolution),
+            "num_chunks": int(ultrashape_num_chunks),
+            "target_face_count": int(ultrashape_target_face_count),
+            "num_latents": int(ultrashape_num_latents),
+            "box_v": float(ultrashape_box_v),
+            "mc_level": float(ultrashape_mc_level),
+            "normalize_scale": float(ultrashape_normalize_scale),
+            "num_sharp_points": int(ultrashape_num_sharp_points),
+            "num_uniform_points": int(ultrashape_num_uniform_points),
+            "seed": int(state.get("seed", 42) if isinstance(state, dict) else 42),
+        }
+
+        do_retexture = bool(
+            ultrashape_enabled and ultrashape_retexture_after_refine and (not bool(no_texture_gen))
+        )
+        ref_path_obj = Path(str(reference_image_path)) if reference_image_path else None
+        if do_retexture and (ref_path_obj is None or not ref_path_obj.is_file()):
+            do_retexture = False
+            _log("UltraShape re-texture requested but no valid reference image found. Skipping re-texture.", 0.06)
+            yield None, None, status
+
+        mesh_blob_00 = out_dir / "00_decoded_mesh_voxel.pt"
+        mesh_blob_01 = out_dir / "01_ultrashape_mesh_voxel.pt"
+        current_mesh_blob = mesh_blob_00
+        final_glb_path: Optional[str] = None
+
+        def _run_stage(stage_name: str, stage_payload: dict, base_progress: float, ui_msg: str):
+            nonlocal status, last_ui_update
+            _log(ui_msg, base_progress)
+            result_local = None
+            for ev in _iter_subprocess_stage(stage_name, stage_payload, work_dir, log_path, session=session):
                 if ev["type"] == "log":
                     line = ev["text"]
                     if line:
-                        status = status + "\n" + line
-                        status = _trim_status(status)
+                        status = _trim_status(status + "\n" + line)
                     now = time.time()
                     if now - last_ui_update > 0.6:
                         last_ui_update = now
                         yield None, None, status
                 else:
-                    result = ev["result"]
+                    result_local = ev["result"]
+            if not result_local:
+                raise gr.Error(f"Stage '{stage_name}' returned no result.")
+            return result_local
+
+        try:
+            # Stage 1: decode latent -> mesh blob
+            decode_payload = {
+                "model_repo": "microsoft/TRELLIS.2-4B",
+                "shape_slat_path": str(shape_slat_path),
+                "tex_slat_path": str(tex_slat_path) if tex_slat_path else None,
+                "res": int(res),
+                "no_texture_gen": bool(no_texture_gen),
+                "extract_use_chunked_processing": bool(extract_use_chunked_processing),
+                "extract_use_tiled_extraction": bool(extract_use_tiled_extraction),
+                "mesh_blob_path": str(mesh_blob_00),
+            }
+            decode_result = yield from _run_stage(
+                "extract_decode_mesh",
+                decode_payload,
+                0.08,
+                "Stage 1/4: Decoding latent mesh (subprocess)…",
+            )
+            current_mesh_blob = Path(str(decode_result["mesh_blob_path"]))
+
+            # Stage 2: optional UltraShape refine -> mesh blob
+            if ultrashape_enabled:
+                if ref_path_obj is None or (not ref_path_obj.is_file()):
+                    _log("UltraShape enabled but no valid reference image found. Skipping refinement.", 0.20)
+                    yield None, None, status
+                else:
+                    ultra_result = yield from _run_stage(
+                        "extract_ultrashape_refine",
+                        {
+                            "mesh_blob_in": str(current_mesh_blob),
+                            "mesh_blob_out": str(mesh_blob_01),
+                            "image_path": str(ref_path_obj),
+                            "ultrashape": ultrashape_payload,
+                        },
+                        0.22,
+                        "Stage 2/4: Running UltraShape refinement (subprocess)…",
+                    )
+                    current_mesh_blob = Path(str(ultra_result["mesh_blob_path"]))
+
+            # Stage 3: mesh blob -> GLB
+            to_glb_export_formats = ["glb"] if do_retexture else list(export_formats)
+            to_glb_result = yield from _run_stage(
+                "extract_to_glb",
+                {
+                    "mesh_blob_path": str(current_mesh_blob),
+                    "res": int(res),
+                    "decimation_target": int(decimation_target),
+                    "texture_size": int(texture_size),
+                    "remesh_method": remesh_method,
+                    "simplify_method": simplify_method,
+                    "prune_invisible_faces": bool(prune_invisible_faces),
+                    "texture_extraction": bool((not no_texture_gen) and (not do_retexture)),
+                    "out_dir": str(out_dir),
+                    "prefix": "glb",
+                    "export_formats": to_glb_export_formats,
+                },
+                0.42,
+                "Stage 3/4: Converting mesh to GLB (subprocess)…",
+            )
+            final_glb_path = str(to_glb_result["glb_path"])
+
+            # Stage 4: optional retexture in separate subprocess stages
+            if do_retexture and ref_path_obj is not None and ref_path_obj.is_file():
+                try:
+                    tex_seed = int(state.get("seed", 42) if isinstance(state, dict) else 42)
+                    tex_params = (state.get("_gen_tex_params") if isinstance(state, dict) else None) or {}
+                    tex_res = int(res)
+                    if tex_res != 512:
+                        tex_res = min(tex_res, 1536)
+                    retex_dir = run_dir / "09_extract_retexture"
+                    cond_path = retex_dir / "03_cond.pt"
+                    shape_slat_tex_path = retex_dir / "04_shape_slat.pt"
+                    tex_slat_tex_path = retex_dir / "05_tex_slat.pt"
+                    preprocessed_ref_path = retex_dir / "02_reference_preprocessed.png"
+
+                    common_tex_payload = {
+                        "model_repo": "microsoft/TRELLIS.2-4B",
+                        "config_file": "texturing_pipeline.json",
+                        "seed": tex_seed,
+                        "resolution": int(tex_res),
+                    }
+
+                    _ = yield from _run_stage(
+                        "tex_encode_cond",
+                        {
+                            **common_tex_payload,
+                            "image_path": str(ref_path_obj),
+                            "preprocessed_image_path": str(preprocessed_ref_path),
+                            "cond_path": str(cond_path),
+                        },
+                        0.58,
+                        "Stage 4/4: Re-texture pass (cond encoding)…",
+                    )
+
+                    _ = yield from _run_stage(
+                        "tex_encode_shape",
+                        {
+                            **common_tex_payload,
+                            "mesh_path": str(final_glb_path),
+                            "shape_slat_path": str(shape_slat_tex_path),
+                        },
+                        0.66,
+                        "Stage 4/4: Re-texture pass (shape encoding)…",
+                    )
+
+                    _ = yield from _run_stage(
+                        "tex_sample_tex_slat",
+                        {
+                            **common_tex_payload,
+                            "cond_path": str(cond_path),
+                            "shape_slat_path": str(shape_slat_tex_path),
+                            "tex_slat_path": str(tex_slat_tex_path),
+                            "tex_params": {
+                                "steps": int(tex_params.get("steps", 12)),
+                                "guidance_strength": float(tex_params.get("guidance_strength", 1.0)),
+                                "guidance_rescale": float(tex_params.get("guidance_rescale", 0.0)),
+                                "guidance_interval": list(tex_params.get("guidance_interval", [0.6, 0.9])),
+                                "rescale_t": float(tex_params.get("rescale_t", 3.0)),
+                            },
+                        },
+                        0.74,
+                        "Stage 4/4: Re-texture pass (texture sampling)…",
+                    )
+
+                    retex_result = yield from _run_stage(
+                        "tex_decode_and_bake",
+                        {
+                            **common_tex_payload,
+                            "mesh_path": str(final_glb_path),
+                            "tex_slat_path": str(tex_slat_tex_path),
+                            "texture_size": int(texture_size),
+                            "out_dir": str(out_dir),
+                            "prefix": "glb",
+                        },
+                        0.82,
+                        "Stage 4/4: Re-texture pass (decode + bake)…",
+                    )
+                    final_glb_path = str(retex_result["glb_path"])
+                except Exception as e:
+                    _log(
+                        f"Re-texture subprocess stages failed ({type(e).__name__}: {e}). "
+                        "Keeping shape-only extracted GLB.",
+                        0.86,
+                    )
+                    yield None, None, status
+
+                extra_formats = [f for f in export_formats if str(f).lower().strip() != "glb"]
+                if extra_formats:
+                    _ = yield from _run_stage(
+                        "mesh_export_formats",
+                        {
+                            "mesh_path": str(final_glb_path),
+                            "out_dir": str(out_dir),
+                            "export_formats": extra_formats,
+                        },
+                        0.90,
+                        "Exporting additional formats…",
+                    )
         except UserCancelled:
             _log("CANCELLED by user.", 0.0)
             yield None, None, status
@@ -3905,10 +4116,10 @@ def extract_glb(
             _clear_cancel_batch(session)
             return
 
-        if not result or "glb_path" not in result:
+        if not final_glb_path:
             raise gr.Error("Extraction failed (no GLB path returned). See logs in the run folder.")
 
-        glb_path = result["glb_path"]
+        glb_path = str(final_glb_path)
         _log(f"Saved: {safe_relpath(glb_path, APP_DIR)}", 0.98)
         _log("Done.", 1.0)
         yield glb_path, glb_path, status
@@ -3996,6 +4207,21 @@ def extract_glb(
     _log("Post-processing + baking GLB (this can take a while)…", 0.3)
     yield None, None, status
 
+    ultrashape_retexture_requested = bool(
+        ultrashape_enabled and ultrashape_retexture_after_refine and texture_extraction
+    )
+    retexture_image_file: Optional[Path] = None
+    if ultrashape_retexture_requested:
+        image_path = state.get("_preprocessed_image_path") or state.get("_input_image_path")
+        retexture_image_file = Path(str(image_path)) if image_path else None
+        if retexture_image_file is None or (not retexture_image_file.is_file()):
+            ultrashape_retexture_requested = False
+            _log("UltraShape re-texture requested, but no valid reference image was found. Using existing texture extraction.", 0.32)
+            yield None, None, status
+        else:
+            _log("UltraShape re-texture enabled: extraction will run shape-only first, then regenerate textures.", 0.32)
+            yield None, None, status
+
     requested_remesh_method = str(remesh_method)
     if requested_remesh_method == "faithful_contouring" and not _is_faithful_contouring_available():
         remesh_method = "dual_contouring"
@@ -4015,7 +4241,7 @@ def extract_glb(
         "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         "decimation_target": decimation_target,
         "simplify_method": simplify_method,
-        "texture_extraction": texture_extraction,
+        "texture_extraction": (False if ultrashape_retexture_requested else texture_extraction),
         "texture_size": texture_size,
         "remesh": True,
         "remesh_band": 1,
@@ -4037,6 +4263,70 @@ def extract_glb(
         else:
             raise
     yield None, None, status
+
+    if ultrashape_retexture_requested and retexture_image_file is not None:
+        try:
+            _log("Re-texturing UltraShape mesh with TRELLIS texturing pipeline…", 0.72)
+            yield None, None, status
+
+            try:
+                pipe.cpu()
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
+
+            mesh_for_tex = glb
+            if isinstance(mesh_for_tex, trimesh.Scene):
+                mesh_for_tex = mesh_for_tex.to_mesh()
+
+            tex_pipe = get_texturing_pipeline()
+            tex_pipe.low_vram = bool(ultrashape_low_vram)
+
+            tex_res = int(res)
+            if tex_res != 512:
+                tex_res = min(tex_res, 1536)
+            tex_params_src = state.get("_gen_tex_params") if isinstance(state, dict) else None
+            tex_params = {
+                "steps": int((tex_params_src or {}).get("steps", 12)),
+                "guidance_strength": float((tex_params_src or {}).get("guidance_strength", 1.0)),
+                "guidance_rescale": float((tex_params_src or {}).get("guidance_rescale", 0.0)),
+                "guidance_interval": list((tex_params_src or {}).get("guidance_interval", [0.6, 0.9])),
+                "rescale_t": float((tex_params_src or {}).get("rescale_t", 3.0)),
+            }
+            if len(tex_params["guidance_interval"]) != 2:
+                tex_params["guidance_interval"] = [0.6, 0.9]
+
+            with Image.open(str(retexture_image_file)) as _im:
+                tex_ref = _im.convert("RGBA")
+            tex_ref = tex_pipe.preprocess_image(tex_ref)
+            mesh_for_tex = tex_pipe.preprocess_mesh(mesh_for_tex)
+
+            torch.manual_seed(int(state.get("seed", 42) if isinstance(state, dict) else 42))
+            cond = tex_pipe.get_cond([tex_ref], 512 if tex_res == 512 else 1024)
+            shape_slat_tex = tex_pipe.encode_shape_slat(mesh_for_tex, tex_res)
+            tex_model = tex_pipe.models["tex_slat_flow_model_512"] if tex_res == 512 else tex_pipe.models["tex_slat_flow_model_1024"]
+            tex_slat = tex_pipe.sample_tex_slat(cond, tex_model, shape_slat_tex, tex_params)
+            pbr_voxel = tex_pipe.decode_tex_slat(tex_slat)
+            glb = tex_pipe.postprocess_mesh(mesh_for_tex, pbr_voxel, tex_res, int(texture_size))
+
+            _log("UltraShape re-texture complete.", 0.84)
+            yield None, None, status
+        except Exception as e:
+            _log(
+                f"UltraShape re-texture failed ({type(e).__name__}: {e}). Falling back to standard texture extraction.",
+                0.84,
+            )
+            try:
+                fallback_kwargs = dict(to_glb_kwargs)
+                fallback_kwargs["texture_extraction"] = True
+                glb = o_voxel.postprocess.to_glb(**fallback_kwargs)
+                _log("Fallback texture extraction complete.", 0.86)
+            except Exception as e2:
+                _log(
+                    f"Fallback texture extraction also failed ({type(e2).__name__}: {e2}). Keeping shape-only GLB.",
+                    0.86,
+                )
+            yield None, None, status
 
     _log("Saving GLB…", 0.9)
     export_formats = export_formats or ["glb"]
@@ -4852,6 +5142,11 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                     value=True,
                                     info="Run UltraShape image-guided mesh refinement before final GLB baking. Improves geometry detail; adds time/VRAM."
                                 )
+                                ultrashape_retexture_after_refine = gr.Checkbox(
+                                    label="Re-generate Texture After UltraShape",
+                                    value=True,
+                                    info="Recommended. Rebuild texture maps after UltraShape mesh changes to keep textures aligned."
+                                )
                                 with gr.Row():
                                     ultrashape_checkpoint = gr.Textbox(
                                         label="UltraShape Checkpoint (optional)",
@@ -5026,6 +5321,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     extract_use_chunked_processing,
                     extract_use_tiled_extraction,
                     ultrashape_enabled,
+                    ultrashape_retexture_after_refine,
                     ultrashape_checkpoint,
                     ultrashape_config_name,
                     ultrashape_dtype,
@@ -5252,6 +5548,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     prune_invisible_faces,
                     export_formats,
                     ultrashape_enabled,
+                    ultrashape_retexture_after_refine,
                     ultrashape_checkpoint,
                     ultrashape_config_name,
                     ultrashape_dtype,
@@ -6113,6 +6410,7 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         ("image_to_3d", "tex_slat_sampling_steps"),
         ("image_to_3d", "tex_slat_rescale_t"),
         ("image_to_3d", "ultrashape_enabled"),
+        ("image_to_3d", "ultrashape_retexture_after_refine"),
         ("image_to_3d", "ultrashape_checkpoint"),
         ("image_to_3d", "ultrashape_config_name"),
         ("image_to_3d", "ultrashape_dtype"),
@@ -6207,6 +6505,7 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         tex_slat_sampling_steps,
         tex_slat_rescale_t,
         ultrashape_enabled,
+        ultrashape_retexture_after_refine,
         ultrashape_checkpoint,
         ultrashape_config_name,
         ultrashape_dtype,

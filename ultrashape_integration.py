@@ -56,6 +56,37 @@ def _mesh_denorm_params(mesh_tri: trimesh.Trimesh, normalize_scale: float) -> tu
     return center.astype(np.float32), float(inv_scale)
 
 
+def _fit_vertices_uniform_to_bounds(vertices: np.ndarray, target_min: np.ndarray, target_max: np.ndarray) -> np.ndarray:
+    vmin = vertices.min(axis=0)
+    vmax = vertices.max(axis=0)
+    vcenter = (vmin + vmax) / 2.0
+    tcenter = (target_min + target_max) / 2.0
+    vext = float(np.max(vmax - vmin))
+    text = float(np.max(target_max - target_min))
+    if vext <= 1e-8 or text <= 1e-8:
+        return vertices
+    scale = text / vext
+    return (vertices - vcenter) * scale + tcenter
+
+
+def _fit_vertices_per_axis_to_bounds(vertices: np.ndarray, target_min: np.ndarray, target_max: np.ndarray) -> np.ndarray:
+    vmin = vertices.min(axis=0)
+    vmax = vertices.max(axis=0)
+    vspan = np.maximum(vmax - vmin, 1e-8)
+    tspan = target_max - target_min
+    return (vertices - vmin) / vspan * tspan + target_min
+
+
+def _outside_ratio(vertices: np.ndarray, bmin: np.ndarray, bmax: np.ndarray, pad_ratio: float = 0.02) -> float:
+    pad = float(np.max(bmax - bmin)) * float(pad_ratio)
+    lo = bmin - pad
+    hi = bmax + pad
+    outside = ((vertices < lo) | (vertices > hi)).any(axis=1)
+    if outside.size == 0:
+        return 0.0
+    return float(np.mean(outside))
+
+
 def _candidate_ultrashape_roots(app_dir: Path) -> list[Path]:
     return [
         app_dir / "UltraShape-1.0",
@@ -256,6 +287,8 @@ def refine_mesh_with_ultrashape(
         }
 
     mesh_tri = _as_trimesh(mesh)
+    orig_bounds = np.asarray(mesh_tri.bounds, dtype=np.float32)
+    orig_min, orig_max = orig_bounds[0], orig_bounds[1]
     denorm_center, denorm_inv_scale = _mesh_denorm_params(mesh_tri, float(normalize_scale))
     _ulog(f"Input mesh prepared (v={len(mesh_tri.vertices)}, f={len(mesh_tri.faces)}).")
 
@@ -352,6 +385,17 @@ def refine_mesh_with_ultrashape(
         # UltraShape outputs in normalized coordinate space; restore original TRELLIS mesh space.
         rv = np.asarray(refined.vertices, dtype=np.float32)
         rv = rv * denorm_inv_scale + denorm_center
+        # Texture safety: align refined geometry back to original TRELLIS bounds.
+        # This keeps attribute-volume sampling stable during GLB extraction.
+        rv = _fit_vertices_uniform_to_bounds(rv, orig_min, orig_max)
+        out_ratio = _outside_ratio(rv, orig_min, orig_max, pad_ratio=0.02)
+        if out_ratio > 0.03:
+            _ulog(
+                f"Refined mesh has {out_ratio:.1%} vertices outside source bounds; applying strict per-axis fit."
+            )
+            rv = _fit_vertices_per_axis_to_bounds(rv, orig_min, orig_max)
+            out_ratio = _outside_ratio(rv, orig_min, orig_max, pad_ratio=0.02)
+        _ulog(f"Bounds check after alignment: outside ratio={out_ratio:.2%}.")
         refined = trimesh.Trimesh(vertices=rv, faces=refined.faces, process=False)
         _ulog(
             f"Refined mesh denormalized to TRELLIS space (inv_scale={denorm_inv_scale:.6f})."

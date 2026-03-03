@@ -8,6 +8,10 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+3d_asset_preview.png
+input_image.png
+with_ultra_shape.png
+without_ultra_shape.png
 build/
 develop-eggs/
 dist/
