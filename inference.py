@@ -111,7 +111,9 @@ def main():
     shape_slat, tex_slat, res = latents
     mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
 
-    remesh_method = args.remesh_method
+    requested_remesh_method = str(args.remesh_method)
+    remesh_method = requested_remesh_method
+    remesh_fallback_reason = None
     if remesh_method == "faithful_contouring":
         try:
             import importlib
@@ -126,27 +128,74 @@ def main():
                 file=sys.stderr,
             )
             remesh_method = "dual_contouring"
+            remesh_fallback_reason = "missing_faithc_dependencies_precheck"
+    print(
+        f"[extract] remesh audit: requested={requested_remesh_method!r}, stage_input={remesh_method!r}",
+        flush=True,
+    )
     
     # Prune config
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=pipeline.pbr_attr_layout,
-        grid_size=res,
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=args.decimation_target,
-        simplify_method=args.simplify_method,
-        texture_extraction=not args.no_texture_gen,
-        texture_size=args.texture_size,
-        remesh=True,
-        remesh_band=1,
-        remesh_project=0,
-        remesh_method=remesh_method,
-        prune_invisible=args.prune_invisible_faces,
-        use_tqdm=True,
-    )
+    to_glb_kwargs = {
+        "vertices": mesh.vertices,
+        "faces": mesh.faces,
+        "attr_volume": mesh.attrs,
+        "coords": mesh.coords,
+        "attr_layout": pipeline.pbr_attr_layout,
+        "grid_size": res,
+        "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+        "decimation_target": args.decimation_target,
+        "simplify_method": args.simplify_method,
+        "texture_extraction": not args.no_texture_gen,
+        "texture_size": args.texture_size,
+        "remesh": True,
+        "remesh_band": 1,
+        "remesh_project": 0,
+        "remesh_method": remesh_method,
+        "prune_invisible": args.prune_invisible_faces,
+        "use_tqdm": True,
+    }
+    try:
+        glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
+    except Exception as e:
+        can_fallback = requested_remesh_method == "faithful_contouring"
+        is_missing_faithc = isinstance(e, ImportError) and ("Faithful Contouring is not installed" in str(e))
+        is_oom = isinstance(e, torch.OutOfMemoryError) or (
+            "out of memory" in str(e).lower() and "cuda" in str(e).lower()
+        )
+        if can_fallback and (is_missing_faithc or is_oom):
+            fallback_method = "dual_contouring"
+            if is_missing_faithc:
+                warn_msg = f"{e} Falling back to remesh_method={fallback_method!r}."
+                remesh_fallback_reason = "faithc_missing_during_to_glb"
+            else:
+                warn_msg = (
+                    "faithful_contouring ran out of GPU memory. "
+                    f"Retrying with remesh_method={fallback_method!r}."
+                )
+                remesh_fallback_reason = "oom_in_faithful_contouring"
+            print(f"[warn] {warn_msg}", file=sys.stderr)
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            to_glb_kwargs["remesh_method"] = fallback_method
+            glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
+        else:
+            raise
+    effective_remesh_method = str(to_glb_kwargs["remesh_method"])
+    if requested_remesh_method != effective_remesh_method:
+        print(
+            f"[extract] remesh audit result: requested={requested_remesh_method!r}, "
+            f"effective={effective_remesh_method!r}, "
+            f"fallback_reason={(remesh_fallback_reason or 'unknown')!r}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[extract] remesh audit result: requested={requested_remesh_method!r}, "
+            f"effective={effective_remesh_method!r}",
+            flush=True,
+        )
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     glb.export(args.output, extension_webp=False)

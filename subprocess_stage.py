@@ -92,6 +92,17 @@ def _read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _is_cuda_oom_error(exc: BaseException) -> bool:
+    try:
+        import torch
+        if isinstance(exc, torch.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    msg = str(exc).lower()
+    return ("out of memory" in msg) and ("cuda" in msg)
+
+
 def _split_indexed_stem(stem: str) -> Tuple[str, Optional[int]]:
     base, sep, tail = str(stem).rpartition("_")
     if sep and tail.isdigit():
@@ -1530,6 +1541,7 @@ def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     texture_size = int(payload["texture_size"])
     requested_remesh_method = str(payload["remesh_method"])
     remesh_method = requested_remesh_method
+    remesh_fallback_reason: Optional[str] = None
     simplify_method = str(payload["simplify_method"])
     prune_invisible_faces = bool(payload["prune_invisible_faces"])
     texture_extraction = bool(payload.get("texture_extraction", True))
@@ -1569,6 +1581,12 @@ def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
                 flush=True,
             )
             remesh_method = "dual_contouring"
+            remesh_fallback_reason = "missing_faithc_dependencies_precheck"
+    print(
+        f"[extract_to_glb] remesh audit: requested={requested_remesh_method!r}, "
+        f"stage_input={remesh_method!r}",
+        flush=True,
+    )
 
     to_glb_kwargs = {
         "vertices": vertices,
@@ -1591,13 +1609,44 @@ def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
     try:
         glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
-    except ImportError as e:
-        if requested_remesh_method == "faithful_contouring" and "Faithful Contouring is not installed" in str(e):
-            print(f"[extract_to_glb] warning: {e} Falling back to dual_contouring.", flush=True)
+    except Exception as e:
+        can_fallback = requested_remesh_method == "faithful_contouring"
+        is_missing_faithc = isinstance(e, ImportError) and ("Faithful Contouring is not installed" in str(e))
+        is_oom = _is_cuda_oom_error(e)
+        if can_fallback and (is_missing_faithc or is_oom):
+            if is_missing_faithc:
+                print(f"[extract_to_glb] warning: {e} Falling back to dual_contouring.", flush=True)
+                remesh_fallback_reason = "faithc_missing_during_to_glb"
+            else:
+                print(
+                    "[extract_to_glb] warning: faithful_contouring ran out of GPU memory. "
+                    "Retrying with dual_contouring.",
+                    flush=True,
+                )
+                remesh_fallback_reason = "oom_in_faithful_contouring"
+            try:
+                import torch
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
             to_glb_kwargs["remesh_method"] = "dual_contouring"
             glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
         else:
             raise
+    effective_remesh_method = str(to_glb_kwargs["remesh_method"])
+    if requested_remesh_method != effective_remesh_method:
+        print(
+            f"[extract_to_glb] remesh audit result: requested={requested_remesh_method!r}, "
+            f"effective={effective_remesh_method!r}, "
+            f"fallback_reason={(remesh_fallback_reason or 'unknown')!r}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[extract_to_glb] remesh audit result: requested={requested_remesh_method!r}, "
+            f"effective={effective_remesh_method!r}",
+            flush=True,
+        )
 
     idx, glb_path = next_indexed_path(out_dir, prefix=prefix, ext="glb", digits=4, start=1)
     glb.export(str(glb_path), extension_webp=False)
@@ -1613,7 +1662,12 @@ def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
             print(f"[extract_to_glb] extra export '{fmt}' failed: {type(e).__name__}: {e}", flush=True)
 
     print(f"[extract_to_glb] saved: {glb_path}", flush=True)
-    return {"glb_path": str(glb_path)}
+    return {
+        "glb_path": str(glb_path),
+        "requested_remesh_method": requested_remesh_method,
+        "effective_remesh_method": effective_remesh_method,
+        "remesh_fallback_reason": remesh_fallback_reason,
+    }
 
 
 def stage_mesh_export_formats(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1669,6 +1723,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     texture_size = int(payload["texture_size"])
     requested_remesh_method = str(payload["remesh_method"])
     remesh_method = requested_remesh_method
+    remesh_fallback_reason: Optional[str] = None
     simplify_method = str(payload["simplify_method"])
     prune_invisible_faces = bool(payload["prune_invisible_faces"])
     no_texture_gen = bool(payload["no_texture_gen"])
@@ -1826,6 +1881,12 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
                 flush=True,
             )
             remesh_method = "dual_contouring"
+            remesh_fallback_reason = "missing_faithc_dependencies_precheck"
+    print(
+        f"[extract] remesh audit: requested={requested_remesh_method!r}, "
+        f"stage_input={remesh_method!r}",
+        flush=True,
+    )
 
     to_glb_kwargs = {
         "vertices": mesh.vertices,
@@ -1848,19 +1909,49 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
     try:
         glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
-    except ImportError as e:
-        # Failsafe: if the FaithC import fails inside `o_voxel` after our check,
-        # retry once with a safe remesher.
-        if requested_remesh_method == "faithful_contouring" and "Faithful Contouring is not installed" in str(e):
+    except Exception as e:
+        # Failsafe: if FaithC is missing or faithful contouring OOMs, retry once
+        # with a safer remesher instead of failing the full extraction.
+        can_fallback = requested_remesh_method == "faithful_contouring"
+        is_missing_faithc = isinstance(e, ImportError) and ("Faithful Contouring is not installed" in str(e))
+        is_oom = _is_cuda_oom_error(e)
+        if can_fallback and (is_missing_faithc or is_oom):
             fallback_method = "dual_contouring"
-            print(
-                f"[extract] warning: {e} Falling back to remesh_method={fallback_method!r}.",
-                flush=True,
-            )
+            if is_missing_faithc:
+                print(
+                    f"[extract] warning: {e} Falling back to remesh_method={fallback_method!r}.",
+                    flush=True,
+                )
+                remesh_fallback_reason = "faithc_missing_during_to_glb"
+            else:
+                print(
+                    "[extract] warning: faithful_contouring ran out of GPU memory. "
+                    f"Retrying with remesh_method={fallback_method!r}.",
+                    flush=True,
+                )
+                remesh_fallback_reason = "oom_in_faithful_contouring"
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
             to_glb_kwargs["remesh_method"] = fallback_method
             glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
         else:
             raise
+    effective_remesh_method = str(to_glb_kwargs["remesh_method"])
+    if requested_remesh_method != effective_remesh_method:
+        print(
+            f"[extract] remesh audit result: requested={requested_remesh_method!r}, "
+            f"effective={effective_remesh_method!r}, "
+            f"fallback_reason={(remesh_fallback_reason or 'unknown')!r}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[extract] remesh audit result: requested={requested_remesh_method!r}, "
+            f"effective={effective_remesh_method!r}",
+            flush=True,
+        )
 
     if do_ultrashape_retexture and image_file_for_retexture is not None:
         try:
@@ -1909,7 +2000,12 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
             print(f"[extract] extra export '{fmt}' failed: {type(e).__name__}: {e}", flush=True)
     torch.cuda.empty_cache()
     print(f"[extract] saved: {glb_path}", flush=True)
-    return {"glb_path": str(glb_path)}
+    return {
+        "glb_path": str(glb_path),
+        "requested_remesh_method": requested_remesh_method,
+        "effective_remesh_method": effective_remesh_method,
+        "remesh_fallback_reason": remesh_fallback_reason,
+    }
 
 
 def stage_ultrashape_refine_mesh(payload: Dict[str, Any]) -> Dict[str, Any]:

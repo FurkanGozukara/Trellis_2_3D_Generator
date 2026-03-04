@@ -561,6 +561,9 @@ def _write_extract_artifacts_manifest(
     final_texture_source: str,
     export_formats: List[str],
     retexture_requested: bool,
+    requested_remesh_method: Optional[str] = None,
+    effective_remesh_method: Optional[str] = None,
+    remesh_fallback_reason: Optional[str] = None,
 ) -> None:
     try:
         out_dir = Path(out_dir)
@@ -642,6 +645,24 @@ def _write_extract_artifacts_manifest(
                 "contains_geometry": True,
                 "contains_pbr_textures": bool(final_has_textures),
                 "texture_source": str(final_texture_source),
+            },
+            "extract_settings": {
+                "requested_remesh_method": (
+                    str(requested_remesh_method) if requested_remesh_method is not None else None
+                ),
+                "effective_remesh_method": (
+                    str(effective_remesh_method) if effective_remesh_method is not None else None
+                ),
+                "remesh_fallback_applied": (
+                    bool(
+                        requested_remesh_method is not None
+                        and effective_remesh_method is not None
+                        and str(requested_remesh_method) != str(effective_remesh_method)
+                    )
+                ),
+                "remesh_fallback_reason": (
+                    str(remesh_fallback_reason) if remesh_fallback_reason else None
+                ),
             },
             "artifacts": artifacts,
         }
@@ -4150,13 +4171,22 @@ def extract_glb(
             export_formats = ["glb"] + list(export_formats)
 
         requested_remesh_method = str(remesh_method)
+        remesh_fallback_reason: Optional[str] = None
         if requested_remesh_method == "faithful_contouring" and not _is_faithful_contouring_available():
             remesh_method = "dual_contouring"
+            remesh_fallback_reason = "missing_faithc_dependencies_precheck"
             _log(
                 "WARNING: remesh_method='faithful_contouring' requires optional FaithC dependencies "
                 "(`faithcontour` + `atom3d`) which are not installed. Falling back to 'dual_contouring'."
             )
             yield None, None, status
+        _log(
+            f"Remesh audit: requested={requested_remesh_method!r}, stage_input={str(remesh_method)!r}"
+        )
+        yield None, None, status
+        stage3_requested_remesh_method = requested_remesh_method
+        stage3_effective_remesh_method = str(remesh_method)
+        stage3_remesh_fallback_reason = remesh_fallback_reason
 
         last_ui_update = 0.0
         log_path = Path(logs_dir) / "extract_glb.log"
@@ -4301,6 +4331,30 @@ def extract_glb(
             )
             stage3_glb_path = str(to_glb_result["glb_path"])
             final_glb_path = stage3_glb_path
+            stage3_requested_remesh_method = str(
+                to_glb_result.get("requested_remesh_method", stage3_requested_remesh_method)
+            )
+            stage3_effective_remesh_method = str(
+                to_glb_result.get("effective_remesh_method", stage3_effective_remesh_method)
+            )
+            stage3_remesh_fallback_reason = (
+                to_glb_result.get("remesh_fallback_reason")
+                or stage3_remesh_fallback_reason
+            )
+            if stage3_requested_remesh_method != stage3_effective_remesh_method:
+                _log(
+                    "Remesh audit result: "
+                    f"requested={stage3_requested_remesh_method!r}, "
+                    f"effective={stage3_effective_remesh_method!r}, "
+                    f"fallback_reason={(stage3_remesh_fallback_reason or 'unknown')!r}"
+                )
+            else:
+                _log(
+                    "Remesh audit result: "
+                    f"requested={stage3_requested_remesh_method!r}, "
+                    f"effective={stage3_effective_remesh_method!r}"
+                )
+            yield None, None, status
 
             # Stage 4: optional retexture in separate subprocess stages
             if do_retexture and ref_path_obj is not None and ref_path_obj.is_file():
@@ -4446,6 +4500,9 @@ def extract_glb(
             final_texture_source=final_texture_source,
             export_formats=export_formats,
             retexture_requested=bool(do_retexture),
+            requested_remesh_method=stage3_requested_remesh_method,
+            effective_remesh_method=stage3_effective_remesh_method,
+            remesh_fallback_reason=stage3_remesh_fallback_reason,
         )
         _log(f"Saved: {safe_relpath(glb_path, APP_DIR)}", 0.98)
         _log("Done.", 1.0)
@@ -4569,8 +4626,10 @@ def extract_glb(
         final_texture_source = "direct_attr_bake"
 
     requested_remesh_method = str(remesh_method)
+    remesh_fallback_reason: Optional[str] = None
     if requested_remesh_method == "faithful_contouring" and not _is_faithful_contouring_available():
         remesh_method = "dual_contouring"
+        remesh_fallback_reason = "missing_faithc_dependencies_precheck"
         _log(
             "WARNING: remesh_method='faithful_contouring' requires optional FaithC dependencies "
             "(`faithcontour` + `atom3d`) which are not installed. Falling back to 'dual_contouring'."
@@ -4596,18 +4655,53 @@ def extract_glb(
         "prune_invisible": prune_invisible_faces,
         "use_tqdm": True,
     }
+    _log(
+        f"Remesh audit: requested={requested_remesh_method!r}, stage_input={str(to_glb_kwargs['remesh_method'])!r}"
+    )
+    yield None, None, status
     try:
         glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
-    except ImportError as e:
-        # Failsafe: if FaithC is missing/unusable, fall back to a built-in remesher
-        # instead of crashing extraction.
-        if requested_remesh_method == "faithful_contouring" and "Faithful Contouring is not installed" in str(e):
+    except Exception as e:
+        # Failsafe: if FaithC is missing or faithful contouring OOMs, retry with
+        # a safer remesher instead of crashing extraction.
+        can_fallback = requested_remesh_method == "faithful_contouring"
+        is_missing_faithc = isinstance(e, ImportError) and ("Faithful Contouring is not installed" in str(e))
+        is_oom = isinstance(e, torch.OutOfMemoryError) or (
+            "out of memory" in str(e).lower() and "cuda" in str(e).lower()
+        )
+        if can_fallback and (is_missing_faithc or is_oom):
             fallback_method = "dual_contouring"
-            _log(f"WARNING: {e} Falling back to remesh_method={fallback_method!r}.")
+            if is_missing_faithc:
+                _log(f"WARNING: {e} Falling back to remesh_method={fallback_method!r}.")
+                remesh_fallback_reason = "faithc_missing_during_to_glb"
+            else:
+                _log(
+                    "WARNING: faithful_contouring ran out of GPU memory. "
+                    f"Retrying with remesh_method={fallback_method!r}."
+                )
+                remesh_fallback_reason = "oom_in_faithful_contouring"
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
             to_glb_kwargs["remesh_method"] = fallback_method
             glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
         else:
             raise
+    effective_remesh_method = str(to_glb_kwargs["remesh_method"])
+    if requested_remesh_method != effective_remesh_method:
+        _log(
+            "Remesh audit result: "
+            f"requested={requested_remesh_method!r}, "
+            f"effective={effective_remesh_method!r}, "
+            f"fallback_reason={(remesh_fallback_reason or 'unknown')!r}"
+        )
+    else:
+        _log(
+            "Remesh audit result: "
+            f"requested={requested_remesh_method!r}, "
+            f"effective={effective_remesh_method!r}"
+        )
     yield None, None, status
 
     if ultrashape_retexture_requested:
@@ -4734,6 +4828,9 @@ def extract_glb(
         final_texture_source=final_texture_source,
         export_formats=export_formats,
         retexture_requested=bool(ultrashape_retexture_requested),
+        requested_remesh_method=requested_remesh_method,
+        effective_remesh_method=effective_remesh_method,
+        remesh_fallback_reason=remesh_fallback_reason,
     )
     torch.cuda.empty_cache()
     _log(f"Saved: {safe_relpath(glb_path, APP_DIR)}", 0.98)

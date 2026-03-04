@@ -524,8 +524,10 @@ def extract_glb(
     texture_extraction = not no_texture_gen
 
     requested_remesh_method = str(remesh_method)
+    remesh_fallback_reason = None
     if requested_remesh_method == "faithful_contouring" and not _is_faithful_contouring_available():
         remesh_method = "dual_contouring"
+        remesh_fallback_reason = "missing_faithc_dependencies_precheck"
         msg = (
             "remesh_method='faithful_contouring' requires optional FaithC dependencies "
             "(`faithcontour` + `atom3d`) which are not installed. Falling back to 'dual_contouring'."
@@ -559,22 +561,59 @@ def extract_glb(
         "prune_invisible": prune_invisible_faces,
         "use_tqdm": True,
     }
+    print(
+        f"[extract] remesh audit: requested={requested_remesh_method!r}, "
+        f"stage_input={str(to_glb_kwargs['remesh_method'])!r}",
+        flush=True,
+    )
     try:
         glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
-    except ImportError as e:
-        # Failsafe: retry once with a safe remesher if FaithC is missing/unusable.
-        if requested_remesh_method == "faithful_contouring" and "Faithful Contouring is not installed" in str(e):
+    except Exception as e:
+        # Failsafe: retry once with a safe remesher if FaithC is missing or
+        # faithful contouring runs out of VRAM.
+        can_fallback = requested_remesh_method == "faithful_contouring"
+        is_missing_faithc = isinstance(e, ImportError) and ("Faithful Contouring is not installed" in str(e))
+        is_oom = isinstance(e, torch.OutOfMemoryError) or (
+            "out of memory" in str(e).lower() and "cuda" in str(e).lower()
+        )
+        if can_fallback and (is_missing_faithc or is_oom):
             fallback_method = "dual_contouring"
-            msg = f"{e} Falling back to remesh_method={fallback_method!r}."
+            if is_missing_faithc:
+                msg = f"{e} Falling back to remesh_method={fallback_method!r}."
+                remesh_fallback_reason = "faithc_missing_during_to_glb"
+            else:
+                msg = (
+                    "faithful_contouring ran out of GPU memory. "
+                    f"Retrying with remesh_method={fallback_method!r}."
+                )
+                remesh_fallback_reason = "oom_in_faithful_contouring"
             print(f"[extract] warning: {msg}", flush=True)
             try:
                 progress(0.0, desc=msg)
+            except Exception:
+                pass
+            try:
+                torch.cuda.empty_cache()
             except Exception:
                 pass
             to_glb_kwargs["remesh_method"] = fallback_method
             glb = o_voxel.postprocess.to_glb(**to_glb_kwargs)
         else:
             raise
+    effective_remesh_method = str(to_glb_kwargs["remesh_method"])
+    if requested_remesh_method != effective_remesh_method:
+        print(
+            f"[extract] remesh audit result: requested={requested_remesh_method!r}, "
+            f"effective={effective_remesh_method!r}, "
+            f"fallback_reason={(remesh_fallback_reason or 'unknown')!r}",
+            flush=True,
+        )
+    else:
+        print(
+            f"[extract] remesh audit result: requested={requested_remesh_method!r}, "
+            f"effective={effective_remesh_method!r}",
+            flush=True,
+        )
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
     os.makedirs(user_dir, exist_ok=True)
