@@ -126,6 +126,8 @@ TMP_DIR = os.path.join(APP_DIR, "tmp")
 OUTPUTS_DIR = os.path.join(APP_DIR, "outputs")
 PRESETS_DIR = os.path.join(APP_DIR, "presets")
 SUBPROCESS_STAGE_SCRIPT = os.path.join(APP_DIR, "subprocess_stage.py")
+EXTRACT_FINAL_DIRNAME = "08_final_exports"
+RETEXTURE_WORK_DIRNAME = "09_retexture_work"
 
 # UniRig paths
 UNIRIG_DIR = os.path.join(APP_DIR, "UniRig")
@@ -522,6 +524,132 @@ def _read_json(path: str) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _split_indexed_stem(stem: str) -> Tuple[str, Optional[int]]:
+    base, sep, tail = str(stem).rpartition("_")
+    if sep and tail.isdigit():
+        try:
+            return base, int(tail)
+        except Exception:
+            pass
+    return str(stem), None
+
+
+def _export_prefix_from_glb_prefix(glb_prefix: str, fmt: str) -> str:
+    fmt_l = str(fmt).lower().strip()
+    glb_prefix_s = str(glb_prefix).strip()
+    glb_prefix_l = glb_prefix_s.lower()
+    if glb_prefix_l == "glb":
+        return fmt_l
+    if glb_prefix_l.startswith("glb_"):
+        return f"{fmt_l}_{glb_prefix_s[4:]}"
+    return f"{fmt_l}_{glb_prefix_s}"
+
+
+def _export_path_for_format(out_dir: Path, fmt: str, glb_prefix: str, idx: int) -> Path:
+    fmt_l = str(fmt).lower().strip()
+    ext = "gltf" if fmt_l == "gltf" else fmt_l
+    return out_dir / f"{_export_prefix_from_glb_prefix(glb_prefix, fmt_l)}_{idx:04d}.{ext}"
+
+
+def _write_extract_artifacts_manifest(
+    *,
+    out_dir: Path,
+    stage3_glb_path: Optional[str],
+    stage3_has_textures: Optional[bool],
+    final_glb_path: str,
+    final_has_textures: bool,
+    final_texture_source: str,
+    export_formats: List[str],
+    retexture_requested: bool,
+) -> None:
+    try:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        def _rel(p: Path) -> str:
+            try:
+                return str(p.resolve().relative_to(out_dir.resolve()))
+            except Exception:
+                return p.name
+
+        requested_formats: List[str] = []
+        for fmt in export_formats or []:
+            fmt_l = str(fmt).lower().strip()
+            if fmt_l in {"glb", "gltf", "obj", "ply", "stl"} and fmt_l not in requested_formats:
+                requested_formats.append(fmt_l)
+        if "glb" not in requested_formats:
+            requested_formats.insert(0, "glb")
+
+        stage3_path_obj = Path(stage3_glb_path) if stage3_glb_path else None
+        final_path_obj = Path(final_glb_path)
+        artifacts: List[Dict[str, Any]] = []
+
+        if stage3_path_obj is not None and stage3_path_obj.is_file():
+            artifacts.append(
+                {
+                    "path": _rel(stage3_path_obj),
+                    "role": ("intermediate_shape_only" if retexture_requested else "final_glb"),
+                    "stage": "extract_to_glb",
+                    "is_final": (stage3_path_obj.resolve() == final_path_obj.resolve()),
+                    "contains_geometry": True,
+                    "contains_pbr_textures": bool(stage3_has_textures),
+                }
+            )
+
+        if final_path_obj.is_file() and (
+            stage3_path_obj is None or stage3_path_obj.resolve() != final_path_obj.resolve()
+        ):
+            artifacts.append(
+                {
+                    "path": _rel(final_path_obj),
+                    "role": "final_glb",
+                    "stage": ("tex_decode_and_bake" if retexture_requested else "extract_to_glb"),
+                    "is_final": True,
+                    "contains_geometry": True,
+                    "contains_pbr_textures": bool(final_has_textures),
+                }
+            )
+
+        final_prefix, final_idx = _split_indexed_stem(final_path_obj.stem)
+        if final_idx is not None:
+            for fmt in requested_formats:
+                if fmt == "glb":
+                    continue
+                sidecar = _export_path_for_format(out_dir, fmt, final_prefix, final_idx)
+                if sidecar.is_file():
+                    artifacts.append(
+                        {
+                            "path": _rel(sidecar),
+                            "role": "final_export",
+                            "stage": "final_export_formats",
+                            "is_final": True,
+                            "format": fmt,
+                            "contains_geometry": True,
+                            "contains_pbr_textures": bool(final_has_textures),
+                        }
+                    )
+
+        manifest = {
+            "schema": "trellis2.extract_artifacts.v1",
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "stage_meanings": {
+                "extract_to_glb": "Converts decoded mesh voxel into remeshed/simplified GLB.",
+                "tex_decode_and_bake": "Optional re-texture pass that bakes new PBR textures onto extracted mesh.",
+                "final_export_formats": "Extra exports generated from the final GLB (gltf/obj/ply/stl).",
+            },
+            "final_output": {
+                "path": _rel(final_path_obj),
+                "contains_geometry": True,
+                "contains_pbr_textures": bool(final_has_textures),
+                "texture_source": str(final_texture_source),
+            },
+            "artifacts": artifacts,
+        }
+        _write_json(str(out_dir / "extract_artifacts.json"), manifest)
+    except Exception:
+        pass
+
+
 # ------------------------------- Presets / Config ----------------------------
 
 UI_PRESET_VERSION = "1.0"
@@ -591,7 +719,7 @@ def _default_ui_config() -> dict:
             "prune_invisible_faces": False,
             "no_texture_gen": False,
             "deferred_texture_after_cleanup": True,
-            "texture_size": 2048,
+            "texture_size": 4096,
             "export_formats": ["glb"],
             "low_vram": False,  # Keep models in VRAM for best quality and speed
             "ss_guidance_strength": 7.5,
@@ -619,9 +747,9 @@ def _default_ui_config() -> dict:
             "tex_slat_guidance_interval_end": 0.9,
             "tex_slat_sampling_steps": 12,
             "tex_slat_rescale_t": 3.0,
-            "ultrashape_enabled": True,
-            "ultrashape_retexture_after_refine": True,
-            "ultrashape_conservative_mode": True,
+            "ultrashape_enabled": False,
+            "ultrashape_retexture_after_refine": False,
+            "ultrashape_conservative_mode": False,
             "ultrashape_checkpoint": "",
             "ultrashape_config_name": "infer_dit_refine.yaml",
             "ultrashape_dtype": "bfloat16",
@@ -760,9 +888,68 @@ def _delete_ui_preset(preset_name: str) -> bool:
         return False
 
 
+_STATUS_TEXT_REPLACEMENTS = {
+    "Ã¢â‚¬Â¦": "...",
+    "â€¦": "...",
+    "â†’": "->",
+    "âž¡": "->",
+    "â€œ": '"',
+    "â€": '"',
+    "â€˜": "'",
+    "â€™": "'",
+    "â€“": "-",
+    "â€”": "-",
+    "â€‘": "-",
+    "â—": "*",
+    "â‰¥": ">=",
+    "â‰¤": "<=",
+    "âœ…": "[OK]",
+    "âŒ": "[ERROR]",
+    "âš ï¸": "[WARNING]",
+    "â„¹ï¸": "[INFO]",
+    "ðŸ›‘": "[STOP]",
+    "…": "...",
+    "→": "->",
+    "“": '"',
+    "”": '"',
+    "‘": "'",
+    "’": "'",
+    "–": "-",
+    "—": "-",
+    "‑": "-",
+    "●": "*",
+    "⚠️": "[WARNING]",
+    "✅": "[OK]",
+    "❌": "[ERROR]",
+    "ℹ️": "[INFO]",
+    "🛑": "[STOP]",
+}
+
+
+def _clean_status_text(text: Any) -> str:
+    s = "" if text is None else str(text)
+
+    # Best-effort repair for UTF-8 text that was decoded as Latin-1/CP1252.
+    for _ in range(2):
+        if not any(token in s for token in ("â", "Ã", "ð", "Â")):
+            break
+        try:
+            repaired = s.encode("latin-1").decode("utf-8")
+        except Exception:
+            break
+        if repaired == s:
+            break
+        s = repaired
+
+    for bad, good in _STATUS_TEXT_REPLACEMENTS.items():
+        s = s.replace(bad, good)
+
+    return s.replace("\ufffd", "")
+
+
 def _append_status(current: str, msg: str) -> str:
     current = current or ""
-    msg = msg or ""
+    msg = _clean_status_text(msg)
     if not current:
         return msg
     if not msg:
@@ -792,11 +979,11 @@ def _trim_status(
     if max_lines:
         lines = status.splitlines()
         if len(lines) > max_lines:
-            lines = ["â€¦ (truncated) â€¦"] + lines[-max_lines:]
+            lines = ["... (truncated) ..."] + lines[-max_lines:]
             status = "\n".join(lines)
 
     if max_chars and len(status) > max_chars:
-        status = "â€¦ (truncated) â€¦\n" + status[-max_chars:]
+        status = "... (truncated) ...\n" + status[-max_chars:]
 
     return status
 
@@ -872,9 +1059,10 @@ def _iter_subprocess_stage(stage: str, payload: dict, work_dir: Path, log_path: 
         with log_path.open("a", encoding="utf-8") as lf:
             assert proc.stdout is not None
             for line in proc.stdout:
-                lf.write(line)
+                clean_line = _clean_status_text(line.rstrip("\n"))
+                lf.write(clean_line + "\n")
                 lf.flush()
-                yield {"type": "log", "text": line.rstrip("\n")}
+                yield {"type": "log", "text": clean_line}
     finally:
         _unregister_active_subproc(session, proc)
         # If the Gradio request is cancelled, this generator can be closed mid-stream.
@@ -1247,7 +1435,7 @@ def _run_unirig_skeleton(input_mesh_path: str, seed: int, upload_run_dir: Option
 
     try:
         if not input_mesh_path or not os.path.exists(input_mesh_path):
-            yield (None, None, "âŒ Please upload a valid mesh file.")
+            yield (None, None, "[ERROR] Please upload a valid mesh file.")
             return
 
         work_dir, input_path = _prepare_rig_input(input_mesh_path, upload_run_dir)
@@ -1347,7 +1535,7 @@ def _run_unirig_skeleton(input_mesh_path: str, seed: int, upload_run_dir: Option
             if not preview_source:
                 preview_source = _select_rig_preview_source(metadata, str(input_path))
                 note = "\nPreview fallback: could not build skeleton overlay, showing uploaded mesh."
-            final_status = _append_status(status, f"\nâœ… Skeleton generated successfully!\nOutput: {skeleton_fbx}{note}")
+            final_status = _append_status(status, f"\n✅ Skeleton generated successfully!\nOutput: {skeleton_fbx}{note}")
             yield (str(skeleton_fbx), preview_source, final_status)
         else:
             metadata.setdefault("stages", {}).setdefault("skeleton", {}).update(
@@ -1357,7 +1545,7 @@ def _run_unirig_skeleton(input_mesh_path: str, seed: int, upload_run_dir: Option
                 }
             )
             _save_rig_metadata(work_dir, metadata)
-            yield (None, None, _append_status(status, "\nâŒ Skeleton generation failed."))
+            yield (None, None, _append_status(status, "\n[ERROR] Skeleton generation failed."))
 
     except Exception as e:
         if work_dir is not None and work_dir.exists():
@@ -1374,7 +1562,7 @@ def _run_unirig_skeleton(input_mesh_path: str, seed: int, upload_run_dir: Option
                 _append_rig_full_log(work_dir, "skeleton", f"ERROR: {type(e).__name__}: {e}")
             except Exception:
                 pass
-        yield (None, None, f"âŒ Error: {type(e).__name__}: {e}")
+        yield (None, None, f"[ERROR] Error: {type(e).__name__}: {e}")
 
 
 def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
@@ -1386,7 +1574,7 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
 
     try:
         if not skeleton_fbx_path or not os.path.exists(skeleton_fbx_path):
-            yield (None, None, "âŒ Please generate or upload a skeleton first.")
+            yield (None, None, "[ERROR] Please generate or upload a skeleton first.")
             return
 
         skeleton_path = Path(skeleton_fbx_path)
@@ -1550,7 +1738,7 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
                 note += f"\nTextured preview ready: {Path(textured_preview_glb).name}"
             if animation_preview_glb and os.path.exists(animation_preview_glb):
                 note += f"\nAnimation preview ready: {Path(animation_preview_glb).name}"
-            final_status = _append_status(status, f"\nâœ… Skinning completed!\nOutput: {skinned_fbx}{note}")
+            final_status = _append_status(status, f"\n✅ Skinning completed!\nOutput: {skinned_fbx}{note}")
             yield (str(skinned_fbx), preview_source, final_status)
         else:
             metadata.setdefault("stages", {}).setdefault("skinning", {}).update(
@@ -1560,7 +1748,7 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
                 }
             )
             _save_rig_metadata(work_dir, metadata)
-            yield (None, None, _append_status(status, "\nâŒ Skinning failed."))
+            yield (None, None, _append_status(status, "\n[ERROR] Skinning failed."))
 
     except Exception as e:
         if work_dir is not None and work_dir.exists():
@@ -1577,7 +1765,7 @@ def _run_unirig_skinning(skeleton_fbx_path: str, seed: int, req: gr.Request):
                 _append_rig_full_log(work_dir, "skinning", f"ERROR: {type(e).__name__}: {e}")
             except Exception:
                 pass
-        yield (None, None, f"âŒ Error: {type(e).__name__}: {e}")
+        yield (None, None, f"[ERROR] Error: {type(e).__name__}: {e}")
 
 
 def _run_unirig_merge(source_fbx_path: str, target_mesh_path: str, export_format: str, req: gr.Request):
@@ -1589,11 +1777,11 @@ def _run_unirig_merge(source_fbx_path: str, target_mesh_path: str, export_format
 
     try:
         if not source_fbx_path or not os.path.exists(source_fbx_path):
-            yield (None, None, "âŒ Please generate skeleton/skinning first.")
+            yield (None, None, "[ERROR] Please generate skeleton/skinning first.")
             return
 
         if not target_mesh_path or not os.path.exists(target_mesh_path):
-            yield (None, None, "âŒ Please upload target mesh.")
+            yield (None, None, "[ERROR] Please upload target mesh.")
             return
 
         source_path = Path(source_fbx_path)
@@ -1665,7 +1853,7 @@ def _run_unirig_merge(source_fbx_path: str, target_mesh_path: str, export_format
                 else:
                     preview_source = None
                     note = "\nNote: FBX preview is not supported by Gradio Model3D in this view."
-            final_status = _append_status(status, f"\nâœ… Rigged model created!\nOutput: {final_output}{note}")
+            final_status = _append_status(status, f"\n✅ Rigged model created!\nOutput: {final_output}{note}")
             yield (str(final_output), preview_source, final_status)
         else:
             metadata.setdefault("stages", {}).setdefault("merge", {}).update(
@@ -1675,7 +1863,7 @@ def _run_unirig_merge(source_fbx_path: str, target_mesh_path: str, export_format
                 }
             )
             _save_rig_metadata(work_dir, metadata)
-            yield (None, None, _append_status(status, "\nâŒ Merge failed."))
+            yield (None, None, _append_status(status, "\n[ERROR] Merge failed."))
 
     except Exception as e:
         if work_dir is not None and work_dir.exists():
@@ -1692,7 +1880,7 @@ def _run_unirig_merge(source_fbx_path: str, target_mesh_path: str, export_format
                 _append_rig_full_log(work_dir, "merge", f"ERROR: {type(e).__name__}: {e}")
             except Exception:
                 pass
-        yield (None, None, f"âŒ Error: {type(e).__name__}: {e}")
+        yield (None, None, f"[ERROR] Error: {type(e).__name__}: {e}")
 
 
 def _send_rig_output_to_animation(
@@ -1712,10 +1900,10 @@ def _send_rig_output_to_animation(
     # Prefer merged output first (usually textured), then skinned, then skeleton.
     candidate = final_output_path or skinned_path or skeleton_path
     if not candidate:
-        status = _append_status(current_status or "", "âŒ No rig output to send. Generate skeleton/skinning/export first.")
+        status = _append_status(current_status or "", "[ERROR] No rig output to send. Generate skeleton/skinning/export first.")
         return "", _trim_status(status), gr.update()
     if not os.path.exists(candidate):
-        status = _append_status(current_status or "", f"âŒ Output file not found: {candidate}")
+        status = _append_status(current_status or "", f"[ERROR] Output file not found: {candidate}")
         return "", _trim_status(status), gr.update()
 
     candidate_path = Path(candidate)
@@ -1750,7 +1938,7 @@ def _send_rig_output_to_animation(
             viewer_candidate = normalized_candidate
 
     viewer_candidate = _norm_path(viewer_candidate)
-    status = _append_status(current_status or "", f"âž¡ Sent to Animation Browser: {Path(viewer_candidate).name}")
+    status = _append_status(current_status or "", f"➡ Sent to Animation Browser: {Path(viewer_candidate).name}")
     return viewer_candidate, _trim_status(status), gr.Tabs(selected="animation_tab")
 
 
@@ -2286,7 +2474,7 @@ def batch_process_folder(
         def _append(line: str) -> None:
             nonlocal log_lines
             ts = datetime.now().strftime("%H:%M:%S")
-            log_lines.append(f"[{ts}] {line}")
+            log_lines.append(f"[{ts}] {_clean_status_text(line)}")
             # Keep UI responsive (avoid giant payloads)
             if len(log_lines) > 400:
                 log_lines = log_lines[-350:]
@@ -2316,8 +2504,8 @@ def batch_process_folder(
 
         _append(f"Input folder: {in_dir}")
         _append(f"Output folder: {out_root}")
-        _append(f"Found {total} image(s). Startingâ€¦")
-        progress(0.0, desc="Batch startingâ€¦")
+        _append(f"Found {total} image(s). Starting…")
+        progress(0.0, desc="Batch starting…")
         yield _render_status()
 
         if _should_cancel():
@@ -2342,7 +2530,7 @@ def batch_process_folder(
 
             if target_dir.exists():
                 skipped += 1
-                _append(f"SKIP [{i}/{total}] {img_path.name} â†’ {target_dir} (already exists)")
+                _append(f"SKIP [{i}/{total}] {img_path.name} → {target_dir} (already exists)")
                 maybe = _maybe_yield(force=True)
                 if maybe is not None:
                     yield maybe
@@ -2476,7 +2664,7 @@ def batch_process_folder(
                 run_dir = Path(str(state.get("_run_dir")))
                 _move_run_dir(run_dir, target_dir)
                 processed += 1
-                _append(f"DONE [{i}/{total}] Saved â†’ {target_dir}")
+                _append(f"DONE [{i}/{total}] Saved → {target_dir}")
                 if glb_path:
                     # Note: glb_path points to the old location; after moving, it's still valid *as a file*, but path string differs.
                     pass
@@ -2514,15 +2702,15 @@ def preprocess_image(
 
     if not subprocess_mode:
         # Used by Upload and Examples. On first run it may load the full pipeline.
-        progress(0.05, desc="Loading Imageâ†’3D pipeline (TRELLIS.2-4B)â€¦")
+        progress(0.05, desc="Loading Image→3D pipeline (TRELLIS.2-4B)…")
         pipe = get_image_pipeline()
-        progress(0.2, desc="Preprocessing image (background removal / crop)â€¦")
+        progress(0.2, desc="Preprocessing image (background removal / crop)…")
         out = pipe.preprocess_image(image)
         progress(1.0, desc="Image ready.")
         return out
 
     # Subprocess mode: run preprocessing in a short-lived worker process so the UI process keeps 0 VRAM.
-    progress(0.02, desc="Starting subprocess: preprocessâ€¦")
+    progress(0.02, desc="Starting subprocess: preprocess…")
     user_dir = Path(TMP_DIR) / str(req.session_hash) / "preprocess"
     user_dir.mkdir(parents=True, exist_ok=True)
     work_dir = user_dir / "work"
@@ -2544,12 +2732,12 @@ def preprocess_image(
         if ev["type"] == "log":
             last = ev["text"]
             # Keep UI responsive without spamming.
-            progress(0.5, desc=(last[:120] + "â€¦") if len(last) > 120 else last)
+            progress(0.5, desc=(last[:120] + "…") if len(last) > 120 else last)
         else:
             result = ev["result"]
             out_path = Path(result["output_image_path"])
 
-    progress(0.95, desc="Loading preprocessed imageâ€¦")
+    progress(0.95, desc="Loading preprocessed image…")
     out_img = Image.open(str(out_path))
     progress(1.0, desc="Image ready.")
     return out_img
@@ -2671,7 +2859,7 @@ def _render_preview_snapshots_incremental(
 
         for j, (extr, intr) in enumerate(zip(extrinsics, intrinsics)):
             p = 0.88 + 0.08 * (j / max(1, nviews - 1))
-            log_fn(f"Rendering preview view {j + 1}/{nviews}â€¦", p)
+            log_fn(f"Rendering preview view {j + 1}/{nviews}…", p)
             res = renderer.render(mesh, extr, intr, envmap=envmap)
             for mode in MODES:
                 key = mode["render_key"]
@@ -2706,7 +2894,7 @@ def _render_preview_snapshots_incremental(
 
     for j, (extr, intr) in enumerate(zip(extrinsics, intrinsics)):
         p = 0.88 + 0.08 * (j / max(1, nviews - 1))
-        log_fn(f"Rendering preview view {j + 1}/{nviews}â€¦", p)
+        log_fn(f"Rendering preview view {j + 1}/{nviews}…", p)
         res = renderer.render(mesh, extr, intr, return_types=["mask", "normal", "attr"])
 
         normal = res["normal"]  # (3,H,W) in [0,1]
@@ -2820,6 +3008,7 @@ def image_to_3d(
 
     def _log(msg: str, p: Optional[float] = None) -> str:
         nonlocal status
+        msg = _clean_status_text(msg)
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         status = (status + "\n" if status else "") + line
@@ -2888,7 +3077,7 @@ def image_to_3d(
             except Exception:
                 pass
 
-    _log(f"Starting Image â†’ 3D generation (resolution: {resolution}, pipeline: {pipeline_type})â€¦", 0.0)
+    _log(f"Starting Image → 3D generation (resolution: {resolution}, pipeline: {pipeline_type})…", 0.0)
     if use_multiview:
         _log(
             f"Multi-view input detected: {len(source_images)} views (mode={mv_mode}). "
@@ -2902,7 +3091,7 @@ def image_to_3d(
         unload_global_pipelines()
 
         # Subprocess stage pipeline (zero VRAM kept by the UI process).
-        _log(f"Subprocess mode ON. Run: {run_id} â†’ {safe_relpath(run_dir, APP_DIR)}", 0.01)
+        _log(f"Subprocess mode ON. Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.01)
         yield None, empty_html, status
 
         work_dir = Path(TMP_DIR) / str(req.session_hash) / "subprocess" / run_id
@@ -3024,7 +3213,7 @@ def image_to_3d(
             out_path = preprocessed_path if view_idx == 1 else (run_dir / f"01_preprocessed_view{view_idx:02d}.png")
             preprocess_progress = 0.05 + 0.02 * ((view_idx - 1) / max(1, num_preprocess_views - 1))
             if use_multiview:
-                _log(f"Preprocessing view {view_idx}/{num_preprocess_views}â€¦", preprocess_progress)
+                _log(f"Preprocessing view {view_idx}/{num_preprocess_views}…", preprocess_progress)
             preprocess_payload = {
                 "model_repo": "microsoft/TRELLIS.2-4B",
                 "input_image_path": str(in_path),
@@ -3218,7 +3407,7 @@ def image_to_3d(
                 if has_shape and has_tex:
                     preview_failed = True
                     preview_error_msg = f"{type(e).__name__}: {e}"
-                    _log(f"âš ï¸ Preview rendering failed: {preview_error_msg}", 0.85)
+                    _log(f"WARNING: Preview rendering failed: {preview_error_msg}", 0.85)
                     _log("Latents saved successfully. You can still extract GLB!", 0.86)
                 else:
                     # No latents, re-raise the error
@@ -3258,7 +3447,7 @@ def image_to_3d(
             error_html = f"""
             <div class="previewer-container" style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 400px; padding: 20px;">
                 <div style="background: rgba(255, 100, 100, 0.15); border: 1px solid rgba(255, 100, 100, 0.4); border-radius: 8px; padding: 20px; max-width: 600px; text-align: center;">
-                    <h3 style="color: #ff6b6b; margin: 0 0 10px 0;">âš ï¸ Preview Rendering Failed</h3>
+                    <h3 style="color: #ff6b6b; margin: 0 0 10px 0;">WARNING: Preview Rendering Failed</h3>
                     <p style="color: #ccc; margin: 0 0 15px 0; font-size: 14px;">
                         {preview_error_msg[:200]}{'...' if len(preview_error_msg) > 200 else ''}
                     </p>
@@ -3275,7 +3464,7 @@ def image_to_3d(
             return
 
         # Build the HTML preview from the saved JPEGs (CPU-only).
-        _log("Building preview UIâ€¦", 0.96)
+        _log("Building preview UI…", 0.96)
         _ensure_mode_icons()
         manifest = _read_json(str(preview_manifest_path))
         files = manifest.get("files", {})
@@ -3314,8 +3503,8 @@ def image_to_3d(
             <div class="tips-wrapper">
                 <div class="tips-icon">Tips</div>
                 <div class="tips-text">
-                    <p>â— <b>Render Mode</b> â€” Click a circular button to switch render modes.</p>
-                    <p>â— <b>View Angle</b> â€” Drag the slider to change view angle.</p>
+                    <p>- <b>Render Mode</b> - Click a circular button to switch render modes.</p>
+                    <p>- <b>View Angle</b> - Drag the slider to change view angle.</p>
                 </div>
             </div>
 
@@ -3354,7 +3543,7 @@ def image_to_3d(
             },
             "preview_manifest_path": str(preview_manifest_path),
         }
-        _log("Done. You can now click â€œExtract GLBâ€.", 1.0)
+        _log('Done. You can now click "Extract GLB".', 1.0)
         if use_multiview:
             state["_multiview"] = True
             state["_multiview_mode"] = mv_mode
@@ -3364,24 +3553,24 @@ def image_to_3d(
         return
 
     if use_multiview:
-        _log("Loading TRELLIS.2 multi-view pipeline (first run can take a while)â€¦", 0.01)
+        _log("Loading TRELLIS.2 multi-view pipeline (first run can take a while)…", 0.01)
         pipe = get_multiview_pipeline()
     else:
-        _log("Loading TRELLIS.2 pipeline (first run can take a while)â€¦", 0.01)
+        _log("Loading TRELLIS.2 pipeline (first run can take a while)…", 0.01)
         pipe = get_image_pipeline()
     yield None, empty_html, status
 
     pbr_supported = _has_nvdiffrec_render()
     envmap = None
     if pbr_supported:
-        _log("Loading HDRI environment mapsâ€¦", 0.03)
+        _log("Loading HDRI environment maps…", 0.03)
         envmap = _get_envmap()
         yield None, empty_html, status
     else:
         _log("PBR preview not available (missing 'nvdiffrec_render'); will use fallback preview.", 0.03)
         yield None, empty_html, status
 
-    _log("Preparing UI render-mode iconsâ€¦", 0.05)
+    _log("Preparing UI render-mode icons…", 0.05)
     _ensure_mode_icons()
     yield None, empty_html, status
 
@@ -3422,13 +3611,13 @@ def image_to_3d(
     preprocessed_views: List[Image.Image] = []
     n_views = len(source_images)
     if use_multiview:
-        _log(f"Preprocessing {n_views} views (background removal / crop)â€¦", 0.06)
+        _log(f"Preprocessing {n_views} views (background removal / crop)…", 0.06)
     else:
-        _log("Preprocessing image (background removal / crop)â€¦", 0.06)
+        _log("Preprocessing image (background removal / crop)…", 0.06)
     for i, src in enumerate(source_images, start=1):
         if use_multiview:
             p = 0.06 + 0.02 * ((i - 1) / max(1, n_views - 1))
-            _log(f"Preprocessing view {i}/{n_views}â€¦", p)
+            _log(f"Preprocessing view {i}/{n_views}…", p)
         out = pipe.preprocess_image(src)
         preprocessed_views.append(out)
         try:
@@ -3443,7 +3632,7 @@ def image_to_3d(
 
     mesh = None
     if use_multiview:
-        _log(f"Running multi-view generation ({n_views} views, mode={mv_mode})â€¦", 0.18)
+        _log(f"Running multi-view generation ({n_views} views, mode={mv_mode})…", 0.18)
         mv_out, latent = pipe.run_multi_image(
             preprocessed_views,
             num_samples=1,
@@ -3491,18 +3680,18 @@ def image_to_3d(
 
         # run_multi_image already decodes; only re-decode when user explicitly requested decode options.
         if use_tiled_extraction or use_chunked_processing:
-            _log("Applying decode settings to multiview latentsâ€¦", 0.75)
+            _log("Applying decode settings to multiview latents…", 0.75)
             mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
             yield None, empty_html, status
         else:
             _log("Using multiview decoded mesh.", 0.75)
             yield None, empty_html, status
 
-        _log("Simplifying meshâ€¦", 0.82)
+        _log("Simplifying mesh…", 0.82)
         mesh.simplify(16777216)  # nvdiffrast limit
         yield None, empty_html, status
 
-        _log("Rendering preview snapshotsâ€¦", 0.88)
+        _log("Rendering preview snapshots…", 0.88)
         try:
             images = _render_preview_snapshots_incremental(
                 mesh,
@@ -3542,17 +3731,17 @@ def image_to_3d(
         except Exception:
             pass
 
-        _log("Packing generation state (for GLB extraction)â€¦", 0.93)
+        _log("Packing generation state (for GLB extraction)…", 0.93)
         state = pack_state((shape_slat, tex_slat, res))
         torch.cuda.empty_cache()
         yield None, empty_html, status
 
-        _log("Building preview UIâ€¦", 0.97)
+        _log("Building preview UI…", 0.97)
         images_html = ""
         for m_idx, mode in enumerate(MODES):
             for s_idx in range(STEPS):
                 p = 0.97 + 0.02 * ((m_idx * STEPS + s_idx) / max(1, (len(MODES) * STEPS - 1)))
-                progress(p, desc="Building preview UIâ€¦")
+                progress(p, desc="Building preview UI…")
                 unique_id = f"view-m{m_idx}-s{s_idx}"
                 is_visible = (m_idx == DEFAULT_MODE and s_idx == DEFAULT_STEP)
                 vis_class = "visible" if is_visible else ""
@@ -3579,8 +3768,8 @@ def image_to_3d(
             <div class="tips-wrapper">
                 <div class="tips-icon">Tips</div>
                 <div class="tips-text">
-                    <p>â— <b>Render Mode</b> â€” Click a circular button to switch render modes.</p>
-                    <p>â— <b>View Angle</b> â€” Drag the slider to change view angle.</p>
+                    <p>- <b>Render Mode</b> - Click a circular button to switch render modes.</p>
+                    <p>- <b>View Angle</b> - Drag the slider to change view angle.</p>
                 </div>
             </div>
 
@@ -3626,7 +3815,7 @@ def image_to_3d(
         except Exception:
             pass
 
-        _log("Done. You can now click â€œExtract GLBâ€.", 1.0)
+        _log('Done. You can now click "Extract GLB".', 1.0)
         yield state, full_html, gr.update(value=_trim_status(status), visible=False)
         return
 
@@ -3634,7 +3823,7 @@ def image_to_3d(
     images = [image]
     torch.manual_seed(seed)
 
-    _log("Computing image embeddings (512px)â€¦", 0.08)
+    _log("Computing image embeddings (512px)…", 0.08)
     cond_512 = pipe.get_cond(images, 512)
     try:
         torch.save({k: v.detach().cpu() for k, v in cond_512.items()}, str(cond_512_path))
@@ -3644,7 +3833,7 @@ def image_to_3d(
 
     cond_1024 = None
     if pipeline_type != "512":
-        _log("Computing image embeddings (1024px)â€¦", 0.12)
+        _log("Computing image embeddings (1024px)…", 0.12)
         cond_1024 = pipe.get_cond(images, 1024)
         if cond_1024_path is not None:
             try:
@@ -3655,7 +3844,7 @@ def image_to_3d(
 
     # Sparse structure resolution: 32 for most cases, 64 for direct 1024 sampling
     ss_res = 64 if pipeline_type == "1024" else 32
-    _log("Stage 1/3: Sampling sparse structureâ€¦", 0.18)
+    _log("Stage 1/3: Sampling sparse structure…", 0.18)
     coords = pipe.sample_sparse_structure(cond_512, ss_res, 1, ss_params)
     try:
         torch.save(coords.detach().cpu(), str(coords_path))
@@ -3664,12 +3853,12 @@ def image_to_3d(
     yield None, empty_html, status
 
     if pipeline_type == "512":
-        _log("Stage 2/3: Sampling shape latent (512)â€¦", 0.35)
+        _log("Stage 2/3: Sampling shape latent (512)…", 0.35)
         shape_slat = pipe.sample_shape_slat(cond_512, pipe.models["shape_slat_flow_model_512"], coords, shape_params)
         yield None, empty_html, status
 
         if not no_texture_gen:
-            _log("Stage 3/3: Sampling texture latent (512)â€¦", 0.55)
+            _log("Stage 3/3: Sampling texture latent (512)…", 0.55)
             tex_slat = pipe.sample_tex_slat(cond_512, pipe.models["tex_slat_flow_model_512"], shape_slat, tex_params)
             yield None, empty_html, status
         else:
@@ -3678,12 +3867,12 @@ def image_to_3d(
             yield None, empty_html, status
         res = 512
     elif pipeline_type == "1024":
-        _log("Stage 2/3: Sampling shape latent (1024)â€¦", 0.35)
+        _log("Stage 2/3: Sampling shape latent (1024)…", 0.35)
         shape_slat = pipe.sample_shape_slat(cond_1024, pipe.models["shape_slat_flow_model_1024"], coords, shape_params)
         yield None, empty_html, status
 
         if not no_texture_gen:
-            _log("Stage 3/3: Sampling texture latent (1024)â€¦", 0.55)
+            _log("Stage 3/3: Sampling texture latent (1024)…", 0.55)
             tex_slat = pipe.sample_tex_slat(cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, tex_params)
             yield None, empty_html, status
         else:
@@ -3693,7 +3882,7 @@ def image_to_3d(
         res = 1024
     elif "_cascade" in pipeline_type:
         # Any cascade resolution (768, 1024, 1280, 1536, 2048, custom)
-        _log(f"Stage 2/3: Sampling shape latent (cascade â†’ {target_res})â€¦", 0.35)
+        _log(f"Stage 2/3: Sampling shape latent (cascade → {target_res})…", 0.35)
         shape_slat, res = pipe.sample_shape_slat_cascade(
             cond_512,
             cond_1024,
@@ -3708,7 +3897,7 @@ def image_to_3d(
         yield None, empty_html, status
 
         if not no_texture_gen:
-            _log("Stage 3/3: Sampling texture latent (1024)â€¦", 0.55)
+            _log("Stage 3/3: Sampling texture latent (1024)…", 0.55)
             tex_slat = pipe.sample_tex_slat(cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, tex_params)
             yield None, empty_html, status
         else:
@@ -3735,15 +3924,15 @@ def image_to_3d(
     except Exception:
         pass
 
-    _log("Decoding latent to meshâ€¦", 0.75)
+    _log("Decoding latent to mesh…", 0.75)
     mesh = pipe.decode_latent(shape_slat, tex_slat, res, use_tiled_extraction, use_chunked_processing)[0]
     yield None, empty_html, status
 
-    _log("Simplifying meshâ€¦", 0.82)
+    _log("Simplifying mesh…", 0.82)
     mesh.simplify(16777216)  # nvdiffrast limit
     yield None, empty_html, status
 
-    _log("Rendering preview snapshotsâ€¦", 0.88)
+    _log("Rendering preview snapshots…", 0.88)
     try:
         images = _render_preview_snapshots_incremental(
             mesh,
@@ -3784,19 +3973,19 @@ def image_to_3d(
     except Exception:
         pass
 
-    _log("Packing generation state (for GLB extraction)â€¦", 0.93)
+    _log("Packing generation state (for GLB extraction)…", 0.93)
     state = pack_state((shape_slat, tex_slat, res))
     torch.cuda.empty_cache()
     yield None, empty_html, status
 
-    _log("Building preview UIâ€¦", 0.97)
+    _log("Building preview UI…", 0.97)
     images_html = ""
     for m_idx, mode in enumerate(MODES):
         for s_idx in range(STEPS):
             # Small progress ticks while we convert images to base64 and build HTML.
             # (48 images total)
             p = 0.97 + 0.02 * ((m_idx * STEPS + s_idx) / max(1, (len(MODES) * STEPS - 1)))
-            progress(p, desc="Building preview UIâ€¦")
+            progress(p, desc="Building preview UI…")
             unique_id = f"view-m{m_idx}-s{s_idx}"
             is_visible = (m_idx == DEFAULT_MODE and s_idx == DEFAULT_STEP)
             vis_class = "visible" if is_visible else ""
@@ -3823,8 +4012,8 @@ def image_to_3d(
         <div class="tips-wrapper">
             <div class="tips-icon">Tips</div>
             <div class="tips-text">
-                <p>â— <b>Render Mode</b> â€” Click a circular button to switch render modes.</p>
-                <p>â— <b>View Angle</b> â€” Drag the slider to change view angle.</p>
+                <p>- <b>Render Mode</b> - Click a circular button to switch render modes.</p>
+                <p>- <b>View Angle</b> - Drag the slider to change view angle.</p>
             </div>
         </div>
 
@@ -3869,7 +4058,7 @@ def image_to_3d(
     except Exception:
         pass
 
-    _log("Done. You can now click â€œExtract GLBâ€.", 1.0)
+    _log('Done. You can now click "Extract GLB".', 1.0)
     # Hide the overlay once preview is ready so users can see the render.
     yield state, full_html, gr.update(value=_trim_status(status), visible=False)
 
@@ -3930,6 +4119,7 @@ def extract_glb(
 
         def _log(msg: str, p: Optional[float] = None) -> str:
             nonlocal status
+            msg = _clean_status_text(msg)
             ts = datetime.now().strftime("%H:%M:%S")
             line = f"[{ts}] {msg}"
             status = (status + "\n" if status else "") + line
@@ -3949,9 +4139,9 @@ def extract_glb(
         tex_slat_path = state.get("tex_slat_path")
         res = int(state.get("res"))
 
-        out_dir = run_dir / "08_extract"
+        out_dir = run_dir / EXTRACT_FINAL_DIRNAME
 
-        _log("Starting GLB extraction (subprocess)â€¦", 0.0)
+        _log("Starting GLB extraction (subprocess)…", 0.0)
         # Show the overlay while extracting.
         yield None, None, gr.update(value=_trim_status(status), visible=True)
 
@@ -4009,6 +4199,23 @@ def extract_glb(
             _log("Deferred re-texture requested but no valid reference image found. Skipping re-texture.", 0.06)
             yield None, None, status
 
+        if do_retexture:
+            stage3_glb_prefix = "glb_stage3_shape_only"
+        elif bool(no_texture_gen):
+            stage3_glb_prefix = "glb_final_shape_only"
+        else:
+            stage3_glb_prefix = "glb_final_textured_direct"
+        final_retexture_glb_prefix = "glb_final_textured_retexture"
+        stage3_glb_path: Optional[str] = None
+        stage3_has_textures = bool((not no_texture_gen) and (not do_retexture))
+        final_has_textures = bool(stage3_has_textures)
+        if bool(no_texture_gen):
+            final_texture_source = "none_shape_only"
+        elif bool(do_retexture):
+            final_texture_source = "none_waiting_retexture"
+        else:
+            final_texture_source = "direct_attr_bake"
+
         mesh_blob_00 = out_dir / "00_decoded_mesh_voxel.pt"
         mesh_blob_01 = out_dir / "01_ultrashape_mesh_voxel.pt"
         current_mesh_blob = mesh_blob_00
@@ -4049,7 +4256,7 @@ def extract_glb(
                 "extract_decode_mesh",
                 decode_payload,
                 0.08,
-                "Stage 1/4: Decoding latent mesh (subprocess)â€¦",
+                "Stage 1/4: Decoding latent mesh (subprocess)…",
             )
             current_mesh_blob = Path(str(decode_result["mesh_blob_path"]))
 
@@ -4068,7 +4275,7 @@ def extract_glb(
                             "ultrashape": ultrashape_payload,
                         },
                         0.22,
-                        "Stage 2/4: Running UltraShape refinement (subprocess)â€¦",
+                        "Stage 2/4: Running UltraShape refinement (subprocess)…",
                     )
                     current_mesh_blob = Path(str(ultra_result["mesh_blob_path"]))
 
@@ -4086,13 +4293,14 @@ def extract_glb(
                     "prune_invisible_faces": bool(prune_invisible_faces),
                     "texture_extraction": bool((not no_texture_gen) and (not do_retexture)),
                     "out_dir": str(out_dir),
-                    "prefix": "glb",
+                    "prefix": stage3_glb_prefix,
                     "export_formats": to_glb_export_formats,
                 },
                 0.42,
-                "Stage 3/4: Converting mesh to GLB (subprocess)â€¦",
+                "Stage 3/4: Converting mesh to GLB (subprocess)…",
             )
-            final_glb_path = str(to_glb_result["glb_path"])
+            stage3_glb_path = str(to_glb_result["glb_path"])
+            final_glb_path = stage3_glb_path
 
             # Stage 4: optional retexture in separate subprocess stages
             if do_retexture and ref_path_obj is not None and ref_path_obj.is_file():
@@ -4114,7 +4322,7 @@ def extract_glb(
                     tex_res = int(res)
                     if tex_res != 512:
                         tex_res = min(tex_res, 1536)
-                    retex_dir = run_dir / "09_extract_retexture"
+                    retex_dir = run_dir / RETEXTURE_WORK_DIRNAME
                     cond_path = retex_dir / "03_cond.pt"
                     shape_slat_tex_path = retex_dir / "04_shape_slat.pt"
                     tex_slat_tex_path = retex_dir / "05_tex_slat.pt"
@@ -4136,7 +4344,7 @@ def extract_glb(
                             "cond_path": str(cond_path),
                         },
                         0.58,
-                        "Stage 4/4: Re-texture pass (cond encoding)â€¦",
+                        "Stage 4/4: Re-texture pass (cond encoding)…",
                     )
 
                     _ = yield from _run_stage(
@@ -4147,7 +4355,7 @@ def extract_glb(
                             "shape_slat_path": str(shape_slat_tex_path),
                         },
                         0.66,
-                        "Stage 4/4: Re-texture pass (shape encoding)â€¦",
+                        "Stage 4/4: Re-texture pass (shape encoding)…",
                     )
 
                     _ = yield from _run_stage(
@@ -4166,7 +4374,7 @@ def extract_glb(
                             },
                         },
                         0.74,
-                        "Stage 4/4: Re-texture pass (texture sampling)â€¦",
+                        "Stage 4/4: Re-texture pass (texture sampling)…",
                     )
 
                     retex_result = yield from _run_stage(
@@ -4177,18 +4385,33 @@ def extract_glb(
                             "tex_slat_path": str(tex_slat_tex_path),
                             "texture_size": int(texture_size),
                             "out_dir": str(out_dir),
-                            "prefix": "glb",
+                            "prefix": final_retexture_glb_prefix,
                         },
                         0.82,
-                        "Stage 4/4: Re-texture pass (decode + bake)â€¦",
+                        "Stage 4/4: Re-texture pass (decode + bake)…",
                     )
                     final_glb_path = str(retex_result["glb_path"])
+                    final_has_textures = True
+                    final_texture_source = "retexture_pass"
                 except Exception as e:
                     _log(
                         f"Re-texture subprocess stages failed ({type(e).__name__}: {e}). "
                         "Keeping shape-only extracted GLB.",
                         0.86,
                     )
+                    final_has_textures = False
+                    final_texture_source = "none_retexture_failed"
+                    try:
+                        if final_glb_path:
+                            stage3_path_obj = Path(final_glb_path)
+                            _, fallback_final_p = next_indexed_path(
+                                out_dir, prefix="glb_final_shape_only", ext="glb", digits=4, start=1
+                            )
+                            if stage3_path_obj.resolve() != fallback_final_p.resolve():
+                                shutil.copyfile(str(stage3_path_obj), str(fallback_final_p))
+                                final_glb_path = str(fallback_final_p)
+                    except Exception:
+                        pass
                     yield None, None, status
 
                 extra_formats = [f for f in export_formats if str(f).lower().strip() != "glb"]
@@ -4201,7 +4424,7 @@ def extract_glb(
                             "export_formats": extra_formats,
                         },
                         0.90,
-                        "Exporting additional formatsâ€¦",
+                        "Exporting additional formats…",
                     )
         except UserCancelled:
             _log("CANCELLED by user.", 0.0)
@@ -4214,6 +4437,16 @@ def extract_glb(
             raise gr.Error("Extraction failed (no GLB path returned). See logs in the run folder.")
 
         glb_path = str(final_glb_path)
+        _write_extract_artifacts_manifest(
+            out_dir=out_dir,
+            stage3_glb_path=stage3_glb_path,
+            stage3_has_textures=stage3_has_textures,
+            final_glb_path=glb_path,
+            final_has_textures=final_has_textures,
+            final_texture_source=final_texture_source,
+            export_formats=export_formats,
+            retexture_requested=bool(do_retexture),
+        )
         _log(f"Saved: {safe_relpath(glb_path, APP_DIR)}", 0.98)
         _log("Done.", 1.0)
         yield glb_path, glb_path, status
@@ -4222,7 +4455,7 @@ def extract_glb(
     texture_extraction = not no_texture_gen
 
     run_dir = Path(state.get("_run_dir", os.path.join(TMP_DIR, str(req.session_hash))))
-    out_dir = run_dir / "08_extract"
+    out_dir = run_dir / EXTRACT_FINAL_DIRNAME
     try:
         shape_slat, tex_slat, res = unpack_state(state)
     except Exception:
@@ -4232,6 +4465,7 @@ def extract_glb(
 
     def _log(msg: str, p: Optional[float] = None) -> str:
         nonlocal status
+        msg = _clean_status_text(msg)
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         status = (status + "\n" if status else "") + line
@@ -4240,15 +4474,15 @@ def extract_glb(
             progress(p, desc=msg)
         return status
 
-    _log("Starting GLB extractionâ€¦", 0.0)
+    _log("Starting GLB extraction…", 0.0)
     # Show the overlay while extracting.
     yield None, None, gr.update(value=_trim_status(status), visible=True)
 
-    _log("Loading TRELLIS.2 pipelineâ€¦", 0.05)
+    _log("Loading TRELLIS.2 pipeline…", 0.05)
     pipe = get_image_pipeline()
     yield None, None, status
     
-    _log("Decoding latent to meshâ€¦", 0.15)
+    _log("Decoding latent to mesh…", 0.15)
     mesh = pipe.decode_latent(shape_slat, tex_slat, res, extract_use_tiled_extraction, extract_use_chunked_processing)[0]
     yield None, None, status
 
@@ -4259,7 +4493,7 @@ def extract_glb(
             _log("UltraShape enabled, but no valid reference image path was found. Skipping UltraShape.", 0.22)
             yield None, None, status
         else:
-            _log("Running UltraShape mesh refinementÃ¢â‚¬Â¦", 0.24)
+            _log("Running UltraShape mesh refinement...", 0.24)
             try:
                 from ultrashape_integration import refine_mesh_with_ultrashape
 
@@ -4299,7 +4533,7 @@ def extract_glb(
                 )
             yield None, None, status
 
-    _log("Post-processing + baking GLB (this can take a while)â€¦", 0.3)
+    _log("Post-processing + baking GLB (this can take a while)…", 0.3)
     yield None, None, status
 
     ultrashape_retexture_requested = bool(
@@ -4316,6 +4550,23 @@ def extract_glb(
         else:
             _log("UltraShape re-texture enabled: extraction will run shape-only first, then regenerate textures.", 0.32)
             yield None, None, status
+
+    if ultrashape_retexture_requested:
+        stage3_glb_prefix = "glb_stage3_shape_only"
+    elif bool(no_texture_gen):
+        stage3_glb_prefix = "glb_final_shape_only"
+    else:
+        stage3_glb_prefix = "glb_final_textured_direct"
+    final_retexture_glb_prefix = "glb_final_textured_retexture"
+    stage3_glb_path: Optional[str] = None
+    stage3_has_textures = bool((not no_texture_gen) and (not ultrashape_retexture_requested))
+    final_has_textures = bool(stage3_has_textures)
+    if bool(no_texture_gen):
+        final_texture_source = "none_shape_only"
+    elif bool(ultrashape_retexture_requested):
+        final_texture_source = "none_waiting_retexture"
+    else:
+        final_texture_source = "direct_attr_bake"
 
     requested_remesh_method = str(remesh_method)
     if requested_remesh_method == "faithful_contouring" and not _is_faithful_contouring_available():
@@ -4359,9 +4610,16 @@ def extract_glb(
             raise
     yield None, None, status
 
+    if ultrashape_retexture_requested:
+        _log("Saving stage-3 shape-only GLB…", 0.68)
+        _, stage3_glb_path_p = next_indexed_path(out_dir, prefix=stage3_glb_prefix, ext="glb", digits=4, start=1)
+        glb.export(str(stage3_glb_path_p), extension_webp=False)
+        stage3_glb_path = str(stage3_glb_path_p)
+        yield None, None, status
+
     if ultrashape_retexture_requested and retexture_image_file is not None:
         try:
-            _log("Re-texturing UltraShape mesh with TRELLIS texturing pipelineâ€¦", 0.72)
+            _log("Re-texturing UltraShape mesh with TRELLIS texturing pipeline…", 0.72)
             yield None, None, status
 
             try:
@@ -4403,6 +4661,8 @@ def extract_glb(
             tex_slat = tex_pipe.sample_tex_slat(cond, tex_model, shape_slat_tex, tex_params)
             pbr_voxel = tex_pipe.decode_tex_slat(tex_slat)
             glb = tex_pipe.postprocess_mesh(mesh_for_tex, pbr_voxel, tex_res, int(texture_size))
+            final_has_textures = True
+            final_texture_source = "retexture_pass"
 
             _log("UltraShape re-texture complete.", 0.84)
             yield None, None, status
@@ -4415,43 +4675,66 @@ def extract_glb(
                 fallback_kwargs = dict(to_glb_kwargs)
                 fallback_kwargs["texture_extraction"] = True
                 glb = o_voxel.postprocess.to_glb(**fallback_kwargs)
+                final_has_textures = True
+                final_texture_source = "fallback_attr_bake_after_retexture_error"
                 _log("Fallback texture extraction complete.", 0.86)
             except Exception as e2:
+                final_has_textures = False
+                final_texture_source = "none_retexture_failed"
                 _log(
                     f"Fallback texture extraction also failed ({type(e2).__name__}: {e2}). Keeping shape-only GLB.",
                     0.86,
                 )
             yield None, None, status
 
-    _log("Saving GLBâ€¦", 0.9)
+    _log("Saving GLB…", 0.9)
     export_formats = export_formats or ["glb"]
     if "glb" not in export_formats:
         export_formats = ["glb"] + list(export_formats)
 
-    idx, glb_path_p = next_indexed_path(out_dir, prefix="glb", ext="glb", digits=4, start=1)
-    glb.export(str(glb_path_p), extension_webp=False)
-    glb_path = str(glb_path_p)
+    if ultrashape_retexture_requested:
+        final_glb_prefix = final_retexture_glb_prefix if final_has_textures else "glb_final_shape_only"
+    else:
+        final_glb_prefix = stage3_glb_prefix
+
+    use_shape_only_fallback = bool(ultrashape_retexture_requested and (not final_has_textures) and stage3_glb_path)
+    if use_shape_only_fallback:
+        _, fallback_final_p = next_indexed_path(out_dir, prefix="glb_final_shape_only", ext="glb", digits=4, start=1)
+        try:
+            shutil.copyfile(str(stage3_glb_path), str(fallback_final_p))
+        except Exception:
+            glb.export(str(fallback_final_p), extension_webp=False)
+        glb_path = str(fallback_final_p)
+        final_glb_prefix = "glb_final_shape_only"
+        _, parsed_idx = _split_indexed_stem(Path(glb_path).stem)
+        idx = parsed_idx if parsed_idx is not None else 1
+    else:
+        idx, glb_path_p = next_indexed_path(out_dir, prefix=final_glb_prefix, ext="glb", digits=4, start=1)
+        glb.export(str(glb_path_p), extension_webp=False)
+        glb_path = str(glb_path_p)
+        if stage3_glb_path is None:
+            stage3_glb_path = glb_path
 
     # Optional extra exports (best effort; never fail the main GLB export).
     extras = [f for f in export_formats if f != "glb"]
     for fmt in extras:
         try:
             fmt = str(fmt).lower().strip()
-            if fmt == "gltf":
-                gltf_path = out_dir / f"gltf_{idx:04d}.gltf"
-                glb.export(str(gltf_path))
-            elif fmt == "obj":
-                obj_path = out_dir / f"obj_{idx:04d}.obj"
-                glb.export(str(obj_path))
-            elif fmt == "ply":
-                ply_path = out_dir / f"ply_{idx:04d}.ply"
-                glb.export(str(ply_path))
-            elif fmt == "stl":
-                stl_path = out_dir / f"stl_{idx:04d}.stl"
-                glb.export(str(stl_path))
+            out_path = _export_path_for_format(out_dir, fmt, final_glb_prefix, idx)
+            glb.export(str(out_path))
         except Exception as e:
             _log(f"Extra export '{fmt}' failed: {type(e).__name__}: {e}", 0.95)
 
+    _write_extract_artifacts_manifest(
+        out_dir=out_dir,
+        stage3_glb_path=stage3_glb_path,
+        stage3_has_textures=stage3_has_textures,
+        final_glb_path=glb_path,
+        final_has_textures=final_has_textures,
+        final_texture_source=final_texture_source,
+        export_formats=export_formats,
+        retexture_requested=bool(ultrashape_retexture_requested),
+    )
     torch.cuda.empty_cache()
     _log(f"Saved: {safe_relpath(glb_path, APP_DIR)}", 0.98)
     _log("Done.", 1.0)
@@ -4482,6 +4765,7 @@ def shapeimage_to_tex(
 
     def _log(msg: str, p: Optional[float] = None) -> str:
         nonlocal status
+        msg = _clean_status_text(msg)
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         status = (status + "\n" if status else "") + line
@@ -4537,7 +4821,7 @@ def shapeimage_to_tex(
             },
         )
 
-        _log(f"Subprocess mode ON. Run: {run_id} â†’ {safe_relpath(run_dir, APP_DIR)}", 0.02)
+        _log(f"Subprocess mode ON. Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.02)
         yield None, None, status
 
         # Define intermediate paths
@@ -4711,15 +4995,15 @@ def shapeimage_to_tex(
         },
     )
 
-    _log(f"Run: {run_id} â†’ {safe_relpath(run_dir, APP_DIR)}", 0.0)
+    _log(f"Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.0)
     yield None, None, status
 
-    _log("Loading texturing pipeline (first run can take a while)â€¦", 0.05)
+    _log("Loading texturing pipeline (first run can take a while)…", 0.05)
     pipe = get_texturing_pipeline()
     pipe.low_vram = low_vram  # Respect user's low VRAM setting
     yield None, None, status
 
-    _log("Loading meshâ€¦", 0.1)
+    _log("Loading mesh…", 0.1)
 
     mesh = trimesh.load(str(mesh_copy))
     if isinstance(mesh, trimesh.Scene):
@@ -4735,7 +5019,7 @@ def shapeimage_to_tex(
         "rescale_t": tex_slat_rescale_t,
     }
 
-    _log("Preprocessing reference imageâ€¦", 0.18)
+    _log("Preprocessing reference image…", 0.18)
     image = pipe.preprocess_image(image)
     try:
         image.save(str(run_dir / "02_reference_preprocessed.png"))
@@ -4743,33 +5027,33 @@ def shapeimage_to_tex(
         pass
     yield None, None, status
 
-    _log("Preprocessing meshâ€¦", 0.22)
+    _log("Preprocessing mesh…", 0.22)
     mesh = pipe.preprocess_mesh(mesh)
     yield None, None, status
 
     torch.manual_seed(seed)
-    _log(f"Computing image embeddings ({512 if res_int == 512 else 1024}px)â€¦", 0.3)
+    _log(f"Computing image embeddings ({512 if res_int == 512 else 1024}px)…", 0.3)
     cond = pipe.get_cond([image], 512) if res_int == 512 else pipe.get_cond([image], 1024)
     yield None, None, status
 
-    _log("Encoding mesh to shape latentâ€¦", 0.4)
+    _log("Encoding mesh to shape latent…", 0.4)
     shape_slat = pipe.encode_shape_slat(mesh, res_int)
     yield None, None, status
 
     tex_model = pipe.models["tex_slat_flow_model_512"] if res_int == 512 else pipe.models["tex_slat_flow_model_1024"]
-    _log("Sampling texture latentâ€¦", 0.55)
+    _log("Sampling texture latent…", 0.55)
     tex_slat = pipe.sample_tex_slat(cond, tex_model, shape_slat, tex_params)
     yield None, None, status
 
-    _log("Decoding texture latentâ€¦", 0.72)
+    _log("Decoding texture latent…", 0.72)
     pbr_voxel = pipe.decode_tex_slat(tex_slat)
     yield None, None, status
 
-    _log("Baking textures onto meshâ€¦", 0.84)
+    _log("Baking textures onto mesh…", 0.84)
     output = pipe.postprocess_mesh(mesh, pbr_voxel, res_int, texture_size)
     yield None, None, status
 
-    _log("Saving textured GLBâ€¦", 0.9)
+    _log("Saving textured GLB…", 0.9)
     out_dir = run_dir / "08_texturing"
     _, glb_path_p = next_indexed_path(out_dir, prefix="textured", ext="glb", digits=4, start=1)
     output.export(str(glb_path_p), extension_webp=False)
@@ -4820,6 +5104,7 @@ def ultrashape_refine_mesh(
 
     def _log(msg: str, p: Optional[float] = None) -> str:
         nonlocal status
+        msg = _clean_status_text(msg)
         ts = datetime.now().strftime("%H:%M:%S")
         line = f"[{ts}] {msg}"
         status = (status + "\n" if status else "") + line
@@ -4891,7 +5176,7 @@ def ultrashape_refine_mesh(
         },
     )
 
-    _log(f"Run: {run_id} â†’ {safe_relpath(run_dir, APP_DIR)}", 0.0)
+    _log(f"Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.0)
     yield None, None, status
 
     if subprocess_mode:
@@ -4928,7 +5213,7 @@ def ultrashape_refine_mesh(
         last_ui_update = 0.0
         result = None
 
-        _log("Running UltraShape refinement (subprocess)â€¦", 0.05)
+        _log("Running UltraShape refinement (subprocess)…", 0.05)
         yield None, None, status
 
         try:
@@ -4959,13 +5244,13 @@ def ultrashape_refine_mesh(
         yield preview_out, mesh_out, status
         return
 
-    _log("Loading meshâ€¦", 0.08)
+    _log("Loading mesh…", 0.08)
     mesh = trimesh.load(str(mesh_copy))
     if isinstance(mesh, trimesh.Scene):
         mesh = mesh.to_mesh()
     yield None, None, status
 
-    _log("Running UltraShape refinementâ€¦", 0.2)
+    _log("Running UltraShape refinement…", 0.2)
     from ultrashape_integration import refine_mesh_with_ultrashape
 
     refined = refine_mesh_with_ultrashape(
@@ -4994,7 +5279,7 @@ def ultrashape_refine_mesh(
     )
     yield None, None, status
 
-    _log("Saving refined meshâ€¦", 0.9)
+    _log("Saving refined mesh…", 0.9)
     _, out_path = next_indexed_path(out_dir, prefix="ultrashape_refined", ext=out_fmt, digits=4, start=1)
     refined.export(str(out_path))
     preview_path = out_path
@@ -5042,7 +5327,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
 
     with gr.Tabs() as main_tabs:
         # ---------------------------- Tab 1: Image -> 3D ----------------------------
-        with gr.Tab("Image â†’ 3D"):
+        with gr.Tab("Image → 3D"):
             with gr.Row():
                 with gr.Column(scale=1, min_width=380):
                     image_prompt = gr.Image(label="Image Prompt", format="png", image_mode="RGBA", type="pil", height=400)
@@ -5066,12 +5351,12 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     )
 
                     with gr.Row():
-                        resolution = gr.Radio(["512", "768", "1024", "1280", "1536", "2048"], label="Resolution (Generate)", value="1024", info="Output mesh resolution. Higher = finer detail but more VRAM. 512 uses direct sampling; 768+ use cascade for quality. â¬†Quality â¬†VRAM", scale=3)
-                        custom_resolution = gr.Number(label="Custom Resolution", value=0, precision=0, minimum=0, maximum=4096, step=128, info="Set to 0 to use radio selection. Must be â‰¥512 and divisible by 128. Overrides radio if >0.", scale=1)
+                        resolution = gr.Radio(["512", "768", "1024", "1280", "1536", "2048"], label="Resolution (Generate)", value="1024", info="Output mesh resolution. Higher = finer detail but more VRAM. 512 uses direct sampling; 768+ use cascade for quality. ⬆Quality ⬆VRAM", scale=3)
+                        custom_resolution = gr.Number(label="Custom Resolution", value=0, precision=0, minimum=0, maximum=4096, step=128, info="Set to 0 to use radio selection. Must be ≥512 and divisible by 128. Overrides radio if >0.", scale=1)
                     with gr.Row():
                         seed = gr.Slider(0, MAX_SEED, label="Seed (Generate)", value=99, step=1, scale=4, info="Random seed for reproducibility. Same seed + settings = same output.")
                         randomize_seed = gr.Checkbox(label="Randomize Seed (Generate)", value=False, scale=1, info="Generate random seed each run for variety.")
-                    decimation_target = gr.Slider(100000, 9000000, label="Decimation Target (Extract GLB)", value=1000000, step=10000, info="Target polygon count during mesh simplification. Higher = more geometric detail preserved but larger files. â¬†Quality, minimal VRAM impact.")
+                    decimation_target = gr.Slider(100000, 9000000, label="Decimation Target (Extract GLB)", value=1000000, step=10000, info="Target polygon count during mesh simplification. Higher = more geometric detail preserved but larger files. ⬆Quality, minimal VRAM impact.")
                     remesh_method = gr.Dropdown(REMESH_METHOD_CHOICES, label="Remesh Method (Extract GLB)", value="dual_contouring", info="Mesh reconstruction algorithm. dual_contouring: fast, good quality. faithful_contouring: higher fidelity (requires extra deps).")
                     if "faithful_contouring" not in REMESH_METHOD_CHOICES:
                         gr.Markdown(
@@ -5079,20 +5364,20 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                             "(`faithcontour` + `atom3d`). Not detected in this environment, so the option is hidden."
                         )
                     simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method (Extract GLB)", value="meshlib", info="Polygon reduction method. cumesh: GPU-accelerated, fast. meshlib: CPU-based alternative. cumesh uses some GPU VRAM.")
-                    prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces (Extract GLB)", value=False, info="Remove triangles not visible from outside. Reduces polygon count, may affect internal geometry. Slight â¬‡VRAM.")
-                    no_texture_gen = gr.Checkbox(label="Skip Texture Generation (Generate + Extract GLB)", value=False, info="Output shape-only mesh without PBR textures. Faster processing, significantly â¬‡VRAM usage.")
+                    prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces (Extract GLB)", value=False, info="Remove triangles not visible from outside. Reduces polygon count, may affect internal geometry. Slight ⬇VRAM.")
+                    no_texture_gen = gr.Checkbox(label="Skip Texture Generation (Generate + Extract GLB)", value=False, info="Output shape-only mesh without PBR textures. Faster processing, significantly ⬇VRAM usage.")
                     deferred_texture_after_cleanup = gr.Checkbox(
                         label="Deferred Texture Rebuild (Extract GLB)",
                         value=True,
                         info="Run a separate final TRELLIS texturing pass on the cleaned extracted mesh. Improves texture/mesh alignment after remesh/simplify; slower runtime. Runs as staged subprocesses."
                     )
-                    texture_size = gr.Slider(1024, 4096, label="Texture Size (Extract GLB)", value=2048, step=1024, info="Resolution of baked texture maps (albedo, normal, etc). Higher = sharper textures. â¬†Quality â¬†VRAM during baking.")
+                    texture_size = gr.Slider(1024, 4096, label="Texture Size (Extract GLB)", value=4096, step=1024, info="Resolution of baked texture maps (albedo, normal, etc). Higher = sharper textures. ⬆Quality ⬆VRAM during baking.")
                     export_formats = gr.CheckboxGroup(
                         choices=["glb", "gltf", "obj", "ply", "stl"],
                         value=["glb", "gltf", "obj", "ply", "stl"],
                         label="Export Formats (Extract GLB)",
                     )
-                    with gr.Accordion("âš™ï¸ Config Presets (Save / Load)", open=True):
+                    with gr.Accordion("Config Presets (Save / Load)", open=True):
                         gr.Markdown(
                             "Saves/loads **all settings** from Image->3D, Texturing, UltraShape Refine, and Rigging tabs (uploaded images/files are not included)."
                         )
@@ -5108,11 +5393,11 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 placeholder="my_settings",
                                 scale=3,
                             )
-                            ui_preset_save_btn = gr.Button("ðŸ’¾ Save", variant="primary", scale=1)
+                            ui_preset_save_btn = gr.Button("💾 Save", variant="primary", scale=1)
                         with gr.Row():
-                            ui_preset_load_btn = gr.Button("ðŸ“‚ Load Selected", scale=1)
-                            ui_preset_reset_btn = gr.Button("ðŸ”„ Reset Defaults", variant="secondary", scale=1)
-                            ui_preset_delete_btn = gr.Button("ðŸ—‘ï¸ Delete", variant="stop", scale=1)
+                            ui_preset_load_btn = gr.Button("📂 Load Selected", scale=1)
+                            ui_preset_reset_btn = gr.Button("🔄 Reset Defaults", variant="secondary", scale=1)
+                            ui_preset_delete_btn = gr.Button("Delete", variant="stop", scale=1)
                         ui_preset_status = gr.Markdown("")
 
                 with gr.Column(scale=3, min_width=680):
@@ -5138,10 +5423,10 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 view_extract_btn = gr.Button("View Extracted", interactive=False)
                             cancel_confirm_state = gr.State({"armed": False, "armed_at": 0.0, "scope": ""})
                             with gr.Row():
-                                open_outputs_top_btn = gr.Button("ðŸ“‚ Open outputs folder", variant="secondary")
-                                view_logs_btn = gr.Button("ðŸ“„ View Logs", variant="secondary")
-                                cancel_processing_btn = gr.Button("ðŸ›‘ Cancel processing", variant="stop")
-                            with gr.Accordion(label="ðŸ“¦ Batch Processing", open=False):
+                                open_outputs_top_btn = gr.Button("📂 Open outputs folder", variant="secondary")
+                                view_logs_btn = gr.Button("📄 View Logs", variant="secondary")
+                                cancel_processing_btn = gr.Button("🛑 Cancel processing", variant="stop")
+                            with gr.Accordion(label="📦 Batch Processing", open=False):
                                 batch_enabled = gr.Checkbox(label="Enable batch processing", value=False)
                                 batch_input_folder = gr.Textbox(
                                     label="Input folder (required)",
@@ -5162,15 +5447,15 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                             with gr.Accordion(label="Advanced Settings Trellis2 (Generate)", open=True):
                                 gr.Markdown("**Stage 1: Sparse Structure Generation (Generate)**")
                                 with gr.Row():
-                                    ss_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1, info="CFG scale - how strongly model follows image. Higher = more faithful but can oversaturate. 7.5 default. Slight â¬†VRAM (2 forward passes).")
+                                    ss_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1, info="CFG scale - how strongly model follows image. Higher = more faithful but can oversaturate. 7.5 default. Slight ⬆VRAM (2 forward passes).")
                                     ss_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.7, step=0.01, info="Reduces over-exposure from high CFG by normalizing variance. 0.7 recommended. No VRAM impact.")
-                                    ss_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1, info="Denoising iterations. More = cleaner but slower. 12 is efficient. â¬†Quality, no per-step VRAM increase.")
+                                    ss_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1, info="Denoising iterations. More = cleaner but slower. 12 is efficient. ⬆Quality, no per-step VRAM increase.")
                                 with gr.Row():
                                     ss_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=5.0, step=0.1, info="Time schedule warping. Higher = more steps on coarse structure. 5.0 default improves structure. No VRAM impact.")
                                     ss_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="âš ï¸ ADVANCED: Model default is 0.6. Only apply CFG in final refinement phase. Changing may reduce quality!")
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="WARNING: ADVANCED: Model default is 0.6. Only apply CFG in final refinement phase. Changing may reduce quality!")
                                     ss_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="âš ï¸ ADVANCED: Model default is 1.0. Keep at 1.0 unless you know what you're doing.")
+                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="WARNING: ADVANCED: Model default is 1.0. Keep at 1.0 unless you know what you're doing.")
                                 with gr.Row():
                                     force_high_res_conditional = gr.Checkbox(
                                         label="Force High-Res Conditioning (Generate)",
@@ -5206,15 +5491,15 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
 
                                 gr.Markdown("**Stage 2: Shape Generation (Generate)**")
                                 with gr.Row():
-                                    shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1, info="CFG for shape latent. Higher = stronger image adherence. 7.5 default. Slight â¬†VRAM (2 passes).")
+                                    shape_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=7.5, step=0.1, info="CFG for shape latent. Higher = stronger image adherence. 7.5 default. Slight ⬆VRAM (2 passes).")
                                     shape_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.5, step=0.01, info="Variance normalization to prevent CFG artifacts. 0.5 recommended. No VRAM impact.")
-                                    shape_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1, info="Denoising steps for shape. More = cleaner geometry. â¬†Quality, no per-step VRAM increase.")
+                                    shape_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1, info="Denoising steps for shape. More = cleaner geometry. ⬆Quality, no per-step VRAM increase.")
                                 with gr.Row():
                                     shape_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1, info="Time warping for shape sampling. 3.0 default balances coarse/fine detail. No VRAM impact.")
                                     shape_slat_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="âš ï¸ ADVANCED: Model default is 0.6. Only apply CFG in final refinement phase. Changing may reduce quality!")
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="WARNING: ADVANCED: Model default is 0.6. Only apply CFG in final refinement phase. Changing may reduce quality!")
                                     shape_slat_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="âš ï¸ ADVANCED: Model default is 1.0. Keep at 1.0 unless you know what you're doing.")
+                                        0.0, 1.0, label="Guidance Interval End", value=1.0, step=0.01, info="WARNING: ADVANCED: Model default is 1.0. Keep at 1.0 unless you know what you're doing.")
                                     max_num_tokens = gr.Slider(
                                         10000, 999999,
                                         label="Max Tokens (Generate - VRAM vs Quality)",
@@ -5224,31 +5509,31 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
 
                                 gr.Markdown("**Stage 3: Material Generation (Generate)**")
                                 with gr.Row():
-                                    tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1, info="CFG for texture. Low (1.0) works well since shape provides strong conditioning. Slight â¬†VRAM if >1.")
+                                    tex_slat_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1, info="CFG for texture. Low (1.0) works well since shape provides strong conditioning. Slight ⬆VRAM if >1.")
                                     tex_slat_guidance_rescale = gr.Slider(0.0, 1.0, label="Guidance Rescale", value=0.0, step=0.01, info="Variance normalization. 0.0 = disabled (not needed at low guidance). No VRAM impact.")
-                                    tex_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1, info="Steps for texture generation. 12 is efficient. â¬†Quality, no per-step VRAM increase.")
+                                    tex_slat_sampling_steps = gr.Slider(1, 50, label="Sampling Steps", value=12, step=1, info="Steps for texture generation. 12 is efficient. ⬆Quality, no per-step VRAM increase.")
                                 with gr.Row():
                                     tex_slat_rescale_t = gr.Slider(1.0, 6.0, label="Rescale T", value=3.0, step=0.1, info="Time warping for texture. 3.0 default. No VRAM impact.")
                                     tex_slat_guidance_interval_start = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="âš ï¸ ADVANCED: Model default is 0.6. Apply CFG in middle refinement phase. Changing may reduce quality!")
+                                        0.0, 1.0, label="Guidance Interval Start", value=0.6, step=0.01, info="WARNING: ADVANCED: Model default is 0.6. Apply CFG in middle refinement phase. Changing may reduce quality!")
                                     tex_slat_guidance_interval_end = gr.Slider(
-                                        0.0, 1.0, label="Guidance Interval End", value=0.9, step=0.01, info="âš ï¸ ADVANCED: Model default is 0.9. Texture uses 0.6-0.9 range. Changing may reduce quality!")
+                                        0.0, 1.0, label="Guidance Interval End", value=0.9, step=0.01, info="WARNING: ADVANCED: Model default is 0.9. Texture uses 0.6-0.9 range. Changing may reduce quality!")
                                 gr.Markdown("**UltraShape Refinement (Extract GLB)**")
                                 with gr.Row():
                                     ultrashape_enabled = gr.Checkbox(
                                         label="Enable UltraShape Refinement",
-                                        value=True,
+                                        value=False,
                                         info="Run UltraShape image-guided mesh refinement before final GLB baking. Improves geometry detail; adds time/VRAM."
                                     )
                                     ultrashape_retexture_after_refine = gr.Checkbox(
                                         label="Re-generate Texture After UltraShape",
-                                        value=True,
-                                        info="Recommended. Rebuild texture maps after UltraShape mesh changes to keep textures aligned."
+                                        value=False,
+                                        info="Rebuild texture maps after UltraShape mesh changes to keep textures aligned. Adds runtime."
                                     )
                                     ultrashape_conservative_mode = gr.Checkbox(
                                         label="Conservative UltraShape Mode",
-                                        value=True,
-                                        info="Recommended. Reduces geometry drift to preserve TRELLIS texture/shape alignment. Slightly less aggressive refinement."
+                                        value=False,
+                                        info="Reduces geometry drift to preserve TRELLIS texture/shape alignment. Slightly less aggressive refinement."
                                     )
                                 with gr.Row():
                                     ultrashape_checkpoint = gr.Textbox(
@@ -5402,7 +5687,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                         value="Select an image (upload or example), then click Generate.",
                     ),  # status_box
                     True,  # logs_visible_state
-                    gr.update(value="ðŸ“„ Hide Logs"),  # view_logs_btn
+                    gr.update(value="📄 Hide Logs"),  # view_logs_btn
                 )
 
             # Note: We intentionally do not auto-preprocess on upload/example click.
@@ -5522,7 +5807,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
             # Navigation-only controls (do NOT re-run extraction)
             view_extract_btn.click(lambda: gr.Walkthrough(selected=1), outputs=walkthrough)
             back_to_preview_btn.click(
-                lambda: (gr.Walkthrough(selected=0), gr.update(visible=False), False, gr.update(value="ðŸ“„ View Logs")),
+                lambda: (gr.Walkthrough(selected=0), gr.update(visible=False), False, gr.update(value="📄 View Logs")),
                 outputs=[walkthrough, status_box, logs_visible_state, view_logs_btn]
             )
 
@@ -5589,7 +5874,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
             def _toggle_logs(current_visible: bool) -> tuple:
                 """Toggle visibility of status logs."""
                 new_visible = not current_visible
-                btn_text = "ðŸ“„ Hide Logs" if new_visible else "ðŸ“„ View Logs"
+                btn_text = "📄 Hide Logs" if new_visible else "📄 View Logs"
                 return gr.update(visible=new_visible), new_visible, gr.update(value=btn_text)
             
             view_logs_btn.click(
@@ -5636,7 +5921,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                 if armed and armed_scope == scope and (now - armed_at) <= confirm_window_s:
                     msg = _cancel_now(session, scope=scope)
                     new_state = {"armed": False, "armed_at": 0.0, "scope": ""}
-                    btn_update = gr.update(value="ðŸ›‘ Cancel processing")
+                    btn_update = gr.update(value="🛑 Cancel processing")
                     line = f"[{ts}] {msg}"
                     return (
                         new_state,
@@ -5646,10 +5931,10 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     )
 
                 # Arm (no cancellation yet)
-                label = "âš ï¸ CONFIRM cancel (click again)"
+                label = "WARNING: CONFIRM cancel (click again)"
                 if scope == "batch":
                     hint = (
-                        f"[{ts}] Cancel armed. Click again to confirm (subprocess mode is OFF â†’ batch only)."
+                        f"[{ts}] Cancel armed. Click again to confirm (subprocess mode is OFF → batch only)."
                     )
                 else:
                     hint = f"[{ts}] Cancel armed. Click again to confirm (this will stop ALL processing)."
@@ -6272,12 +6557,12 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
             )
 
         # ---------------------------- Tab 4: Help / Guide ----------------------------
-        with gr.Tab("ðŸ“˜ Help / Settings Guide"):
+        with gr.Tab("📘 Help / Settings Guide"):
             gr.Markdown(
                 """
 ## Quick start (most people)
 
-1. Go to **Image â†’ 3D**.
+1. Go to **Image → 3D**.
 2. Upload an image in **Image Prompt** (best: one object, centered, clear silhouette).
 3. Keep defaults, click **Generate**.
 4. When preview is ready, click **Extract GLB**.
@@ -6285,20 +6570,20 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
 
 If you want to stop a run:
 - **Subprocess mode ON**: **Cancel processing** will stop everything and terminate the active worker stage immediately.
-- **Subprocess mode OFF**: **Cancel processing** will stop **batch only** (in-process jobs canâ€™t be force-killed safely).
+- **Subprocess mode OFF**: **Cancel processing** will stop **batch only** (in-process jobs can’t be force-killed safely).
 
 ---
 
-## What the pipeline does (Image â†’ 3D)
+## What the pipeline does (Image → 3D)
 
-The Image â†’ 3D pipeline is intentionally split into stages so progress can be shown and (in subprocess mode) VRAM can be released between stages:
+The Image → 3D pipeline is intentionally split into stages so progress can be shown and (in subprocess mode) VRAM can be released between stages:
 
 1. **Preprocess image**: background removal + crop/center.  
    - Goal: give the model a clean, object-focused input.
 2. **Encode conditioning**: compute image embeddings (512px and/or 1024px depending on resolution).
-3. **Stage 1 â€” Sparse structure**: generate a sparse 3D structure (where the object exists in space).
-4. **Stage 2 â€” Shape generation**: generate the high-detail geometry latent.
-5. **Stage 3 â€” Material generation** (optional): generate texture/material latent (basecolor/roughness/metallic/opacity).
+3. **Stage 1 — Sparse structure**: generate a sparse 3D structure (where the object exists in space).
+4. **Stage 2 — Shape generation**: generate the high-detail geometry latent.
+5. **Stage 3 — Material generation** (optional): generate texture/material latent (basecolor/roughness/metallic/opacity).
 6. **Preview render**: render multi-view snapshots for the UI preview.
 7. **Extract GLB**: convert the latent representation into a mesh and bake textures into a GLB (and optional extra formats).
 
@@ -6307,19 +6592,19 @@ The Image â†’ 3D pipeline is intentionally split into stages so progress ca
 ## GLOBAL setting
 
 ### Subprocess stage processing (zero leftover VRAM between stages)
-**What it is**: When enabled, each major stage runs in a fresh Python subprocess. This keeps the UI process from â€œholding ontoâ€ VRAM between stages.  
+**What it is**: When enabled, each major stage runs in a fresh Python subprocess. This keeps the UI process from "holding onto" VRAM between stages.  
 **When to enable**:
 - Enable if you get CUDA OOM errors, driver resets, or your VRAM stays high after a run.
 - Enable if you run large resolutions (1536/2048) or do batch processing.
 **When to disable**:
-- Disable if you prefer slightly simpler execution and youâ€™re not memory constrained.
+- Disable if you prefer slightly simpler execution and you’re not memory constrained.
 **Important**:
 - With subprocess mode ON, the **Cancel processing** button can immediately terminate the worker stage.
-- With subprocess mode OFF, in-process work can only stop at â€œsafe pointsâ€ (and we intentionally only cancel batch).
+- With subprocess mode OFF, in-process work can only stop at "safe points" (and we intentionally only cancel batch).
 
 ---
 
-## IMAGE â†’ 3D settings (left panel)
+## IMAGE → 3D settings (left panel)
 
 ### Image Prompt (upload)
 Upload the input image you want to convert to 3D.
@@ -6327,7 +6612,7 @@ Upload the input image you want to convert to 3D.
 **Best practices**:
 - Use a single main object. Avoid busy backgrounds.
 - Center the object and keep it large in the frame.
-- If you have a PNG with transparency, thatâ€™s ideal.
+- If you have a PNG with transparency, that’s ideal.
 
 **Examples**:
 - Good: a centered product photo on a plain background.
@@ -6345,13 +6630,13 @@ You can upload one or multiple additional views of the same object (front/back/s
 Choose the target generation quality/speed level. Higher resolutions produce more detail but cost more VRAM/time.
 
 **Options**:
-- **512**: fastest and lightest. Great for quick tests and lowâ€‘VRAM GPUs.
+- **512**: fastest and lightest. Great for quick tests and low‑VRAM GPUs.
 - **1024**: good default balance (recommended starting point).
-- **1536 / 2048**: highest detail, slowest, and most VRAMâ€‘intensive.
+- **1536 / 2048**: highest detail, slowest, and most VRAM‑intensive.
 
 **Example decision**:
-- â€œI want fast previewsâ€: start with **512** or **1024**.
-- â€œI need maximum detailâ€: try **1536**, and only use **2048** if your GPU has enough VRAM and you can wait.
+- "I want fast previews": start with **512** or **1024**.
+- "I need maximum detail": try **1536**, and only use **2048** if your GPU has enough VRAM and you can wait.
 
 ### Seed
 Controls randomness. Same inputs + same seed + same settings = very similar output (useful for reproducibility).
@@ -6372,12 +6657,12 @@ If enabled, a new random seed is used each time you click **Generate** (or for e
 Target triangle/face count for mesh simplification during **Extract GLB**.
 
 **What it changes**:
-- Lower target â†’ smaller file, faster loading, but less geometric detail.
-- Higher target â†’ more detail, larger file, heavier rendering.
+- Lower target → smaller file, faster loading, but less geometric detail.
+- Higher target → more detail, larger file, heavier rendering.
 
 **Examples**:
-- Game/realâ€‘time: try `100kâ€“300k`.
-- DCC / offline: try `500kâ€“1M` (default is high quality).
+- Game/real‑time: try `100k–300k`.
+- DCC / offline: try `500k–1M` (default is high quality).
 
 ### Remesh Method
 Controls how the surface is reconstructed before export.
@@ -6393,10 +6678,10 @@ Controls how the surface is reconstructed before export.
 Controls which mesh simplifier is used during export.
 
 **cumesh**:
-- GPUâ€‘accelerated (when available), generally fast.
+- GPU‑accelerated (when available), generally fast.
 
 **meshlib**:
-- CPUâ€‘based alternative (requires optional deps), can behave differently on some meshes.
+- CPU‑based alternative (requires optional deps), can behave differently on some meshes.
 
 ### Prune Invisible Faces
 Attempts to remove faces that are not visible / not contributing (can reduce mesh size).
@@ -6415,48 +6700,57 @@ If enabled, the model will generate **shape only** and skip material/texture gen
 - Lower VRAM/time
 - Useful for clay/geometry workflows
 
-**Tradeâ€‘off**:
-- Exported GLB wonâ€™t have rich PBR textures.
+**Trade‑off**:
+- Exported GLB won’t have rich PBR textures.
 
 ### Texture Size
 Controls baked texture resolution during extraction (typical values: 1024 / 2048 / 4096).
 
 **Examples**:
 - 1024: lightweight, faster, good for previews.
-- 2048: default sweet spot.
-- 4096: maximum crispness, heavy VRAM/disk.
+- 2048: balanced quality/performance.
+- 4096: default for maximum crispness (heavy VRAM/disk).
 
-### Autoâ€‘save export formats
-Select which formats are written under `./outputs/<run_id>/08_extract/`.
+### Auto‑save export formats
+Select which formats are written under `./outputs/<run_id>/08_final_exports/`.
 
 **Notes**:
 - `glb` is always produced for the viewer/download.
-- Extra formats (obj/ply/stl/gltf) are best-effort and may fail for some meshes; failures wonâ€™t block GLB export.
+- Filenames now include stage meaning:
+  - `glb_stage3_shape_only_####.glb`: intermediate mesh before optional re-texture.
+  - `glb_final_textured_direct_####.glb`: final direct extract with TRELLIS texture bake.
+  - `glb_final_textured_retexture_####.glb`: final output after deferred re-texture pass.
+  - `glb_final_shape_only_####.glb`: final geometry-only output (no texture generation).
+- Extra formats follow the same suffix, e.g. `obj_final_textured_retexture_####.obj`.
+- `extract_artifacts.json` is written in `08_final_exports/` and marks which artifact is final + what it contains.
+- If deferred re-texture is enabled, temporary stage files are stored in `09_retexture_work/` (not final deliverables).
+- Extra formats (obj/ply/stl/gltf) are best-effort and may fail for some meshes; failures won’t block GLB export.
 
 ---
 
 ## Preview panel controls (right side)
 
 ### Generate
-Runs the **Image â†’ 3D** pipeline and builds the preview.
+Runs the **Image → 3D** pipeline and builds the preview.
 
 ### Extract GLB
-Converts the generated latents into an exportable mesh + textures (GLB) and saves to `./outputs/<run_id>/08_extract/`.
+Converts the generated latents into an exportable mesh + textures (GLB) and saves to `./outputs/<run_id>/08_final_exports/`.
+Also writes `extract_artifacts.json` that documents stage outputs, final artifact, and whether textures are included.
 
 ### View Extracted
-Switches the UI to show the extracted GLB in the 3D viewer (no reâ€‘compute).
+Switches the UI to show the extracted GLB in the 3D viewer (no re‑compute).
 
-### ðŸ“‚ Open outputs folder
+### 📂 Open outputs folder
 Opens the `./outputs` folder in your OS file explorer:
 - Windows: File Explorer
 - Linux: default file manager via `xdg-open` / `gio open`
 - macOS: Finder via `open`
 
-### ðŸ›‘ Cancel processing (twoâ€‘step safety)
-This button uses a **twoâ€‘click confirmation** to avoid accidental cancels:
+### 🛑 Cancel processing (two‑step safety)
+This button uses a **two‑click confirmation** to avoid accidental cancels:
 
-1. First click â†’ arms cancellation (no work is stopped yet).
-2. Second click within a few seconds â†’ performs cancellation.
+1. First click → arms cancellation (no work is stopped yet).
+2. Second click within a few seconds → performs cancellation.
 
 **Actual cancel behavior**:
 - **If a subprocess stage is running**: cancels everything and terminates the active stage process immediately.
@@ -6485,21 +6779,21 @@ Tip: If your path contains spaces, you can wrap it in quotes.
 Where batch results go.
 
 - Leave blank to use `./outputs`
-- Each input image is saved into its own subfolder named after the filename (safeâ€‘sanitized).
+- Each input image is saved into its own subfolder named after the filename (safe‑sanitized).
 - If a target folder already exists, that file is **skipped** (safe for resume).
 
 ### Run Batch
 Processes each image using the **same settings** as a single run (resolution, guidance, extraction options, etc.).
 
 **Seed behavior**:
-- If **Randomize Seed** is ON â†’ each image gets a different seed.
-- If OFF â†’ all images use the same seed (useful if you want consistent style).
+- If **Randomize Seed** is ON → each image gets a different seed.
+- If OFF → all images use the same seed (useful if you want consistent style).
 
 ---
 
-## Advanced Settings (what â€œguidanceâ€ means)
+## Advanced Settings (what "guidance" means)
 
-These parameters control diffusion sampling behavior. Think of them as â€œhow strongly the model follows its conditioningâ€ and â€œhow the sampler behaves over timeâ€.
+These parameters control diffusion sampling behavior. Think of them as "how strongly the model follows its conditioning" and "how the sampler behaves over time".
 
 ### Guidance Strength
 Higher values usually enforce the conditioning more strongly (often sharper/more literal), but too high can cause artifacts.
@@ -6515,18 +6809,18 @@ Helps reduce over-saturation / over-contrast artifacts at higher guidance.
 - If you raise guidance strength a lot, consider raising rescale a bit too.
 
 ### Guidance Interval Start / End
-Limits guidance to only part of the sampling trajectory (0 â†’ start, 1 â†’ end).
+Limits guidance to only part of the sampling trajectory (0 → start, 1 → end).
 
 **Examples**:
-- `start=0.6, end=1.0` means â€œapply stronger guidance mostly laterâ€.
+- `start=0.6, end=1.0` means "apply stronger guidance mostly later".
 - Narrower interval can reduce early over-constraint artifacts.
 
 ### Sampling Steps
 More steps can improve quality but increases time.
 
 **Examples**:
-- Fast test: 8â€“12 steps
-- Higher quality: 16â€“30 steps
+- Fast test: 8–12 steps
+- Higher quality: 16–30 steps
 
 ### Rescale T
 Sampler stability/temperature-like parameter used by this pipeline. Defaults are generally good.
@@ -6554,13 +6848,13 @@ Image that guides the texture appearance (color/material cues).
 Controls which internal model path is used. Higher = more detail, more cost.
 
 ### Seed / Randomize Seed
-Same meaning as Image â†’ 3D: controls randomness and reproducibility.
+Same meaning as Image → 3D: controls randomness and reproducibility.
 
 ### Texture Size (Texturing)
 Baked texture resolution for the textured output GLB.
 
 ### Texturing Advanced Settings
-Same concepts as â€œguidanceâ€ above but applied to texture generation.
+Same concepts as "guidance" above but applied to texture generation.
 
 ---
 
@@ -6577,13 +6871,13 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
 **Where presets are stored**: `./presets/<name>.json`
 
 **Typical workflow**:
-- Dial in settings you like â†’ Save preset as `my_high_quality`
-- Later â†’ Load preset to restore all sliders/checkboxes instantly
+- Dial in settings you like → Save preset as `my_high_quality`
+- Later → Load preset to restore all sliders/checkboxes instantly
 """
             )
 
         # ---------------------------- Tab 5: Rigging (UniRig) ----------------------------
-        with gr.Tab("ðŸ¦´ Rigging", id="rigging_tab"):
+        with gr.Tab("🦴 Rigging", id="rigging_tab"):
             rigging_ui = rigging_tab(
                 run_skeleton_fn=_run_unirig_skeleton,
                 run_skinning_fn=_run_unirig_skinning,
@@ -6593,7 +6887,7 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
             )
 
         # ---------------------------- Tab 6: Animation Player ----------------------------
-        with gr.Tab("ðŸŽ¬ Animation Player", id="animation_tab"):
+        with gr.Tab("🎬 Animation Player", id="animation_tab"):
             animation_ui = animation_player_tab(
                 list_models_fn=_list_rigged_models,
                 rigging_outputs_dir=OUTPUTS_DIR,
@@ -6827,7 +7121,7 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         # If a key is invalid, fall back to defaults (keeps UI consistent).
         defaults = _default_ui_config()
 
-        # Imageâ†’3D resolution
+        # Image→3D resolution
         if merged["image_to_3d"]["resolution"] not in ["512", "768", "1024", "1280", "1536", "2048"]:
             merged["image_to_3d"]["resolution"] = defaults["image_to_3d"]["resolution"]
         # Texturing resolution
@@ -6893,39 +7187,39 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
             presets = _list_ui_presets()
             return (
                 gr.update(choices=presets, value=saved),
-                f"âœ… Saved preset **{saved}**",
+                f"✅ Saved preset **{saved}**",
             )
         except Exception as e:
-            return gr.update(), f"âŒ Save failed: {e}"
+            return gr.update(), f"[ERROR] Save failed: {e}"
 
     def _load_preset_ui(preset_name: str):
         if not preset_name:
             cfg = _default_ui_config()
             vals = _ui_config_to_values(cfg)
-            return (*vals, "â„¹ï¸ No preset selected (showing defaults).")
+            return (*vals, "INFO: No preset selected (showing defaults).")
 
         cfg = _load_ui_preset(preset_name)
         if not cfg:
             cfg = _default_ui_config()
             vals = _ui_config_to_values(cfg)
-            return (*vals, f"âš ï¸ Preset **{preset_name}** not found (loaded defaults).")
+            return (*vals, f"WARNING: Preset **{preset_name}** not found (loaded defaults).")
 
         vals = _ui_config_to_values(cfg)
-        return (*vals, f"âœ… Loaded preset **{preset_name}**")
+        return (*vals, f"✅ Loaded preset **{preset_name}**")
 
     def _reset_defaults_ui():
         cfg = _default_ui_config()
         vals = _ui_config_to_values(cfg)
-        return (*vals, "âœ… Reset to defaults")
+        return (*vals, "✅ Reset to defaults")
 
     def _delete_preset_ui(preset_name: str):
         if not preset_name:
-            return gr.update(), "âš ï¸ No preset selected"
+            return gr.update(), "WARNING: No preset selected"
         ok = _delete_ui_preset(preset_name)
         presets = _list_ui_presets()
         if ok:
-            return gr.update(choices=presets, value=""), f"âœ… Deleted preset **{preset_name}**"
-        return gr.update(choices=presets), f"âš ï¸ Could not delete preset **{preset_name}**"
+            return gr.update(choices=presets, value=""), f"✅ Deleted preset **{preset_name}**"
+        return gr.update(choices=presets), f"WARNING: Could not delete preset **{preset_name}**"
 
     ui_preset_save_btn.click(
         fn=_save_preset_ui,

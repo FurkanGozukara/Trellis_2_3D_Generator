@@ -92,6 +92,33 @@ def _read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _split_indexed_stem(stem: str) -> Tuple[str, Optional[int]]:
+    base, sep, tail = str(stem).rpartition("_")
+    if sep and tail.isdigit():
+        try:
+            return base, int(tail)
+        except Exception:
+            pass
+    return str(stem), None
+
+
+def _export_prefix_from_glb_prefix(glb_prefix: str, fmt: str) -> str:
+    fmt_l = str(fmt).lower().strip()
+    glb_prefix_s = str(glb_prefix).strip()
+    glb_prefix_l = glb_prefix_s.lower()
+    if glb_prefix_l == "glb":
+        return fmt_l
+    if glb_prefix_l.startswith("glb_"):
+        return f"{fmt_l}_{glb_prefix_s[4:]}"
+    return f"{fmt_l}_{glb_prefix_s}"
+
+
+def _export_path_for_format(out_dir: Path, fmt: str, glb_prefix: str, idx: int) -> Path:
+    fmt_l = str(fmt).lower().strip()
+    ext = "gltf" if fmt_l == "gltf" else fmt_l
+    return out_dir / f"{_export_prefix_from_glb_prefix(glb_prefix, fmt_l)}_{idx:04d}.{ext}"
+
+
 def _load_npz_sparse(path: Path) -> Tuple["torch.Tensor", "torch.Tensor"]:
     import numpy as np
     import torch
@@ -1579,10 +1606,7 @@ def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
         if fmt == "glb":
             continue
         try:
-            if fmt == "gltf":
-                p = out_dir / f"gltf_{idx:04d}.gltf"
-            else:
-                p = out_dir / f"{fmt}_{idx:04d}.{fmt}"
+            p = _export_path_for_format(out_dir, fmt, prefix, idx)
             glb.export(str(p))
             print(f"[extract_to_glb] saved extra '{fmt}': {p}", flush=True)
         except Exception as e:
@@ -1593,7 +1617,6 @@ def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def stage_mesh_export_formats(payload: Dict[str, Any]) -> Dict[str, Any]:
-    import re
     import trimesh
 
     mesh_path = Path(payload["mesh_path"])
@@ -1610,15 +1633,16 @@ def stage_mesh_export_formats(payload: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(mesh, trimesh.Scene):
         mesh = mesh.to_mesh()
 
-    m = re.search(r"(\d+)$", mesh_path.stem)
-    idx = int(m.group(1)) if m else 1
+    glb_prefix, idx = _split_indexed_stem(mesh_path.stem)
+    if idx is None:
+        idx = 1
+    if not str(glb_prefix).lower().startswith("glb"):
+        glb_prefix = f"glb_{glb_prefix}"
+
     exported: List[str] = []
     for fmt in export_formats:
         try:
-            if fmt == "gltf":
-                p = out_dir / f"gltf_{idx:04d}.gltf"
-            else:
-                p = out_dir / f"{fmt}_{idx:04d}.{fmt}"
+            p = _export_path_for_format(out_dir, fmt, str(glb_prefix), idx)
             mesh.export(str(p))
             exported.append(str(p))
             print(f"[mesh_export] saved '{fmt}': {p}", flush=True)
@@ -1879,18 +1903,8 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
         if fmt == "glb":
             continue
         try:
-            if fmt == "gltf":
-                gltf_path = out_dir / f"gltf_{idx:04d}.gltf"
-                glb.export(str(gltf_path))
-            elif fmt == "obj":
-                obj_path = out_dir / f"obj_{idx:04d}.obj"
-                glb.export(str(obj_path))
-            elif fmt == "ply":
-                ply_path = out_dir / f"ply_{idx:04d}.ply"
-                glb.export(str(ply_path))
-            elif fmt == "stl":
-                stl_path = out_dir / f"stl_{idx:04d}.stl"
-                glb.export(str(stl_path))
+            out_path = _export_path_for_format(out_dir, fmt, prefix, idx)
+            glb.export(str(out_path))
         except Exception as e:
             print(f"[extract] extra export '{fmt}' failed: {type(e).__name__}: {e}", flush=True)
     torch.cuda.empty_cache()

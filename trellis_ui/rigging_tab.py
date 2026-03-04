@@ -104,14 +104,14 @@ def rigging_tab(
             
             # Action Buttons
             gr.Markdown("## Actions")
-            generate_skeleton_btn = gr.Button("ðŸ¦´ Generate Skeleton", variant="primary", size="lg")
-            add_skinning_btn = gr.Button("ðŸŽ¨ Add Skinning", variant="secondary", size="lg")
-            export_rigged_btn = gr.Button("ðŸ’¾ Export Rigged Model", variant="secondary", size="lg")
-            send_to_animation_btn = gr.Button("âž¡ Open In Animation Browser", variant="secondary", size="lg")
+            generate_skeleton_btn = gr.Button("🦴 Generate Skeleton", variant="primary", size="lg")
+            add_skinning_btn = gr.Button("🎨 Add Skinning", variant="secondary", size="lg")
+            export_rigged_btn = gr.Button("💾 Export Rigged Model", variant="secondary", size="lg")
+            send_to_animation_btn = gr.Button("➡ Open In Animation Browser", variant="secondary", size="lg")
             
             with gr.Row():
-                open_outputs_btn = gr.Button("ðŸ“ Open Outputs Folder", variant="secondary")
-                clear_btn = gr.Button("ðŸ—‘ï¸ Clear", variant="secondary")
+                open_outputs_btn = gr.Button("Open Outputs Folder", variant="secondary")
+                clear_btn = gr.Button("Clear", variant="secondary")
         
         # Right Column: Preview and Status
         with gr.Column(scale=2, min_width=520):
@@ -155,7 +155,7 @@ def rigging_tab(
             
             # Download button (hidden until export is complete)
             download_btn = gr.DownloadButton(
-                label="â¬‡ï¸ Download Rigged Model",
+                label="Download Rigged Model",
                 visible=False,
                 variant="primary"
             )
@@ -467,7 +467,7 @@ def rigging_tab(
                 if converted_preview:
                     return (
                         converted_preview,
-                        f"Preview source: converted {preview_glb.name} ({original_faces}â†’{simplified_faces} faces)",
+                        f"Preview source: converted {preview_glb.name} ({original_faces}→{simplified_faces} faces)",
                     )
         except Exception as e:
             note = f"Preview conversion failed ({type(e).__name__}); using uploaded mesh."
@@ -487,7 +487,7 @@ def rigging_tab(
             return (
                 None,
                 None,
-                "âŒ Uploaded mesh file was not found. Please upload again.",
+                "[ERROR] Uploaded mesh file was not found. Please upload again.",
                 None,
             )
 
@@ -497,7 +497,7 @@ def rigging_tab(
             return (
                 None,
                 None,
-                f"âŒ Failed to prepare upload workspace: {type(e).__name__}: {e}",
+                f"[ERROR] Failed to prepare upload workspace: {type(e).__name__}: {e}",
                 None,
             )
 
@@ -507,7 +507,7 @@ def rigging_tab(
 
         if preview_path:
             status = (
-                f"âœ… Mesh uploaded: {Path(copied_path).name}\n"
+                f"✅ Mesh uploaded: {Path(copied_path).name}\n"
                 f"Workspace: {work_dir}\n"
                 f"Viewer path: {preview_path}\n"
                 f"{preview_note}\n"
@@ -515,7 +515,7 @@ def rigging_tab(
             )
         else:
             status = (
-                f"âœ… Mesh uploaded: {Path(copied_path).name}\n"
+                f"✅ Mesh uploaded: {Path(copied_path).name}\n"
                 f"Workspace: {work_dir}\n"
                 f"{preview_note}\n"
                 "You can still run rigging."
@@ -542,12 +542,12 @@ def rigging_tab(
         base_status = prior_status or ""
 
         if not skeleton_path:
-            msg = "âŒ Skeleton generation did not produce an output. Auto-skinning skipped."
+            msg = "[ERROR] Skeleton generation did not produce an output. Auto-skinning skipped."
             yield (None, None, (base_status + "\n" + msg).strip() if base_status else msg)
             return
 
         if not enable_skin:
-            msg = "â„¹ï¸ Auto-skinning is disabled. Skeleton was saved."
+            msg = "INFO: Auto-skinning is disabled. Skeleton was saved."
             yield (None, None, (base_status + "\n" + msg).strip() if base_status else msg)
             return
 
@@ -688,9 +688,9 @@ def rigging_tab(
     def open_outputs():
         try:
             open_folder_fn(rigging_outputs_dir)
-            return "âœ… Opened outputs folder"
+            return "✅ Opened outputs folder"
         except Exception as e:
-            return f"âŒ Failed to open folder: {e}"
+            return f"[ERROR] Failed to open folder: {e}"
     
     open_outputs_btn.click(
         fn=open_outputs,
