@@ -249,6 +249,182 @@ css = """
     top: 0;
     left: 0;
 }
+
+/* Stage action buttons */
+@keyframes warm-stage-button-glow {
+    0%, 100% {
+        box-shadow:
+            0 14px 34px rgba(127, 16, 35, 0.38),
+            0 0 18px rgba(239, 68, 68, 0.32),
+            inset 0 1px 0 rgba(255, 255, 255, 0.2);
+    }
+    50% {
+        box-shadow:
+            0 18px 40px rgba(127, 16, 35, 0.46),
+            0 0 28px rgba(248, 113, 113, 0.42),
+            inset 0 1px 0 rgba(255, 255, 255, 0.26);
+    }
+}
+
+@keyframes purple-stage-button-glow {
+    0%, 100% {
+        box-shadow:
+            0 14px 34px rgba(76, 29, 149, 0.34),
+            0 0 18px rgba(168, 85, 247, 0.28),
+            inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    }
+    50% {
+        box-shadow:
+            0 18px 42px rgba(76, 29, 149, 0.42),
+            0 0 30px rgba(196, 181, 253, 0.34),
+            inset 0 1px 0 rgba(255, 255, 255, 0.24);
+    }
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .stage-action-btn button,
+    button.stage-action-btn
+) {
+    min-height: 58px;
+    padding: 0 1.4rem !important;
+    border: 1px solid transparent !important;
+    border-radius: 18px !important;
+    color: #fff !important;
+    font-size: 0.98rem !important;
+    font-weight: 800 !important;
+    letter-spacing: 0.02em;
+    text-shadow: 0 1px 0 rgba(255, 255, 255, 0.08);
+    background-size: 180% 180% !important;
+    transition:
+        transform 0.18s ease,
+        filter 0.18s ease,
+        box-shadow 0.18s ease,
+        background-position 0.28s ease;
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .stage-action-btn button,
+    button.stage-action-btn
+):hover:not(:disabled) {
+    transform: translateY(-2px) scale(1.01);
+    filter: saturate(1.08) brightness(1.04);
+    background-position: 100% 50% !important;
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .stage-action-btn button,
+    button.stage-action-btn
+):active:not(:disabled) {
+    transform: translateY(0) scale(0.99);
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .stage-action-btn button,
+    button.stage-action-btn
+):focus-visible {
+    outline: none;
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .stage-action-btn button,
+    button.stage-action-btn
+):disabled {
+    cursor: not-allowed;
+    opacity: 0.72 !important;
+    filter: saturate(0.72) brightness(0.86);
+    animation: none !important;
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.08),
+        0 8px 18px rgba(15, 23, 42, 0.14) !important;
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    .generate-stage-btn button,
+    button.generate-stage-btn
+) {
+    background: linear-gradient(135deg, #7f1023 0%, #b91c1c 36%, #ef4444 72%, #f97316 100%) !important;
+    border-color: rgba(255, 208, 208, 0.34) !important;
+    box-shadow:
+        0 14px 34px rgba(127, 16, 35, 0.38),
+        0 0 18px rgba(239, 68, 68, 0.32),
+        inset 0 1px 0 rgba(255, 255, 255, 0.2) !important;
+    animation: warm-stage-button-glow 2.7s ease-in-out infinite;
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    .generate-stage-btn button,
+    button.generate-stage-btn
+):hover:not(:disabled),
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    .generate-stage-btn button,
+    button.generate-stage-btn
+):focus-visible:not(:disabled) {
+    box-shadow:
+        0 18px 40px rgba(127, 16, 35, 0.46),
+        0 0 28px rgba(248, 113, 113, 0.42),
+        inset 0 1px 0 rgba(255, 255, 255, 0.24),
+        0 0 0 3px rgba(248, 113, 113, 0.16) !important;
+}
+
+:where(
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .extract-stage-btn button,
+    button.extract-stage-btn
+) {
+    background: linear-gradient(135deg, #312e81 0%, #5b21b6 35%, #7c3aed 72%, #a855f7 100%) !important;
+    border-color: rgba(224, 215, 255, 0.34) !important;
+    box-shadow:
+        0 14px 34px rgba(76, 29, 149, 0.34),
+        0 0 18px rgba(168, 85, 247, 0.28),
+        inset 0 1px 0 rgba(255, 255, 255, 0.18) !important;
+    animation: purple-stage-button-glow 2.9s ease-in-out infinite;
+}
+
+:where(
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .extract-stage-btn button,
+    button.extract-stage-btn
+):hover:not(:disabled),
+:where(
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .extract-stage-btn button,
+    button.extract-stage-btn
+):focus-visible:not(:disabled) {
+    box-shadow:
+        0 18px 42px rgba(76, 29, 149, 0.42),
+        0 0 30px rgba(196, 181, 253, 0.34),
+        inset 0 1px 0 rgba(255, 255, 255, 0.22),
+        0 0 0 3px rgba(196, 181, 253, 0.16) !important;
+}
 """
 
 
@@ -626,8 +802,8 @@ def extract_glb(
 with gr.Blocks(delete_cache=(600, 600)) as demo:
     gr.Markdown("""
     ## Image to 3D Asset with [TRELLIS.2](https://microsoft.github.io/TRELLIS.2)
-    * Upload an image (preferably with an alpha-masked foreground object) and click Generate to create a 3D asset.
-    * Click Extract GLB to export and download the generated GLB file if you're satisfied with the result. Otherwise, try another time.
+    * Upload an image (preferably with an alpha-masked foreground object) and click Generate (Step 1) to create a 3D asset.
+    * Click Extract GLB (Step 2) to export and download the generated GLB file if you're satisfied with the result. Otherwise, try another time.
     """)
 
     with gr.Row():
@@ -649,7 +825,11 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             no_texture_gen = gr.Checkbox(label="Skip Texture Generation", value=False)
             texture_size = gr.Slider(1024, 4096, label="Texture Size", value=2048, step=1024)
 
-            generate_btn = gr.Button("Generate")
+            generate_btn = gr.Button(
+                "Generate (Step 1)",
+                elem_id="generate_step_btn",
+                elem_classes=["stage-action-btn", "generate-stage-btn"],
+            )
 
             with gr.Accordion(label="Advanced Settings", open=False):
                 gr.Markdown("Stage 1: Sparse Structure Generation")
@@ -677,7 +857,11 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             with gr.Walkthrough(selected=0) as walkthrough:
                 with gr.Step("Preview", id=0):
                     preview_output = gr.HTML(empty_html, label="3D Asset Preview", show_label=True, container=True)
-                    extract_btn = gr.Button("Extract GLB")
+                    extract_btn = gr.Button(
+                        "Extract GLB (Step 2)",
+                        elem_id="extract_step_btn",
+                        elem_classes=["stage-action-btn", "extract-stage-btn"],
+                    )
                 with gr.Step("Extract", id=1):
                     glb_output = gr.Model3D(label="Extracted GLB", height=724, show_label=True, display_mode="solid", clear_color=(0.25, 0.25, 0.25, 1.0))
                     download_btn = gr.DownloadButton(label="Download GLB")

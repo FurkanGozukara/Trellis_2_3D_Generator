@@ -426,6 +426,182 @@ css = """
 /* Remove padding around the HTML preview block */
 .gradio-container .padded:has(.previewer-container) { padding: 0 !important; }
 
+/* ----------------------------- Stage Action Buttons ------------------------ */
+@keyframes warm-stage-button-glow {
+    0%, 100% {
+        box-shadow:
+            0 14px 34px rgba(127, 16, 35, 0.38),
+            0 0 18px rgba(239, 68, 68, 0.32),
+            inset 0 1px 0 rgba(255, 255, 255, 0.2);
+    }
+    50% {
+        box-shadow:
+            0 18px 40px rgba(127, 16, 35, 0.46),
+            0 0 28px rgba(248, 113, 113, 0.42),
+            inset 0 1px 0 rgba(255, 255, 255, 0.26);
+    }
+}
+
+@keyframes purple-stage-button-glow {
+    0%, 100% {
+        box-shadow:
+            0 14px 34px rgba(76, 29, 149, 0.34),
+            0 0 18px rgba(168, 85, 247, 0.28),
+            inset 0 1px 0 rgba(255, 255, 255, 0.18);
+    }
+    50% {
+        box-shadow:
+            0 18px 42px rgba(76, 29, 149, 0.42),
+            0 0 30px rgba(196, 181, 253, 0.34),
+            inset 0 1px 0 rgba(255, 255, 255, 0.24);
+    }
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .stage-action-btn button,
+    button.stage-action-btn
+) {
+    min-height: 58px;
+    padding: 0 1.4rem !important;
+    border: 1px solid transparent !important;
+    border-radius: 18px !important;
+    color: #fff !important;
+    font-size: 0.98rem !important;
+    font-weight: 800 !important;
+    letter-spacing: 0.02em;
+    text-shadow: 0 1px 0 rgba(255, 255, 255, 0.08);
+    background-size: 180% 180% !important;
+    transition:
+        transform 0.18s ease,
+        filter 0.18s ease,
+        box-shadow 0.18s ease,
+        background-position 0.28s ease;
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .stage-action-btn button,
+    button.stage-action-btn
+):hover:not(:disabled) {
+    transform: translateY(-2px) scale(1.01);
+    filter: saturate(1.08) brightness(1.04);
+    background-position: 100% 50% !important;
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .stage-action-btn button,
+    button.stage-action-btn
+):active:not(:disabled) {
+    transform: translateY(0) scale(0.99);
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .stage-action-btn button,
+    button.stage-action-btn
+):focus-visible {
+    outline: none;
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .stage-action-btn button,
+    button.stage-action-btn
+):disabled {
+    cursor: not-allowed;
+    opacity: 0.72 !important;
+    filter: saturate(0.72) brightness(0.86);
+    animation: none !important;
+    box-shadow:
+        inset 0 1px 0 rgba(255, 255, 255, 0.08),
+        0 8px 18px rgba(15, 23, 42, 0.14) !important;
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    .generate-stage-btn button,
+    button.generate-stage-btn
+) {
+    background: linear-gradient(135deg, #7f1023 0%, #b91c1c 36%, #ef4444 72%, #f97316 100%) !important;
+    border-color: rgba(255, 208, 208, 0.34) !important;
+    box-shadow:
+        0 14px 34px rgba(127, 16, 35, 0.38),
+        0 0 18px rgba(239, 68, 68, 0.32),
+        inset 0 1px 0 rgba(255, 255, 255, 0.2) !important;
+    animation: warm-stage-button-glow 2.7s ease-in-out infinite;
+}
+
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    .generate-stage-btn button,
+    button.generate-stage-btn
+):hover:not(:disabled),
+:where(
+    #generate_step_btn button,
+    button#generate_step_btn,
+    .generate-stage-btn button,
+    button.generate-stage-btn
+):focus-visible:not(:disabled) {
+    box-shadow:
+        0 18px 40px rgba(127, 16, 35, 0.46),
+        0 0 28px rgba(248, 113, 113, 0.42),
+        inset 0 1px 0 rgba(255, 255, 255, 0.24),
+        0 0 0 3px rgba(248, 113, 113, 0.16) !important;
+}
+
+:where(
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .extract-stage-btn button,
+    button.extract-stage-btn
+) {
+    background: linear-gradient(135deg, #312e81 0%, #5b21b6 35%, #7c3aed 72%, #a855f7 100%) !important;
+    border-color: rgba(224, 215, 255, 0.34) !important;
+    box-shadow:
+        0 14px 34px rgba(76, 29, 149, 0.34),
+        0 0 18px rgba(168, 85, 247, 0.28),
+        inset 0 1px 0 rgba(255, 255, 255, 0.18) !important;
+    animation: purple-stage-button-glow 2.9s ease-in-out infinite;
+}
+
+:where(
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .extract-stage-btn button,
+    button.extract-stage-btn
+):hover:not(:disabled),
+:where(
+    #extract_step_btn button,
+    button#extract_step_btn,
+    .extract-stage-btn button,
+    button.extract-stage-btn
+):focus-visible:not(:disabled) {
+    box-shadow:
+        0 18px 42px rgba(76, 29, 149, 0.42),
+        0 0 30px rgba(196, 181, 253, 0.34),
+        inset 0 1px 0 rgba(255, 255, 255, 0.22),
+        0 0 0 3px rgba(196, 181, 253, 0.16) !important;
+}
+
 /* ---------------------------- Preview Progress Overlay --------------------- */
 /* Replaces the old left-side Progress panel: keep progress on top of the preview. */
 #preview_stack { position: relative; }
@@ -909,7 +1085,7 @@ def _default_ui_config() -> dict:
             "shape_slat_sampling_steps": 12,
             "shape_slat_rescale_t": 3.0,
             "max_num_tokens": 400000,
-            "multiview_mode": "stochastic",
+            "multiview_mode": "multidiffusion",
             "tex_slat_guidance_strength": 1.0,
             "tex_slat_guidance_rescale": 0.0,
             "tex_slat_guidance_interval_start": 0.6,  # Model default: CFG in middle 30% range
@@ -2791,7 +2967,6 @@ def batch_process_folder(
                 state: Optional[dict] = None
                 for s, _html, _st in image_to_3d(
                     pil_img,
-                    None,
                     int(run_seed),
                     resolution,
                     custom_resolution,
@@ -3027,6 +3202,37 @@ def _coerce_uploaded_files_to_paths(files_obj: Any) -> List[str]:
     return out
 
 
+def _update_uploaded_input_preview(files_obj: Any):
+    paths = _coerce_uploaded_files_to_paths(files_obj)
+    default_note = (
+        "Upload one image for single-image mode. Upload multiple angles of the same object "
+        "to enable multi-image mode. The first image is used as the primary view."
+    )
+    if not paths:
+        return (
+            gr.update(value=None, visible=False),
+            gr.update(value=[], visible=False),
+            gr.update(value=default_note, visible=True),
+        )
+    if len(paths) == 1:
+        return (
+            gr.update(value=str(paths[0]), visible=True),
+            gr.update(value=[], visible=False),
+            gr.update(value="Single-image mode ready: 1 image loaded.", visible=True),
+        )
+    return (
+        gr.update(value=None, visible=False),
+        gr.update(value=[str(path) for path in paths], visible=True),
+        gr.update(
+            value=(
+                f"**Multi-image enabled**: {len(paths)} images loaded. "
+                "The first image will be treated as the primary view."
+            ),
+            visible=True,
+        ),
+    )
+
+
 # ------------------------------- Preview Rendering ---------------------------
 
 def _tensor_to_uint8_hwc(img: torch.Tensor) -> np.ndarray:
@@ -3206,8 +3412,7 @@ def _get_pipeline_type(resolution_str: str) -> tuple[str, int]:
 
 
 def image_to_3d(
-    image: Image.Image,
-    multi_view_files: Optional[List[Any]],
+    image_or_files: Any,
     seed: int,
     resolution: str,
     custom_resolution: int,
@@ -3277,8 +3482,20 @@ def image_to_3d(
         return status
 
 
-    if image is None:
-        raise gr.Error("Please provide an image (upload or pick an example).")
+    extra_view_paths: List[str] = []
+    if isinstance(image_or_files, Image.Image):
+        image = image_or_files.convert("RGBA").copy()
+    else:
+        uploaded_paths = _coerce_uploaded_files_to_paths(image_or_files)
+        if not uploaded_paths:
+            raise gr.Error("Please upload at least one image (or pick an example).")
+        primary_path = Path(uploaded_paths[0])
+        try:
+            with Image.open(str(primary_path)) as im:
+                image = im.convert("RGBA").copy()
+        except Exception as e:
+            raise gr.Error(f"Could not read input image: {primary_path} ({type(e).__name__}: {e})")
+        extra_view_paths = uploaded_paths[1:]
 
     mv_mode = str(multiview_mode or "stochastic").strip().lower()
     if mv_mode not in {"stochastic", "multidiffusion"}:
@@ -3293,10 +3510,8 @@ def image_to_3d(
     runtime_cfg["config_file"] = model_variant_cfg["config_file"]
     runtime_cfg["sampler_type"] = requested_sampler_type
 
-    # Optional extra views for multi-view generation.
-    # Main image is always view #1.
+    # Multi-image generation: the first uploaded image is always view #1.
     source_images: List[Image.Image] = [image.convert("RGBA")]
-    extra_view_paths = _coerce_uploaded_files_to_paths(multi_view_files)
     for p in extra_view_paths:
         try:
             with Image.open(str(p)) as im:
@@ -3370,7 +3585,7 @@ def image_to_3d(
     if use_multiview:
         _log(
             f"Multi-view input detected: {len(source_images)} views (mode={mv_mode}). "
-            "View #1 is the main Image Prompt.",
+            "View #1 is the first uploaded image.",
             0.0,
         )
     yield None, empty_html, gr.update(value=_trim_status(status), visible=True)
@@ -5970,8 +6185,15 @@ with gr.Blocks(
 ) as demo:
     gr.Markdown(
         """
-## Trellis 2 SECourses Premium App V4 : https://www.patreon.com/posts/147686623
-Generate a 3D asset from an image, export as GLB, and optionally texture an existing mesh.
+<div style="display:flex; flex-wrap:wrap; align-items:baseline; gap:10px 16px;">
+  <div style="font-size:1.35rem; font-weight:700;">
+    Trellis 2 SECourses Premium App V4 :
+    <a href="https://www.patreon.com/posts/147686623" target="_blank">https://www.patreon.com/posts/147686623</a>
+  </div>
+  <div style="color:var(--body-text-color-subdued);">
+    Generate a 3D asset from an image, export as GLB, and optionally texture an existing mesh.
+  </div>
+</div>
 """
     )
 
@@ -5989,19 +6211,36 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
         with gr.Tab("Image → 3D"):
             with gr.Row():
                 with gr.Column(scale=1, min_width=380):
-                    image_prompt = gr.Image(label="Image Prompt", format="png", image_mode="RGBA", type="pil", height=400)
-                    multi_view_images = gr.Files(
-                        label="Optional Extra Views (Multi-View)",
+                    input_images = gr.Files(
+                        label="Upload Input Image (Or Multi-Angle)",
                         file_types=["image"],
                         file_count="multiple",
+                        type="filepath",
+                        allow_reordering=True,
                     )
-                    gr.Markdown(
-                        "Upload additional views of the same object (front/back/side). "
-                        "You can add one image or many. Leave empty for single-image generation."
+                    input_preview_single = gr.Image(
+                        label="Input Preview",
+                        type="filepath",
+                        interactive=False,
+                        visible=False,
+                        height=400,
+                    )
+                    input_preview_gallery = gr.Gallery(
+                        label="Input Preview",
+                        type="filepath",
+                        interactive=False,
+                        visible=False,
+                        columns=2,
+                        height=400,
+                        object_fit="contain",
+                    )
+                    input_upload_status = gr.Markdown(
+                        "Upload one image for single-image mode. Upload multiple angles of the same object "
+                        "to enable multi-image mode. The first image is used as the primary view."
                     )
                     multiview_mode = gr.Dropdown(
                         choices=["stochastic", "multidiffusion"],
-                        value="stochastic",
+                        value="multidiffusion",
                         label="Multi-View Fusion Mode (Generate)",
                         info=(
                             "stochastic: rotates conditioning views across steps (faster). "
@@ -6117,7 +6356,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 )
                                 # Progress shown directly on top of the preview (no separate side panel).
                                 status_box = gr.Textbox(
-                                    value="Select an image (upload or example), then click Generate.",
+                                    value="Upload one or more images (or pick an example), then click Generate (Step 1).",
                                     lines=20,
                                     max_lines=20,
                                     interactive=False,
@@ -6126,8 +6365,18 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                     elem_id="preview_status_overlay",
                                 )
                             with gr.Row():
-                                generate_btn = gr.Button("Generate", variant="primary")
-                                extract_btn = gr.Button("Extract GLB", interactive=False)
+                                generate_btn = gr.Button(
+                                    "Generate (Step 1)",
+                                    variant="primary",
+                                    elem_id="generate_step_btn",
+                                    elem_classes=["stage-action-btn", "generate-stage-btn"],
+                                )
+                                extract_btn = gr.Button(
+                                    "Extract GLB (Step 2)",
+                                    interactive=False,
+                                    elem_id="extract_step_btn",
+                                    elem_classes=["stage-action-btn", "extract-stage-btn"],
+                                )
                                 view_extract_btn = gr.Button("View Extracted", interactive=False)
                             cancel_confirm_state = gr.State({"armed": False, "armed_at": 0.0, "scope": ""})
                             with gr.Row():
@@ -6389,10 +6638,10 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
             gr.Markdown("### Examples")
             examples = gr.Examples(
                 examples=[
-                    os.path.join(APP_DIR, "assets", "example_image", image)
+                    [os.path.join(APP_DIR, "assets", "example_image", image)]
                     for image in os.listdir(os.path.join(APP_DIR, "assets", "example_image"))
                 ],
-                inputs=[image_prompt],
+                inputs=[input_images],
                 examples_per_page=18,
             )
 
@@ -6411,7 +6660,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     None,  # download_btn
                     gr.update(
                         visible=True,
-                        value="Select an image (upload or example), then click Generate.",
+                        value="Upload one or more images (or pick an example), then click Generate (Step 1).",
                     ),  # status_box
                     True,  # logs_visible_state
                     gr.update(value="📄 Hide Logs"),  # view_logs_btn
@@ -6422,12 +6671,12 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
             # and each run saves both the raw input + the preprocessed image under outputs/<run_id>/.
 
             # Any time the input image changes (upload, example click, clear), invalidate previous results.
-            image_prompt.change(
-                _reset_image_to_3d_ui,
-                inputs=[],
-                outputs=[output_buf, preview_output, extract_btn, view_extract_btn, walkthrough, glb_output, download_btn, status_box, logs_visible_state, view_logs_btn],
+            input_images.change(
+                _update_uploaded_input_preview,
+                inputs=[input_images],
+                outputs=[input_preview_single, input_preview_gallery, input_upload_status],
             )
-            multi_view_images.change(
+            input_images.change(
                 _reset_image_to_3d_ui,
                 inputs=[],
                 outputs=[output_buf, preview_output, extract_btn, view_extract_btn, walkthrough, glb_output, download_btn, status_box, logs_visible_state, view_logs_btn],
@@ -6446,8 +6695,7 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
             ).then(
                 image_to_3d,
                 inputs=[
-                    image_prompt,
-                    multi_view_images,
+                    input_images,
                     seed,
                     resolution,
                     custom_resolution,
@@ -7332,7 +7580,8 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
 ## Quick start (most people)
 
 1. Go to **Image → 3D**.
-2. Upload an image in **Image Prompt** (best: one object, centered, clear silhouette).
+2. Upload one or more images in **Upload Input Image (Or Multi-Angle)**.
+   If you upload multiple, the first image is treated as the primary view.
 3. Keep defaults, click **Generate**.
 4. When preview is ready, click **Extract GLB**.
 5. Your files are saved into `./outputs/<run_id>/` (for example `./outputs/0007/`).
@@ -7375,8 +7624,8 @@ The Image → 3D pipeline is intentionally split into stages so progress can be 
 
 ## IMAGE → 3D settings (left panel)
 
-### Image Prompt (upload)
-Upload the input image you want to convert to 3D.
+### Upload Input Image (Or Multi-Angle)
+Upload the image or images you want to convert to 3D.
 
 **Best practices**:
 - Use a single main object. Avoid busy backgrounds.
@@ -7387,12 +7636,13 @@ Upload the input image you want to convert to 3D.
 - Good: a centered product photo on a plain background.
 - Risky: multiple characters, cluttered scenery, tiny object in the distance.
 
-### Optional Extra Views (Multi-View)
-You can upload one or multiple additional views of the same object (front/back/side).
+### Multi-image behavior
+You can upload one or multiple views of the same object (front/back/side).
 
 **Behavior**:
-- If only **Image Prompt** is provided, generation runs in single-view mode.
-- If extra views are uploaded, generation runs in multi-view mode.
+- If you upload **1 image**, generation runs in single-image mode.
+- If you upload **2 or more images**, generation runs in multi-image mode.
+- The **first uploaded image** is treated as the primary view.
 - `stochastic` mode is faster; `multidiffusion` is usually more consistent but slower.
 
 ### Resolution
