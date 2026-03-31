@@ -4,7 +4,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..modules.norm import GroupNorm32, ChannelLayerNorm32
 from ..modules.spatial import pixel_shuffle_3d
-from ..modules.utils import zero_module, convert_module_to_f16, convert_module_to_f32
+from ..modules.utils import (
+    zero_module,
+    convert_module_to_f16,
+    convert_module_to_f32,
+    convert_module_to_fp8,
+)
 
 
 def norm_layer(norm_type: str, *args, **kwargs) -> nn.Module:
@@ -120,6 +125,7 @@ class SparseStructureEncoder(nn.Module):
         num_res_blocks_middle: int = 2,
         norm_type: Literal["group", "layer"] = "layer",
         use_fp16: bool = False,
+        use_fp8: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -129,7 +135,8 @@ class SparseStructureEncoder(nn.Module):
         self.num_res_blocks_middle = num_res_blocks_middle
         self.norm_type = norm_type
         self.use_fp16 = use_fp16
-        self.dtype = torch.float16 if use_fp16 else torch.float32
+        self.use_fp8 = use_fp8
+        self.dtype = torch.bfloat16 if use_fp8 else (torch.float16 if use_fp16 else torch.float32)
 
         self.input_layer = nn.Conv3d(in_channels, channels[0], 3, padding=1)
 
@@ -155,7 +162,9 @@ class SparseStructureEncoder(nn.Module):
             nn.Conv3d(channels[-1], latent_channels*2, 3, padding=1)
         )
 
-        if use_fp16:
+        if use_fp8:
+            self.convert_to_fp8()
+        elif use_fp16:
             self.convert_to_fp16()
 
     @property
@@ -170,15 +179,24 @@ class SparseStructureEncoder(nn.Module):
         Convert the torso of the model to float16.
         """
         self.use_fp16 = True
+        self.use_fp8 = False
         self.dtype = torch.float16
         self.blocks.apply(convert_module_to_f16)
         self.middle_block.apply(convert_module_to_f16)
+
+    def convert_to_fp8(self) -> None:
+        self.use_fp16 = False
+        self.use_fp8 = True
+        self.dtype = torch.bfloat16
+        self.blocks.apply(convert_module_to_fp8)
+        self.middle_block.apply(convert_module_to_fp8)
 
     def convert_to_fp32(self) -> None:
         """
         Convert the torso of the model to float32.
         """
         self.use_fp16 = False
+        self.use_fp8 = False
         self.dtype = torch.float32
         self.blocks.apply(convert_module_to_f32)
         self.middle_block.apply(convert_module_to_f32)
@@ -229,6 +247,7 @@ class SparseStructureDecoder(nn.Module):
         num_res_blocks_middle: int = 2,
         norm_type: Literal["group", "layer"] = "layer",
         use_fp16: bool = False,
+        use_fp8: bool = False,
     ):
         super().__init__()
         self.out_channels = out_channels
@@ -238,7 +257,8 @@ class SparseStructureDecoder(nn.Module):
         self.num_res_blocks_middle = num_res_blocks_middle
         self.norm_type = norm_type
         self.use_fp16 = use_fp16
-        self.dtype = torch.float16 if use_fp16 else torch.float32
+        self.use_fp8 = use_fp8
+        self.dtype = torch.bfloat16 if use_fp8 else (torch.float16 if use_fp16 else torch.float32)
 
         self.input_layer = nn.Conv3d(latent_channels, channels[0], 3, padding=1)
 
@@ -264,7 +284,9 @@ class SparseStructureDecoder(nn.Module):
             nn.Conv3d(channels[-1], out_channels, 3, padding=1)
         )
 
-        if use_fp16:
+        if use_fp8:
+            self.convert_to_fp8()
+        elif use_fp16:
             self.convert_to_fp16()
 
     @property
@@ -279,15 +301,24 @@ class SparseStructureDecoder(nn.Module):
         Convert the torso of the model to float16.
         """
         self.use_fp16 = True
+        self.use_fp8 = False
         self.dtype = torch.float16
         self.blocks.apply(convert_module_to_f16)
         self.middle_block.apply(convert_module_to_f16)
+
+    def convert_to_fp8(self) -> None:
+        self.use_fp16 = False
+        self.use_fp8 = True
+        self.dtype = torch.bfloat16
+        self.blocks.apply(convert_module_to_fp8)
+        self.middle_block.apply(convert_module_to_fp8)
 
     def convert_to_fp32(self) -> None:
         """
         Convert the torso of the model to float32.
         """
         self.use_fp16 = False
+        self.use_fp8 = False
         self.dtype = torch.float32
         self.blocks.apply(convert_module_to_f32)
         self.middle_block.apply(convert_module_to_f32)

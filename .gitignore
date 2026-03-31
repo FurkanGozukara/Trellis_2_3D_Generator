@@ -29,7 +29,10 @@ PixelArtistry_Trellis2_HighQuality.json
 PixelArtistry_Trellis2_MergeViews.json
 Trellis2_HighQuality.json
 Trellis2_MV_Combined.json
-
+High_Quality_withFaithC_Multiview_PixelArtistry.json
+High_Quality_withFaithC_PixelArtistry.json
+_analysis_repos/
+_comparison_runs/
 wheels/
 ComfyUI-TRELLIS2_v2/
 ComfyUI-Trellis2/

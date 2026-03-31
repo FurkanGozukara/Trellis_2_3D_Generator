@@ -8,6 +8,7 @@ from . import samplers, rembg
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
+from ..runtime_options import normalize_sampler_type, sampler_class_name
 
 
 class Trellis2ImageTo3DPipeline(Pipeline):
@@ -70,6 +71,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         self.rembg_model = rembg_model
         self.low_vram = low_vram
         self.default_pipeline_type = default_pipeline_type
+        self.sampler_type = 'euler'
         self.pbr_attr_layout = {
             'base_color': slice(0, 3),
             'metallic': slice(3, 4),
@@ -77,6 +79,21 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             'alpha': slice(5, 6),
         }
         self._device = 'cpu'
+
+    def _build_sampler(self, sampler_key: str, sampler_type: str):
+        args = self._pretrained_args
+        sampler_cfg = args[sampler_key]
+        sampler_name = sampler_class_name(sampler_cfg['name'], sampler_type)
+        return getattr(samplers, sampler_name)(**sampler_cfg['args'])
+
+    def switch_samplers(self, sampler_type: str = 'euler') -> str:
+        sampler_type = normalize_sampler_type(sampler_type)
+        self.sparse_structure_sampler = self._build_sampler('sparse_structure_sampler', sampler_type)
+        self.shape_slat_sampler = self._build_sampler('shape_slat_sampler', sampler_type)
+        if self.tex_slat_sampler is not None and self.tex_slat_normalization is not None:
+            self.tex_slat_sampler = self._build_sampler('tex_slat_sampler', sampler_type)
+        self.sampler_type = sampler_type
+        return sampler_type
 
     @classmethod
     def from_pretrained(
@@ -126,6 +143,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         
         pipeline.low_vram = args.get('low_vram', True)
         pipeline.default_pipeline_type = args.get('default_pipeline_type', '1024_cascade')
+        pipeline.sampler_type = 'euler'
         pipeline.pbr_attr_layout = {
             'base_color': slice(0, 3),
             'metallic': slice(3, 4),

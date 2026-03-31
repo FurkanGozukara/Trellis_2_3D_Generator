@@ -8,6 +8,7 @@ from .base import Pipeline
 from . import samplers, rembg
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
+from ..runtime_options import normalize_sampler_type, sampler_class_name
 import o_voxel
 import cumesh
 import nvdiffrast.torch as dr
@@ -57,6 +58,7 @@ class Trellis2TexturingPipeline(Pipeline):
         self.image_cond_model = image_cond_model
         self.rembg_model = rembg_model
         self.low_vram = low_vram
+        self.sampler_type = 'euler'
         self.pbr_attr_layout = {
             'base_color': slice(0, 3),
             'metallic': slice(3, 4),
@@ -64,6 +66,13 @@ class Trellis2TexturingPipeline(Pipeline):
             'alpha': slice(5, 6),
         }
         self._device = 'cpu'
+
+    def switch_sampler(self, sampler_type: str = 'euler') -> str:
+        sampler_type = normalize_sampler_type(sampler_type)
+        sampler_name = sampler_class_name(self._pretrained_args['tex_slat_sampler']['name'], sampler_type)
+        self.tex_slat_sampler = getattr(samplers, sampler_name)(**self._pretrained_args['tex_slat_sampler']['args'])
+        self.sampler_type = sampler_type
+        return sampler_type
 
     @classmethod
     def from_pretrained(
@@ -91,6 +100,7 @@ class Trellis2TexturingPipeline(Pipeline):
         pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
 
         pipeline.low_vram = args.get('low_vram', True)
+        pipeline.sampler_type = 'euler'
         pipeline.pbr_attr_layout = {
             'base_color': slice(0, 3),
             'metallic': slice(3, 4),
@@ -321,6 +331,7 @@ class Trellis2TexturingPipeline(Pipeline):
             self.models['tex_slat_decoder'].cpu()
         return ret
     
+    @torch.no_grad()
     def postprocess_mesh(
         self,
         mesh: trimesh.Trimesh,
@@ -331,23 +342,23 @@ class Trellis2TexturingPipeline(Pipeline):
         vertices = mesh.vertices
         faces = mesh.faces
         normals = mesh.vertex_normals
-        vertices_torch = torch.from_numpy(vertices).float().cuda()
-        faces_torch = torch.from_numpy(faces).int().cuda()
+        vertices_torch = torch.from_numpy(vertices).float().to(self.device)
+        faces_torch = torch.from_numpy(faces).int().to(self.device)
         if hasattr(mesh, 'visual') and hasattr(mesh.visual, 'uv') and mesh.visual.uv is not None:
             uvs = mesh.visual.uv.copy()
             uvs[:, 1] = 1 - uvs[:, 1]
-            uvs_torch = torch.from_numpy(uvs).float().cuda()
+            uvs_torch = torch.from_numpy(uvs).float().to(self.device)
         else:
             _cumesh = cumesh.CuMesh()
             _cumesh.init(vertices_torch, faces_torch)
             vertices_torch, faces_torch, uvs_torch, vmap = _cumesh.uv_unwrap(return_vmaps=True)
-            vertices_torch = vertices_torch.cuda()
-            faces_torch = faces_torch.cuda()
-            uvs_torch = uvs_torch.cuda()
-            vertices = vertices_torch.cpu().numpy()
-            faces = faces_torch.cpu().numpy()
-            uvs = uvs_torch.cpu().numpy()
-            normals = normals[vmap.cpu().numpy()]
+            vertices_torch = vertices_torch.to(self.device)
+            faces_torch = faces_torch.to(self.device)
+            uvs_torch = uvs_torch.to(self.device)
+            vertices = vertices_torch.detach().cpu().numpy()
+            faces = faces_torch.detach().cpu().numpy()
+            uvs = uvs_torch.detach().cpu().numpy()
+            normals = normals[vmap.detach().cpu().numpy()]
                 
         # rasterize
         ctx = dr.RasterizeCudaContext()
@@ -369,11 +380,11 @@ class Trellis2TexturingPipeline(Pipeline):
         )
         
         # construct mesh
-        mask = mask.cpu().numpy()
-        base_color = np.clip(attrs[..., self.pbr_attr_layout['base_color']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-        metallic = np.clip(attrs[..., self.pbr_attr_layout['metallic']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-        roughness = np.clip(attrs[..., self.pbr_attr_layout['roughness']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
-        alpha = np.clip(attrs[..., self.pbr_attr_layout['alpha']].cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        mask = mask.detach().cpu().numpy()
+        base_color = np.clip(attrs[..., self.pbr_attr_layout['base_color']].detach().cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        metallic = np.clip(attrs[..., self.pbr_attr_layout['metallic']].detach().cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        roughness = np.clip(attrs[..., self.pbr_attr_layout['roughness']].detach().cpu().numpy() * 255, 0, 255).astype(np.uint8)
+        alpha = np.clip(attrs[..., self.pbr_attr_layout['alpha']].detach().cpu().numpy() * 255, 0, 255).astype(np.uint8)
         
         # extend
         mask = (~mask).astype(np.uint8)

@@ -138,6 +138,8 @@ class SparseStructureFlowModel(nn.Module):
 
         self.initialize_weights()
         self.convert_to(self.dtype)
+        if self.dtype == torch.float8_e4m3fn:
+            self.dtype = torch.bfloat16
 
     @property
     def device(self) -> torch.device:

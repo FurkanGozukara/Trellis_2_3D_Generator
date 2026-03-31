@@ -206,3 +206,178 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
             - 'pred_x_0': a list of prediction of x_0.
         """
         return super().sample(model, noise, cond, steps, rescale_t, verbose, neg_cond=neg_cond, guidance_strength=guidance_strength, guidance_interval=guidance_interval, **kwargs)
+
+
+class FlowHeunSampler(FlowEulerSampler):
+    """
+    Generate samples from a flow-matching model using Heun's method (RK2).
+    """
+    @torch.no_grad()
+    def sample_once(
+        self,
+        model,
+        x_t,
+        t: float,
+        t_prev: float,
+        cond: Optional[Any] = None,
+        **kwargs
+    ):
+        dt = t_prev - t
+
+        def get_v(current_x, current_t):
+            _, _, pred_v = self._get_model_prediction(model, current_x, current_t, cond, **kwargs)
+            return pred_v
+
+        k1 = get_v(x_t, t)
+        k2 = get_v(x_t + dt * k1, t + dt)
+        pred_x_prev = x_t + 0.5 * dt * (k1 + k2)
+        pred_x_0, _ = self._v_to_xstart_eps(x_t=x_t, t=t, v=k1)
+        return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
+
+
+class FlowHeunGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierFreeGuidanceSamplerMixin, FlowHeunSampler):
+    """
+    Heun sampling with classifier-free guidance and interval support.
+    """
+    pass
+
+
+class FlowRK4Sampler(FlowEulerSampler):
+    """
+    Generate samples from a flow-matching model using the 4th-order Runge-Kutta method.
+    """
+    @torch.no_grad()
+    def sample_once(
+        self,
+        model,
+        x_t,
+        t: float,
+        t_prev: float,
+        cond: Optional[Any] = None,
+        **kwargs
+    ):
+        dt = t_prev - t
+
+        def get_v(current_x, current_t):
+            _, _, pred_v = self._get_model_prediction(model, current_x, current_t, cond, **kwargs)
+            return pred_v
+
+        k1 = get_v(x_t, t)
+        k2 = get_v(x_t + 0.5 * dt * k1, t + 0.5 * dt)
+        k3 = get_v(x_t + 0.5 * dt * k2, t + 0.5 * dt)
+        k4 = get_v(x_t + dt * k3, t + dt)
+
+        pred_x_prev = x_t + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        pred_x_0, _ = self._v_to_xstart_eps(x_t=x_t, t=t, v=k1)
+        return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
+
+
+class FlowRK4CfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowRK4Sampler):
+    """
+    RK4 sampling with classifier-free guidance.
+    """
+    @torch.no_grad()
+    def sample(
+        self,
+        model,
+        noise,
+        cond,
+        neg_cond,
+        steps: int = 50,
+        rescale_t: float = 1.0,
+        guidance_strength: float = 3.0,
+        verbose: bool = True,
+        **kwargs
+    ):
+        return super().sample(
+            model,
+            noise,
+            cond,
+            steps,
+            rescale_t,
+            verbose,
+            neg_cond=neg_cond,
+            guidance_strength=guidance_strength,
+            **kwargs,
+        )
+
+
+class FlowRK4GuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierFreeGuidanceSamplerMixin, FlowRK4Sampler):
+    """
+    RK4 sampling with classifier-free guidance and interval support.
+    """
+    pass
+
+
+class FlowRK5Sampler(FlowEulerSampler):
+    """
+    Generate samples from a flow-matching model using a 5th-order Runge-Kutta method.
+    """
+    @torch.no_grad()
+    def sample_once(
+        self,
+        model,
+        x_t,
+        t: float,
+        t_prev: float,
+        cond: Optional[Any] = None,
+        **kwargs
+    ):
+        dt = t_prev - t
+
+        def get_v(current_x, current_t):
+            _, _, pred_v = self._get_model_prediction(model, current_x, current_t, cond, **kwargs)
+            return pred_v
+
+        c2, c3, c4, c5, c6 = 1 / 4, 1 / 4, 1 / 2, 3 / 4, 1.0
+
+        k1 = get_v(x_t, t)
+        k2 = get_v(x_t + dt * (1 / 4 * k1), t + dt * c2)
+        k3 = get_v(x_t + dt * (1 / 8 * k1 + 1 / 8 * k2), t + dt * c3)
+        k4 = get_v(x_t + dt * (-1 / 2 * k2 + 1.0 * k3), t + dt * c4)
+        k5 = get_v(x_t + dt * (3 / 16 * k1 + 9 / 16 * k4), t + dt * c5)
+        k6 = get_v(
+            x_t + dt * (-3 / 7 * k1 + 2 / 7 * k2 + 12 / 7 * k3 - 12 / 7 * k4 + 8 / 7 * k5),
+            t + dt * c6,
+        )
+
+        pred_x_prev = x_t + dt * (7 / 90 * k1 + 32 / 90 * k3 + 12 / 90 * k4 + 32 / 90 * k5 + 7 / 90 * k6)
+        pred_x_0, _ = self._v_to_xstart_eps(x_t=x_t, t=t, v=k1)
+        return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
+
+
+class FlowRK5CfgSampler(ClassifierFreeGuidanceSamplerMixin, FlowRK5Sampler):
+    """
+    RK5 sampling with classifier-free guidance.
+    """
+    @torch.no_grad()
+    def sample(
+        self,
+        model,
+        noise,
+        cond,
+        neg_cond,
+        steps: int = 50,
+        rescale_t: float = 1.0,
+        guidance_strength: float = 3.0,
+        verbose: bool = True,
+        **kwargs
+    ):
+        return super().sample(
+            model,
+            noise,
+            cond,
+            steps,
+            rescale_t,
+            verbose,
+            neg_cond=neg_cond,
+            guidance_strength=guidance_strength,
+            **kwargs,
+        )
+
+
+class FlowRK5GuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierFreeGuidanceSamplerMixin, FlowRK5Sampler):
+    """
+    RK5 sampling with classifier-free guidance and interval support.
+    """
+    pass

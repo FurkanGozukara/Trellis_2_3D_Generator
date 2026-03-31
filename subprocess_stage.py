@@ -36,6 +36,43 @@ O_VOXEL_SRC_DIR = APP_DIR / "o-voxel"
 # Ensure TRELLIS models dir is discoverable (offline-friendly).
 os.environ.setdefault("TRELLIS_MODELS_DIR", str(MODELS_DIR))
 
+from trellis2.runtime_options import (
+    DEFAULT_ATTENTION_BACKEND,
+    DEFAULT_SAMPLER_TYPE,
+    apply_runtime_backends,
+    normalize_sampler_type,
+)
+
+
+def _configure_image_pipeline_runtime(pipe: Any, payload: Dict[str, Any], label: str) -> Dict[str, Any]:
+    runtime = apply_runtime_backends(payload.get("attention_backend", DEFAULT_ATTENTION_BACKEND))
+    sampler_type = normalize_sampler_type(payload.get("sampler_type", DEFAULT_SAMPLER_TYPE))
+    if hasattr(pipe, "switch_samplers"):
+        pipe.switch_samplers(sampler_type)
+    print(
+        f"[runtime] {label}: requested_backend={runtime['requested_backend']}, "
+        f"dense_backend={runtime['dense_backend']}, sparse_backend={runtime['sparse_backend']}, "
+        f"sampler={sampler_type}",
+        flush=True,
+    )
+    runtime["sampler_type"] = sampler_type
+    return runtime
+
+
+def _configure_texturing_pipeline_runtime(pipe: Any, payload: Dict[str, Any], label: str) -> Dict[str, Any]:
+    runtime = apply_runtime_backends(payload.get("attention_backend", DEFAULT_ATTENTION_BACKEND))
+    sampler_type = normalize_sampler_type(payload.get("sampler_type", DEFAULT_SAMPLER_TYPE))
+    if hasattr(pipe, "switch_sampler"):
+        pipe.switch_sampler(sampler_type)
+    print(
+        f"[runtime] {label}: requested_backend={runtime['requested_backend']}, "
+        f"dense_backend={runtime['dense_backend']}, sparse_backend={runtime['sparse_backend']}, "
+        f"sampler={sampler_type}",
+        flush=True,
+    )
+    runtime["sampler_type"] = sampler_type
+    return runtime
+
 
 def _log_vram_usage(label: str) -> None:
     """Log current VRAM usage for debugging OOM issues."""
@@ -359,6 +396,14 @@ def _retexture_mesh_with_reference(
         config_file=config_file,
         ignore_models=ignore_models,
     )
+    _configure_texturing_pipeline_runtime(
+        tex_pipe,
+        {
+            "attention_backend": tex_params.get("attention_backend", DEFAULT_ATTENTION_BACKEND),
+            "sampler_type": tex_params.get("sampler_type", DEFAULT_SAMPLER_TYPE),
+        },
+        "extract_retexture",
+    )
     tex_pipe.low_vram = bool(low_vram)
     tex_pipe.cuda()
 
@@ -379,19 +424,20 @@ def _retexture_mesh_with_reference(
         cond_res = 512 if tex_res == 512 else 1024
 
         torch.manual_seed(int(seed))
-        print(f"[extract][retexture] computing image cond ({cond_res}px)...", flush=True)
-        cond = tex_pipe.get_cond([ref], cond_res)
+        with torch.inference_mode():
+            print(f"[extract][retexture] computing image cond ({cond_res}px)...", flush=True)
+            cond = tex_pipe.get_cond([ref], cond_res)
 
-        print("[extract][retexture] encoding shape latent...", flush=True)
-        shape_slat = tex_pipe.encode_shape_slat(mesh_in, tex_res)
+            print("[extract][retexture] encoding shape latent...", flush=True)
+            shape_slat = tex_pipe.encode_shape_slat(mesh_in, tex_res)
 
-        print("[extract][retexture] sampling texture latent...", flush=True)
-        tex_model = tex_pipe.models[tex_model_key]
-        tex_slat = tex_pipe.sample_tex_slat(cond, tex_model, shape_slat, tex_params)
+            print("[extract][retexture] sampling texture latent...", flush=True)
+            tex_model = tex_pipe.models[tex_model_key]
+            tex_slat = tex_pipe.sample_tex_slat(cond, tex_model, shape_slat, tex_params)
 
-        print("[extract][retexture] decoding + baking texture...", flush=True)
-        pbr_voxel = tex_pipe.decode_tex_slat(tex_slat)
-        out_mesh = tex_pipe.postprocess_mesh(mesh_in, pbr_voxel, tex_res, int(texture_size))
+            print("[extract][retexture] decoding + baking texture...", flush=True)
+            pbr_voxel = tex_pipe.decode_tex_slat(tex_slat)
+            out_mesh = tex_pipe.postprocess_mesh(mesh_in, pbr_voxel, tex_res, int(texture_size))
         return out_mesh
     finally:
         try:
@@ -495,6 +541,7 @@ def stage_preprocess_image(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "pipeline.json")
     low_vram = payload.get("low_vram", False)
     in_path = Path(payload["input_image_path"])
     out_path = Path(payload["output_image_path"])
@@ -505,6 +552,7 @@ def stage_preprocess_image(payload: Dict[str, Any]) -> Dict[str, Any]:
     # Preprocess uses rembg only; skip loading the heavy diffusion models.
     pipe = Trellis2ImageTo3DPipeline.from_pretrained(
         model_repo,
+        config_file=config_file,
         ignore_models=_ignore_all_image_models(),
         load_texture_models=False,
         load_image_cond_model=False,
@@ -528,6 +576,7 @@ def stage_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "pipeline.json")
     low_vram = payload.get("low_vram", False)
     image_path = Path(payload["image_path"])
     resolution = str(payload["resolution"])
@@ -541,11 +590,13 @@ def stage_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     pipe = Trellis2ImageTo3DPipeline.from_pretrained(
         model_repo,
+        config_file=config_file,
         ignore_models=_ignore_all_image_models(),
         load_texture_models=False,
         load_image_cond_model=True,
         load_rembg_model=False,
     )
+    _configure_image_pipeline_runtime(pipe, payload, "encode_cond")
     pipe.low_vram = low_vram
     pipe.cuda()
 
@@ -579,6 +630,7 @@ def stage_sample_sparse_structure(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "pipeline.json")
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
     pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
@@ -593,11 +645,13 @@ def stage_sample_sparse_structure(payload: Dict[str, Any]) -> Dict[str, Any]:
     device = "cuda"
     pipe = Trellis2ImageTo3DPipeline.from_pretrained(
         model_repo,
+        config_file=config_file,
         ignore_models=_ignore_except_image_models(["sparse_structure_flow_model", "sparse_structure_decoder"]),
         load_texture_models=False,
         load_image_cond_model=False,
         load_rembg_model=False,
     )
+    _configure_image_pipeline_runtime(pipe, payload, "sample_sparse_structure")
     pipe.low_vram = low_vram
     pipe.cuda()
 
@@ -652,6 +706,7 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "pipeline.json")
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
     pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
@@ -693,11 +748,13 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
         keep = ["shape_slat_flow_model_512"]
         pipe = Trellis2ImageTo3DPipeline.from_pretrained(
             model_repo,
+            config_file=config_file,
             ignore_models=_ignore_except_image_models(keep),
             load_texture_models=False,
             load_image_cond_model=False,
             load_rembg_model=False,
         )
+        _configure_image_pipeline_runtime(pipe, payload, "sample_shape_slat_512")
         pipe.cuda()
 
         cond = _load_cond(cond_512_path, device=device)
@@ -712,11 +769,13 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
         keep = ["shape_slat_flow_model_1024"]
         pipe = Trellis2ImageTo3DPipeline.from_pretrained(
             model_repo,
+            config_file=config_file,
             ignore_models=_ignore_except_image_models(keep),
             load_texture_models=False,
             load_image_cond_model=False,
             load_rembg_model=False,
         )
+        _configure_image_pipeline_runtime(pipe, payload, "sample_shape_slat_1024")
         pipe.cuda()
 
         cond = _load_cond(cond_1024_path, device=device)
@@ -733,11 +792,13 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
         keep = ["shape_slat_flow_model_512", "shape_slat_flow_model_1024", "shape_slat_decoder"]
         pipe = Trellis2ImageTo3DPipeline.from_pretrained(
             model_repo,
+            config_file=config_file,
             ignore_models=_ignore_except_image_models(keep),
             load_texture_models=False,
             load_image_cond_model=False,
             load_rembg_model=False,
         )
+        _configure_image_pipeline_runtime(pipe, payload, "sample_shape_slat_cascade")
         pipe.cuda()
 
         lr_cond = _load_cond(cond_512_path, device=device)
@@ -794,6 +855,7 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "pipeline.json")
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
     pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
@@ -836,11 +898,13 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     pipe = Trellis2ImageTo3DPipeline.from_pretrained(
         model_repo,
+        config_file=config_file,
         ignore_models=_ignore_except_image_models(keep),
         load_texture_models=True,
         load_image_cond_model=False,
         load_rembg_model=False,
     )
+    _configure_image_pipeline_runtime(pipe, payload, "sample_tex_slat")
     pipe.low_vram = low_vram
     pipe.cuda()
 
@@ -871,6 +935,7 @@ def stage_sample_multiview_latents(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2MultiViewPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "pipeline.json")
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
     pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
@@ -916,11 +981,13 @@ def stage_sample_multiview_latents(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
     pipe = Trellis2MultiViewPipeline.from_pretrained(
         model_repo,
+        config_file=config_file,
         ignore_models=_ignore_except_image_models(keep_models),
         load_texture_models=not no_texture_gen,
         load_image_cond_model=True,
         load_rembg_model=False,
     )
+    _configure_image_pipeline_runtime(pipe, payload, "sample_multiview_latents")
     pipe.low_vram = low_vram
     pipe.cuda()
 
@@ -1044,6 +1111,7 @@ def stage_preview_decode_mesh(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "pipeline.json")
     low_vram = bool(payload.get("low_vram", False))
     shape_slat_path = Path(payload["shape_slat_path"])
     tex_slat_path = Path(payload["tex_slat_path"]) if payload.get("tex_slat_path") else None
@@ -1070,6 +1138,7 @@ def stage_preview_decode_mesh(payload: Dict[str, Any]) -> Dict[str, Any]:
     print("[preview_decode] loading image pipeline decoder...", flush=True)
     pipe = Trellis2ImageTo3DPipeline.from_pretrained(
         model_repo,
+        config_file=config_file,
         ignore_models=_ignore_except_image_models(keep),
         load_texture_models=False,
         load_image_cond_model=False,
@@ -1258,6 +1327,7 @@ def stage_render_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.utils import render_utils
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "pipeline.json")
     low_vram = payload.get("low_vram", False)
     shape_slat_path = Path(payload["shape_slat_path"])
     tex_slat_path = Path(payload["tex_slat_path"]) if payload.get("tex_slat_path") else None
@@ -1283,6 +1353,7 @@ def stage_render_preview(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     pipe = Trellis2ImageTo3DPipeline.from_pretrained(
         model_repo,
+        config_file=config_file,
         ignore_models=_ignore_except_image_models(keep),
         load_texture_models=False,
         load_image_cond_model=False,
@@ -1418,6 +1489,7 @@ def stage_extract_decode_mesh(payload: Dict[str, Any]) -> Dict[str, Any]:
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "pipeline.json")
     low_vram = bool(payload.get("low_vram", False))
     shape_slat_path = Path(payload["shape_slat_path"])
     tex_slat_path = Path(payload["tex_slat_path"]) if payload.get("tex_slat_path") else None
@@ -1443,6 +1515,7 @@ def stage_extract_decode_mesh(payload: Dict[str, Any]) -> Dict[str, Any]:
     print("[extract_decode] loading image pipeline decoder...", flush=True)
     pipe = Trellis2ImageTo3DPipeline.from_pretrained(
         model_repo,
+        config_file=config_file,
         ignore_models=_ignore_except_image_models(keep),
         load_texture_models=False,
         load_image_cond_model=False,
@@ -1531,6 +1604,17 @@ def stage_extract_ultrashape_refine(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"mesh_blob_path": str(mesh_blob_out)}
 
 
+def _can_use_faithful_contouring() -> bool:
+    try:
+        from faithcontour import FCTDecoder, FCTEncoder, normalize_mesh  # noqa: F401
+        from atom3d import MeshBVH  # noqa: F401
+        from atom3d.grid import OctreeIndexer  # noqa: F401
+        import torch_scatter  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     import o_voxel
     from subprocess_utils import next_indexed_path
@@ -1569,15 +1653,10 @@ def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     print("[extract_to_glb] converting mesh blob to GLB...", flush=True)
     if remesh_method == "faithful_contouring":
-        try:
-            import importlib
-
-            importlib.import_module("faithcontour")
-            importlib.import_module("atom3d")
-        except Exception as e:
+        if not _can_use_faithful_contouring():
             print(
-                "[extract_to_glb] warning: faithful_contouring unavailable "
-                f"({type(e).__name__}: {e}). Falling back to dual_contouring.",
+                "[extract_to_glb] warning: faithful_contouring runtime dependencies are unavailable. "
+                "Falling back to dual_contouring.",
                 flush=True,
             )
             remesh_method = "dual_contouring"
@@ -1705,6 +1784,70 @@ def stage_mesh_export_formats(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {"mesh_path": str(mesh_path), "exported": exported}
 
 
+def stage_project_texture_multiview(payload: Dict[str, Any]) -> Dict[str, Any]:
+    import trimesh
+    from PIL import Image
+    from subprocess_utils import next_indexed_path
+    from trellis2.projection import texture_mesh_with_multiview
+
+    mesh_path = Path(payload["mesh_path"])
+    image_paths = [Path(p) for p in payload.get("image_paths", [])]
+    azimuths = [float(v) for v in payload.get("azimuths", [])]
+    elevations = [float(v) for v in payload.get("elevations", [])]
+    texture_size = int(payload.get("texture_size", 4096))
+    blend_exponent = float(payload.get("blend_exponent", 2.0))
+    ortho_scale = float(payload.get("ortho_scale", 1.1))
+    fill_holes = bool(payload.get("fill_holes", True))
+    max_hole_size = int(payload.get("max_hole_size", 20))
+    out_dir = Path(payload["out_dir"])
+    prefix = str(payload.get("prefix", "glb_projected"))
+
+    if not mesh_path.is_file():
+        raise FileNotFoundError(f"Projection mesh path not found: {mesh_path}")
+    if not image_paths:
+        raise ValueError("Projection texture refinement requires at least one image path.")
+    if not (len(image_paths) == len(azimuths) == len(elevations)):
+        raise ValueError(
+            "Projection image_paths, azimuths, and elevations must have the same length. "
+            f"Got {len(image_paths)}, {len(azimuths)}, {len(elevations)}."
+        )
+
+    print(f"[projection] loading mesh: {mesh_path}", flush=True)
+    mesh = trimesh.load(str(mesh_path))
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.to_mesh()
+
+    images = []
+    for path in image_paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"Projection image path not found: {path}")
+        with Image.open(str(path)) as img:
+            images.append(img.convert("RGBA").copy())
+
+    print(
+        f"[projection] projecting {len(images)} views at texture_size={texture_size}, "
+        f"blend_exponent={blend_exponent}, ortho_scale={ortho_scale}",
+        flush=True,
+    )
+    projected_mesh, _, _ = texture_mesh_with_multiview(
+        mesh,
+        images,
+        azimuths,
+        elevations,
+        texture_size=texture_size,
+        blend_texture=True,
+        blend_exponent=blend_exponent,
+        ortho_scale=ortho_scale,
+        fill_holes=fill_holes,
+        max_hole_size=max_hole_size,
+    )
+
+    _, out_path = next_indexed_path(out_dir, prefix=prefix, ext="glb", digits=4, start=1)
+    projected_mesh.export(str(out_path))
+    print(f"[projection] saved: {out_path}", flush=True)
+    return {"glb_path": str(out_path)}
+
+
 def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     import torch
     from trellis2.modules.sparse import SparseTensor
@@ -1714,6 +1857,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     from subprocess_utils import next_indexed_path
 
     model_repo = payload.get("model_repo", "microsoft/TRELLIS.2-4B")
+    config_file = payload.get("config_file", "pipeline.json")
     low_vram = payload.get("low_vram", False)
     shape_slat_path = Path(payload["shape_slat_path"])
     tex_slat_path = Path(payload["tex_slat_path"]) if payload.get("tex_slat_path") else None
@@ -1758,6 +1902,7 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     pipe = Trellis2ImageTo3DPipeline.from_pretrained(
         model_repo,
+        config_file=config_file,
         ignore_models=_ignore_except_image_models(keep),
         load_texture_models=False,
         load_image_cond_model=False,
@@ -1868,15 +2013,10 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     # setups (especially Windows). Instead of failing the whole extraction,
     # fall back to the built-in `dual_contouring` remesher with a clear log.
     if remesh_method == "faithful_contouring":
-        try:
-            import importlib
-
-            importlib.import_module("faithcontour")
-            importlib.import_module("atom3d")
-        except Exception as e:
+        if not _can_use_faithful_contouring():
             print(
-                "[extract] warning: remesh_method='faithful_contouring' requested but optional "
-                f"dependency is missing/unusable ({type(e).__name__}: {e}). "
+                "[extract] warning: remesh_method='faithful_contouring' requested but FaithC "
+                "runtime dependencies are unavailable. "
                 "Falling back to 'dual_contouring'.",
                 flush=True,
             )
@@ -2115,6 +2255,7 @@ def stage_tex_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
         config_file=config_file,
         ignore_models=_ignore_except_texturing_models([])  # Load base + image_cond_model
     )
+    _configure_texturing_pipeline_runtime(pipe, payload, "tex_encode_cond")
     pipe.cuda()
     
     _log_vram_usage("After loading")
@@ -2170,6 +2311,7 @@ def stage_tex_encode_shape(payload: Dict[str, Any]) -> Dict[str, Any]:
         config_file=config_file,
         ignore_models=_ignore_except_texturing_models(["shape_slat_encoder"])
     )
+    _configure_texturing_pipeline_runtime(pipe, payload, "tex_encode_shape")
     pipe.cuda()
 
     _log_vram_usage("After loading")
@@ -2232,6 +2374,7 @@ def stage_tex_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
         config_file=config_file,
         ignore_models=_ignore_except_texturing_models([tex_model_key])
     )
+    _configure_texturing_pipeline_runtime(pipe, payload, "tex_sample_tex_slat")
     pipe.cuda()
     
     _log_vram_usage("After loading")
@@ -2290,6 +2433,7 @@ def stage_tex_decode_and_bake(payload: Dict[str, Any]) -> Dict[str, Any]:
         config_file=config_file,
         ignore_models=_ignore_except_texturing_models(["tex_slat_decoder"])
     )
+    _configure_texturing_pipeline_runtime(pipe, payload, "tex_decode_and_bake")
     pipe.cuda()
     
     _log_vram_usage("After loading")
@@ -3360,6 +3504,8 @@ def main() -> int:
             result = stage_extract_to_glb(payload)
         elif stage == "mesh_export_formats":
             result = stage_mesh_export_formats(payload)
+        elif stage == "project_texture_multiview":
+            result = stage_project_texture_multiview(payload)
         elif stage == "extract_glb":
             result = stage_extract_glb(payload)
         elif stage == "ultrashape_refine_mesh":

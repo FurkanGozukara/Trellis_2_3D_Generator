@@ -84,6 +84,19 @@ from trellis2.pipelines import (
     Trellis2MultiViewPipeline,
     Trellis2TexturingPipeline,
 )
+from trellis2.projection import resolve_projection_views
+from trellis2.runtime_options import (
+    ATTENTION_BACKEND_CHOICES,
+    DEFAULT_ATTENTION_BACKEND,
+    DEFAULT_MODEL_VARIANT,
+    DEFAULT_SAMPLER_TYPE,
+    MODEL_VARIANT_CHOICES,
+    SAMPLER_TYPE_CHOICES,
+    apply_runtime_backends,
+    normalize_model_variant,
+    normalize_sampler_type,
+    resolve_model_variant,
+)
 from trellis2.renderers import EnvMap
 from trellis2.utils import render_utils
 import o_voxel
@@ -102,14 +115,16 @@ def _has_nvdiffrec_render() -> bool:
 def _is_faithful_contouring_available() -> bool:
     """
     `faithful_contouring` remeshing in `o_voxel.postprocess.to_glb()` depends on optional
-    FaithC packages (`faithcontour` + `atom3d`). These are not installed by default in
-    many environments (especially Windows).
+    FaithC packages plus their runtime imports. A shallow `find_spec()` check is not
+    enough because mismatched `atom3d` installs or missing `torch_scatter` can still
+    make the remesher unusable at import time.
     """
     try:
-        return (
-            importlib.util.find_spec("faithcontour") is not None
-            and importlib.util.find_spec("atom3d") is not None
-        )
+        from faithcontour import FCTDecoder, FCTEncoder, normalize_mesh  # noqa: F401
+        from atom3d import MeshBVH  # noqa: F401
+        from atom3d.grid import OctreeIndexer  # noqa: F401
+        import torch_scatter  # noqa: F401
+        return True
     except Exception:
         return False
 
@@ -139,6 +154,48 @@ RIGGING_OUTPUTS_DIR = OUTPUTS_DIR
 
 # Ensure TRELLIS_MODELS_DIR is set (trellis2 code also falls back to ../models).
 os.environ.setdefault("TRELLIS_MODELS_DIR", MODELS_DIR)
+
+DEFAULT_SUBPROCESS_PYTHON = r"G:\Trellis2_v3\Trellis_2_3D_Generator\venv\Scripts\python.exe"
+
+
+def _resolve_subprocess_python() -> str:
+    candidates = [
+        os.environ.get("TRELLIS_SUBPROCESS_PYTHON"),
+        DEFAULT_SUBPROCESS_PYTHON,
+        sys.executable,
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            return str(candidate)
+    return sys.executable
+
+
+def _configure_image_pipeline_runtime(
+    pipe: Any,
+    *,
+    attention_backend: Optional[str],
+    sampler_type: Optional[str],
+) -> dict:
+    runtime = apply_runtime_backends(attention_backend)
+    normalized_sampler = normalize_sampler_type(sampler_type)
+    if hasattr(pipe, "switch_samplers"):
+        pipe.switch_samplers(normalized_sampler)
+    runtime["sampler_type"] = normalized_sampler
+    return runtime
+
+
+def _configure_texturing_pipeline_runtime(
+    pipe: Any,
+    *,
+    attention_backend: Optional[str],
+    sampler_type: Optional[str],
+) -> dict:
+    runtime = apply_runtime_backends(attention_backend)
+    normalized_sampler = normalize_sampler_type(sampler_type)
+    if hasattr(pipe, "switch_sampler"):
+        pipe.switch_sampler(normalized_sampler)
+    runtime["sampler_type"] = normalized_sampler
+    return runtime
 
 
 def _discover_allowed_paths_all_drives() -> List[str]:
@@ -492,7 +549,9 @@ APP_THEME = gr.themes.Soft(
 # ------------------------------- Model Loading ------------------------------
 
 _image_pipeline = None
+_image_pipeline_key = None
 _multiview_pipeline = None
+_multiview_pipeline_key = None
 _texturing_pipeline = None
 _envmap = None
 _mode_icons_ready = False
@@ -549,6 +608,69 @@ def _export_path_for_format(out_dir: Path, fmt: str, glb_prefix: str, idx: int) 
     fmt_l = str(fmt).lower().strip()
     ext = "gltf" if fmt_l == "gltf" else fmt_l
     return out_dir / f"{_export_prefix_from_glb_prefix(glb_prefix, fmt_l)}_{idx:04d}.{ext}"
+
+
+def _round_float(value: Any, digits: int = 6) -> Optional[float]:
+    try:
+        return round(float(value), digits)
+    except Exception:
+        return None
+
+
+def _detect_visual_kind(mesh: trimesh.Trimesh) -> str:
+    visual = getattr(mesh, "visual", None)
+    if visual is None:
+        return "none"
+    kind = type(visual).__name__.lower()
+    if "texture" in kind:
+        return "texture"
+    if "color" in kind:
+        return "color"
+    return kind
+
+
+def _collect_mesh_audit(model_path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        asset = trimesh.load(str(model_path), force="mesh", process=False)
+        if isinstance(asset, trimesh.Scene):
+            asset = asset.to_mesh()
+        if not isinstance(asset, trimesh.Trimesh):
+            return None
+
+        material = getattr(getattr(asset, "visual", None), "material", None)
+        bounds = getattr(asset, "bounds", None)
+        extents = getattr(asset, "extents", None)
+        body_count = getattr(asset, "body_count", None)
+        vertex_normals = getattr(asset, "vertex_normals", None)
+        uv = getattr(getattr(asset, "visual", None), "uv", None)
+
+        audit: Dict[str, Any] = {
+            "path": model_path.name,
+            "vertex_count": int(len(asset.vertices)),
+            "face_count": int(len(asset.faces)),
+            "is_empty": bool(asset.is_empty),
+            "is_watertight": bool(asset.is_watertight),
+            "is_winding_consistent": bool(asset.is_winding_consistent),
+            "is_volume": bool(getattr(asset, "is_volume", False)),
+            "body_count": int(body_count) if body_count is not None else None,
+            "euler_number": int(asset.euler_number) if getattr(asset, "euler_number", None) is not None else None,
+            "has_uv": bool(uv is not None and len(uv) == len(asset.vertices)),
+            "has_vertex_normals": bool(vertex_normals is not None and len(vertex_normals) == len(asset.vertices)),
+            "visual_kind": _detect_visual_kind(asset),
+            "has_base_color_texture": bool(getattr(material, "baseColorTexture", None) is not None),
+            "has_metallic_roughness_texture": bool(getattr(material, "metallicRoughnessTexture", None) is not None),
+            "surface_area": _round_float(getattr(asset, "area", None)),
+            "volume": _round_float(getattr(asset, "volume", None)) if bool(getattr(asset, "is_volume", False)) else None,
+            "bounds_min": [float(x) for x in bounds[0].tolist()] if bounds is not None else None,
+            "bounds_max": [float(x) for x in bounds[1].tolist()] if bounds is not None else None,
+            "extents": [float(x) for x in extents.tolist()] if extents is not None else None,
+            "bounding_box_diagonal": (
+                _round_float(np.linalg.norm(extents)) if extents is not None else None
+            ),
+        }
+        return audit
+    except Exception:
+        return None
 
 
 def _write_extract_artifacts_manifest(
@@ -632,14 +754,37 @@ def _write_extract_artifacts_manifest(
                         }
                     )
 
+        mesh_audit: Dict[str, Any] = {
+            "schema": "trellis2.mesh_audit.v1",
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "artifacts": {},
+        }
+        final_audit = _collect_mesh_audit(final_path_obj) if final_path_obj.is_file() else None
+        if final_audit is not None:
+            mesh_audit["artifacts"]["final_output"] = final_audit
+        if (
+            stage3_path_obj is not None
+            and stage3_path_obj.is_file()
+            and (not final_path_obj.is_file() or stage3_path_obj.resolve() != final_path_obj.resolve())
+        ):
+            stage3_audit = _collect_mesh_audit(stage3_path_obj)
+            if stage3_audit is not None:
+                mesh_audit["artifacts"]["stage3_output"] = stage3_audit
+        mesh_audit_report_path = out_dir / "mesh_audit.json"
+        if mesh_audit["artifacts"]:
+            _write_json(str(mesh_audit_report_path), mesh_audit)
+
         manifest = {
-            "schema": "trellis2.extract_artifacts.v1",
+            "schema": "trellis2.extract_artifacts.v2",
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "stage_meanings": {
                 "extract_to_glb": "Converts decoded mesh voxel into remeshed/simplified GLB.",
                 "tex_decode_and_bake": "Optional re-texture pass that bakes new PBR textures onto extracted mesh.",
                 "final_export_formats": "Extra exports generated from the final GLB (gltf/obj/ply/stl).",
             },
+            "mesh_audit_report": (
+                str(mesh_audit_report_path.name) if mesh_audit["artifacts"] else None
+            ),
             "final_output": {
                 "path": _rel(final_path_obj),
                 "contains_geometry": True,
@@ -743,6 +888,9 @@ def _default_ui_config() -> dict:
             "texture_size": 4096,
             "export_formats": ["glb"],
             "low_vram": False,  # Keep models in VRAM for best quality and speed
+            "model_variant": "standard",
+            "attention_backend": "auto",
+            "sampler_type": "heun",
             "ss_guidance_strength": 7.5,
             "ss_guidance_rescale": 0.7,
             "ss_guidance_interval_start": 0.6,  # Model default: CFG only in last 40% of sampling
@@ -768,6 +916,13 @@ def _default_ui_config() -> dict:
             "tex_slat_guidance_interval_end": 0.9,
             "tex_slat_sampling_steps": 12,
             "tex_slat_rescale_t": 3.0,
+            "projection_texture_refine": False,
+            "projection_view_azimuths": "",
+            "projection_view_elevations": "",
+            "projection_blend_exponent": 2.0,
+            "projection_ortho_scale": 1.1,
+            "projection_fill_holes": True,
+            "projection_max_hole_size": 20,
             "ultrashape_enabled": False,
             "ultrashape_retexture_after_refine": False,
             "ultrashape_conservative_mode": False,
@@ -794,6 +949,8 @@ def _default_ui_config() -> dict:
             "randomize_seed": False,
             "texture_size": 2048,
             "low_vram": True,  # Default True for memory safety
+            "attention_backend": "auto",
+            "sampler_type": "heun",
             "guidance_strength": 1.0,
             "guidance_rescale": 0.0,
             "guidance_interval_start": 0.6,
@@ -1041,8 +1198,9 @@ def _iter_subprocess_stage(stage: str, payload: dict, work_dir: Path, log_path: 
     result_path = work_dir / f"{stage}.result.json"
     payload_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    python_exe = _resolve_subprocess_python()
     cmd = [
-        sys.executable,
+        python_exe,
         "-u",
         SUBPROCESS_STAGE_SCRIPT,
         "--stage",
@@ -1147,29 +1305,55 @@ def _get_envmap():
     return _envmap
 
 
-def get_image_pipeline():
-    global _image_pipeline, _multiview_pipeline
-    if _image_pipeline is None:
+def get_image_pipeline(model_variant: str = DEFAULT_MODEL_VARIANT):
+    global _image_pipeline, _image_pipeline_key, _multiview_pipeline, _multiview_pipeline_key
+    variant_cfg = resolve_model_variant(model_variant)
+    key = (variant_cfg["model_repo"], variant_cfg["config_file"])
+    if _image_pipeline is None or _image_pipeline_key != key:
+        if _image_pipeline is not None:
+            _image_pipeline.cpu()
+            del _image_pipeline
+            _image_pipeline = None
+            _image_pipeline_key = None
+            torch.cuda.empty_cache()
         if _multiview_pipeline is not None:
             _multiview_pipeline.cpu()
             del _multiview_pipeline
             _multiview_pipeline = None
+            _multiview_pipeline_key = None
             torch.cuda.empty_cache()
-        _image_pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
+        _image_pipeline = Trellis2ImageTo3DPipeline.from_pretrained(
+            variant_cfg["model_repo"],
+            config_file=variant_cfg["config_file"],
+        )
+        _image_pipeline_key = key
         _image_pipeline.low_vram = False  # Keep models in VRAM for best quality and speed
         _image_pipeline.cuda()
     return _image_pipeline
 
 
-def get_multiview_pipeline():
-    global _image_pipeline, _multiview_pipeline
-    if _multiview_pipeline is None:
+def get_multiview_pipeline(model_variant: str = DEFAULT_MODEL_VARIANT):
+    global _image_pipeline, _image_pipeline_key, _multiview_pipeline, _multiview_pipeline_key
+    variant_cfg = resolve_model_variant(model_variant)
+    key = (variant_cfg["model_repo"], variant_cfg["config_file"])
+    if _multiview_pipeline is None or _multiview_pipeline_key != key:
+        if _multiview_pipeline is not None:
+            _multiview_pipeline.cpu()
+            del _multiview_pipeline
+            _multiview_pipeline = None
+            _multiview_pipeline_key = None
+            torch.cuda.empty_cache()
         if _image_pipeline is not None:
             _image_pipeline.cpu()
             del _image_pipeline
             _image_pipeline = None
+            _image_pipeline_key = None
             torch.cuda.empty_cache()
-        _multiview_pipeline = Trellis2MultiViewPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
+        _multiview_pipeline = Trellis2MultiViewPipeline.from_pretrained(
+            variant_cfg["model_repo"],
+            config_file=variant_cfg["config_file"],
+        )
+        _multiview_pipeline_key = key
         _multiview_pipeline.low_vram = False  # Keep models in VRAM for best quality and speed
         _multiview_pipeline.cuda()
     return _multiview_pipeline
@@ -1186,9 +1370,18 @@ def get_texturing_pipeline():
     return _texturing_pipeline
 
 
+def _collect_preprocessed_view_paths(run_dir: Path) -> List[str]:
+    paths: List[Path] = []
+    first = run_dir / "01_preprocessed.png"
+    if first.is_file():
+        paths.append(first)
+    paths.extend(sorted(run_dir.glob("01_preprocessed_view*.png")))
+    return [str(path) for path in paths if path.is_file()]
+
+
 def unload_global_pipelines():
     """Unload any global pipelines to free VRAM before subprocess mode."""
-    global _image_pipeline, _multiview_pipeline, _texturing_pipeline
+    global _image_pipeline, _image_pipeline_key, _multiview_pipeline, _multiview_pipeline_key, _texturing_pipeline
     import gc
 
     if _image_pipeline is not None:
@@ -1196,12 +1389,14 @@ def unload_global_pipelines():
         _image_pipeline.cpu()
         del _image_pipeline
         _image_pipeline = None
+        _image_pipeline_key = None
 
     if _multiview_pipeline is not None:
         print("[main] Unloading global multi-view pipeline to free VRAM...", flush=True)
         _multiview_pipeline.cpu()
         del _multiview_pipeline
         _multiview_pipeline = None
+        _multiview_pipeline_key = None
 
     if _texturing_pipeline is not None:
         print("[main] Unloading global texturing pipeline to free VRAM...", flush=True)
@@ -2411,6 +2606,9 @@ def batch_process_folder(
     ss_rescale_t: float,
     force_high_res_conditional: bool,
     low_vram: bool,
+    model_variant: str,
+    attention_backend: str,
+    sampler_type: str,
     use_chunked_processing: bool,
     use_tiled_extraction: bool,
     shape_slat_guidance_strength: float,
@@ -2427,6 +2625,13 @@ def batch_process_folder(
     tex_slat_rescale_t: float,
     no_texture_gen: bool,
     deferred_texture_after_cleanup: bool,
+    projection_texture_refine: bool,
+    projection_view_azimuths: str,
+    projection_view_elevations: str,
+    projection_blend_exponent: float,
+    projection_ortho_scale: float,
+    projection_fill_holes: bool,
+    projection_max_hole_size: int,
     max_num_tokens: int,
     multiview_mode: str,
     decimation_target: int,
@@ -2598,8 +2803,11 @@ def batch_process_folder(
                     ss_rescale_t,
                     force_high_res_conditional,
                     low_vram,
-                    use_chunked_processing,
-                    use_tiled_extraction,
+                    model_variant,
+                    attention_backend,
+                    sampler_type,
+                    extract_use_chunked_processing,
+                    extract_use_tiled_extraction,
                     shape_slat_guidance_strength,
                     shape_slat_guidance_rescale,
                     shape_slat_guidance_interval_start,
@@ -2613,7 +2821,13 @@ def batch_process_folder(
                     tex_slat_sampling_steps,
                     tex_slat_rescale_t,
                     no_texture_gen,
-                    deferred_texture_after_cleanup,
+                    projection_texture_refine,
+                    projection_view_azimuths,
+                    projection_view_elevations,
+                    projection_blend_exponent,
+                    projection_ortho_scale,
+                    projection_fill_holes,
+                    projection_max_hole_size,
                     max_num_tokens,
                     multiview_mode,
                     subprocess_mode,
@@ -2644,10 +2858,17 @@ def batch_process_folder(
                     str(simplify_method),
                     bool(no_texture_gen),
                     bool(deferred_texture_after_cleanup),
+                    bool(projection_texture_refine),
+                    str(projection_view_azimuths),
+                    str(projection_view_elevations),
+                    float(projection_blend_exponent),
+                    float(projection_ortho_scale),
+                    bool(projection_fill_holes),
+                    int(projection_max_hole_size),
                     bool(prune_invisible_faces),
                     export_formats,
-                    use_chunked_processing,
-                    use_tiled_extraction,
+                    extract_use_chunked_processing,
+                    extract_use_tiled_extraction,
                     ultrashape_enabled,
                     ultrashape_retexture_after_refine,
                     ultrashape_conservative_mode,
@@ -2998,6 +3219,9 @@ def image_to_3d(
     ss_rescale_t: float,
     force_high_res_conditional: bool,
     low_vram: bool,
+    model_variant: str,
+    attention_backend: str,
+    sampler_type: str,
     use_chunked_processing: bool,
     use_tiled_extraction: bool,
     shape_slat_guidance_strength: float,
@@ -3013,6 +3237,13 @@ def image_to_3d(
     tex_slat_sampling_steps: int,
     tex_slat_rescale_t: float,
     no_texture_gen: bool,
+    projection_texture_refine: bool,
+    projection_view_azimuths: str,
+    projection_view_elevations: str,
+    projection_blend_exponent: float,
+    projection_ortho_scale: float,
+    projection_fill_holes: bool,
+    projection_max_hole_size: int,
     max_num_tokens: int,
     multiview_mode: str,
     subprocess_mode: bool,
@@ -3052,6 +3283,15 @@ def image_to_3d(
     mv_mode = str(multiview_mode or "stochastic").strip().lower()
     if mv_mode not in {"stochastic", "multidiffusion"}:
         mv_mode = "stochastic"
+    requested_model_variant = normalize_model_variant(model_variant)
+    model_variant_cfg = resolve_model_variant(requested_model_variant)
+    requested_attention_backend = str(attention_backend or DEFAULT_ATTENTION_BACKEND).strip().lower()
+    requested_sampler_type = normalize_sampler_type(sampler_type)
+    runtime_cfg = apply_runtime_backends(requested_attention_backend)
+    runtime_cfg["model_variant"] = requested_model_variant
+    runtime_cfg["model_repo"] = model_variant_cfg["model_repo"]
+    runtime_cfg["config_file"] = model_variant_cfg["config_file"]
+    runtime_cfg["sampler_type"] = requested_sampler_type
 
     # Optional extra views for multi-view generation.
     # Main image is always view #1.
@@ -3064,6 +3304,26 @@ def image_to_3d(
         except Exception as e:
             raise gr.Error(f"Could not read multi-view image: {p} ({type(e).__name__}: {e})")
     use_multiview = len(source_images) > 1
+    projection_settings = {
+        "enabled": bool(projection_texture_refine),
+        "azimuths": [],
+        "elevations": [],
+        "blend_exponent": float(projection_blend_exponent),
+        "ortho_scale": float(projection_ortho_scale),
+        "fill_holes": bool(projection_fill_holes),
+        "max_hole_size": int(projection_max_hole_size),
+    }
+    if projection_settings["enabled"]:
+        try:
+            azimuths, elevations = resolve_projection_views(
+                [Path(f"view_{idx:02d}.png") for idx in range(len(source_images))],
+                projection_view_azimuths,
+                projection_view_elevations,
+            )
+        except Exception as e:
+            raise gr.Error(f"Invalid projection view angles: {e}")
+        projection_settings["azimuths"] = [float(v) for v in azimuths]
+        projection_settings["elevations"] = [float(v) for v in elevations]
 
     # Handle custom resolution override
     if custom_resolution and custom_resolution > 0:
@@ -3099,6 +3359,14 @@ def image_to_3d(
                 pass
 
     _log(f"Starting Image → 3D generation (resolution: {resolution}, pipeline: {pipeline_type})…", 0.0)
+    _log(
+        "Runtime settings: "
+        f"requested_backend={requested_attention_backend}, "
+        f"dense_backend={runtime_cfg['dense_backend']}, "
+        f"sparse_backend={runtime_cfg['sparse_backend']}, "
+        f"sampler={requested_sampler_type}",
+        0.0,
+    )
     if use_multiview:
         _log(
             f"Multi-view input detected: {len(source_images)} views (mode={mv_mode}). "
@@ -3147,6 +3415,12 @@ def image_to_3d(
                 "max_num_tokens": int(max_num_tokens),
                 "force_high_res_conditional": bool(force_high_res_conditional),
                 "low_vram": bool(low_vram),
+                "model_variant": requested_model_variant,
+                "model_repo": model_variant_cfg["model_repo"],
+                "attention_backend": requested_attention_backend,
+                "dense_attention_backend": runtime_cfg["dense_backend"],
+                "sparse_attention_backend": runtime_cfg["sparse_backend"],
+                "sampler_type": requested_sampler_type,
                 "use_chunked_processing": bool(use_chunked_processing),
                 "use_tiled_extraction": bool(use_tiled_extraction),
                 "ss_params": {
@@ -3170,6 +3444,13 @@ def image_to_3d(
                     "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
                     "rescale_t": float(tex_slat_rescale_t),
                 },
+                "projection_texture_refine": bool(projection_settings["enabled"]),
+                "projection_azimuths": list(projection_settings["azimuths"]),
+                "projection_elevations": list(projection_settings["elevations"]),
+                "projection_blend_exponent": float(projection_settings["blend_exponent"]),
+                "projection_ortho_scale": float(projection_settings["ortho_scale"]),
+                "projection_fill_holes": bool(projection_settings["fill_holes"]),
+                "projection_max_hole_size": int(projection_settings["max_hole_size"]),
             },
         )
 
@@ -3236,7 +3517,8 @@ def image_to_3d(
             if use_multiview:
                 _log(f"Preprocessing view {view_idx}/{num_preprocess_views}…", preprocess_progress)
             preprocess_payload = {
-                "model_repo": "microsoft/TRELLIS.2-4B",
+                "model_repo": model_variant_cfg["model_repo"],
+                "config_file": model_variant_cfg["config_file"],
                 "input_image_path": str(in_path),
                 "output_image_path": str(out_path),
             }
@@ -3250,7 +3532,8 @@ def image_to_3d(
         if use_multiview:
             # Multi-view subprocess stage: sample sparse/shape/tex latents from all views.
             multiview_payload = {
-                "model_repo": "microsoft/TRELLIS.2-4B",
+                "model_repo": model_variant_cfg["model_repo"],
+                "config_file": model_variant_cfg["config_file"],
                 "seed": int(seed),
                 "resolution": resolution,
                 "image_paths": [str(p) for p in preprocessed_view_paths],
@@ -3261,6 +3544,8 @@ def image_to_3d(
                 "max_num_tokens": int(max_num_tokens),
                 "no_texture_gen": bool(no_texture_gen),
                 "low_vram": bool(low_vram),
+                "attention_backend": requested_attention_backend,
+                "sampler_type": requested_sampler_type,
                 "ss_params": {
                     "steps": int(ss_sampling_steps),
                     "guidance_strength": float(ss_guidance_strength),
@@ -3292,12 +3577,15 @@ def image_to_3d(
         else:
             # Stage: encode conditioning
             cond_payload = {
-                "model_repo": "microsoft/TRELLIS.2-4B",
+                "model_repo": model_variant_cfg["model_repo"],
+                "config_file": model_variant_cfg["config_file"],
                 "image_path": str(preprocessed_path),
                 "resolution": resolution,
                 "cond_512_path": str(cond_512_path),
                 "cond_1024_path": str(cond_1024_path) if cond_1024_path is not None else None,
                 "force_high_res_conditional": bool(force_high_res_conditional),
+                "attention_backend": requested_attention_backend,
+                "sampler_type": requested_sampler_type,
             }
             try:
                 _ = yield from _stage("encode_cond", cond_payload, 0.08)
@@ -3312,13 +3600,16 @@ def image_to_3d(
 
             # Stage: sparse structure
             sparse_payload = {
-                "model_repo": "microsoft/TRELLIS.2-4B",
+                "model_repo": model_variant_cfg["model_repo"],
+                "config_file": model_variant_cfg["config_file"],
                 "seed": int(seed),
                 "resolution": resolution,
                 "cond_512_path": str(cond_512_path),
                 "coords_path": str(coords_path),
                 "force_high_res_conditional": bool(force_high_res_conditional),
                 "rng_state_out_path": str(rng_after_sparse_path),
+                "attention_backend": requested_attention_backend,
+                "sampler_type": requested_sampler_type,
                 "ss_params": {
                     "steps": int(ss_sampling_steps),
                     "guidance_strength": float(ss_guidance_strength),
@@ -3335,7 +3626,8 @@ def image_to_3d(
 
             # Stage: shape latent
             shape_payload = {
-                "model_repo": "microsoft/TRELLIS.2-4B",
+                "model_repo": model_variant_cfg["model_repo"],
+                "config_file": model_variant_cfg["config_file"],
                 "seed": int(seed),
                 "resolution": resolution,
                 "cond_512_path": str(cond_512_path),
@@ -3345,6 +3637,8 @@ def image_to_3d(
                 "out_res_path": str(shape_res_path),
                 "rng_state_in_path": str(rng_after_sparse_path),
                 "rng_state_out_path": str(rng_after_shape_path),
+                "attention_backend": requested_attention_backend,
+                "sampler_type": requested_sampler_type,
                 "shape_params": {
                     "steps": int(shape_slat_sampling_steps),
                     "guidance_strength": float(shape_slat_guidance_strength),
@@ -3365,13 +3659,16 @@ def image_to_3d(
             if not no_texture_gen:
                 tex_cond_path = str(cond_512_path if pipeline_type == "512" else cond_1024_path)
                 tex_payload = {
-                    "model_repo": "microsoft/TRELLIS.2-4B",
+                    "model_repo": model_variant_cfg["model_repo"],
+                    "config_file": model_variant_cfg["config_file"],
                     "seed": int(seed),
                     "resolution": resolution,
                     "cond_path": tex_cond_path,
                     "shape_slat_path": str(shape_slat_path),
                     "tex_slat_path": str(tex_slat_path),
                     "rng_state_in_path": str(rng_after_shape_path),
+                    "attention_backend": requested_attention_backend,
+                    "sampler_type": requested_sampler_type,
                     "tex_params": {
                         "steps": int(tex_slat_sampling_steps),
                         "guidance_strength": float(tex_slat_guidance_strength),
@@ -3398,7 +3695,8 @@ def image_to_3d(
                 _ = yield from _stage(
                     "preview_decode_mesh",
                     {
-                        "model_repo": "microsoft/TRELLIS.2-4B",
+                        "model_repo": model_variant_cfg["model_repo"],
+                        "config_file": model_variant_cfg["config_file"],
                         "shape_slat_path": str(shape_slat_path),
                         "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
                         "res": int(res),
@@ -3444,18 +3742,34 @@ def image_to_3d(
                 "_run_dir": str(run_dir),
                 "_input_image_path": str(input_path),
                 "_preprocessed_image_path": str(preprocessed_path),
+                "_preprocessed_view_paths": [str(p) for p in preprocessed_view_paths],
                 "_pipeline_type": pipeline_type,
                 "seed": int(seed),
                 "res": int(res),
                 "shape_slat_path": str(shape_slat_path),
                 "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
+                "_model_variant": requested_model_variant,
                 "_gen_tex_params": {
                     "steps": int(tex_slat_sampling_steps),
                     "guidance_strength": float(tex_slat_guidance_strength),
                     "guidance_rescale": float(tex_slat_guidance_rescale),
                     "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
                     "rescale_t": float(tex_slat_rescale_t),
+                    "attention_backend": requested_attention_backend,
+                    "sampler_type": requested_sampler_type,
+                    "dense_attention_backend": runtime_cfg["dense_backend"],
+                    "sparse_attention_backend": runtime_cfg["sparse_backend"],
                 },
+                "_runtime_settings": {
+                    "model_variant": requested_model_variant,
+                    "model_repo": model_variant_cfg["model_repo"],
+                    "config_file": model_variant_cfg["config_file"],
+                    "attention_backend": requested_attention_backend,
+                    "dense_attention_backend": runtime_cfg["dense_backend"],
+                    "sparse_attention_backend": runtime_cfg["sparse_backend"],
+                    "sampler_type": requested_sampler_type,
+                },
+                "_projection_settings": dict(projection_settings),
                 "preview_manifest_path": None,  # No preview available
                 "_preview_failed": True,
                 "_preview_error": preview_error_msg,
@@ -3550,18 +3864,34 @@ def image_to_3d(
             "_run_dir": str(run_dir),
             "_input_image_path": str(input_path),
             "_preprocessed_image_path": str(preprocessed_path),
+            "_preprocessed_view_paths": [str(p) for p in preprocessed_view_paths],
             "_pipeline_type": pipeline_type,
             "seed": int(seed),
             "res": int(res),
             "shape_slat_path": str(shape_slat_path),
             "tex_slat_path": str(tex_slat_path) if tex_slat_path is not None else None,
+            "_model_variant": requested_model_variant,
             "_gen_tex_params": {
                 "steps": int(tex_slat_sampling_steps),
                 "guidance_strength": float(tex_slat_guidance_strength),
                 "guidance_rescale": float(tex_slat_guidance_rescale),
                 "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
                 "rescale_t": float(tex_slat_rescale_t),
+                "attention_backend": requested_attention_backend,
+                "sampler_type": requested_sampler_type,
+                "dense_attention_backend": runtime_cfg["dense_backend"],
+                "sparse_attention_backend": runtime_cfg["sparse_backend"],
             },
+            "_runtime_settings": {
+                "model_variant": requested_model_variant,
+                "model_repo": model_variant_cfg["model_repo"],
+                "config_file": model_variant_cfg["config_file"],
+                "attention_backend": requested_attention_backend,
+                "dense_attention_backend": runtime_cfg["dense_backend"],
+                "sparse_attention_backend": runtime_cfg["sparse_backend"],
+                "sampler_type": requested_sampler_type,
+            },
+            "_projection_settings": dict(projection_settings),
             "preview_manifest_path": str(preview_manifest_path),
         }
         _log('Done. You can now click "Extract GLB".', 1.0)
@@ -3575,10 +3905,15 @@ def image_to_3d(
 
     if use_multiview:
         _log("Loading TRELLIS.2 multi-view pipeline (first run can take a while)…", 0.01)
-        pipe = get_multiview_pipeline()
+        pipe = get_multiview_pipeline(requested_model_variant)
     else:
         _log("Loading TRELLIS.2 pipeline (first run can take a while)…", 0.01)
-        pipe = get_image_pipeline()
+        pipe = get_image_pipeline(requested_model_variant)
+    runtime_cfg = _configure_image_pipeline_runtime(
+        pipe,
+        attention_backend=requested_attention_backend,
+        sampler_type=requested_sampler_type,
+    )
     yield None, empty_html, status
 
     pbr_supported = _has_nvdiffrec_render()
@@ -3828,6 +4163,16 @@ def image_to_3d(
                 "guidance_rescale": float(tex_slat_guidance_rescale),
                 "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
                 "rescale_t": float(tex_slat_rescale_t),
+                "attention_backend": requested_attention_backend,
+                "sampler_type": requested_sampler_type,
+                "dense_attention_backend": runtime_cfg["dense_backend"],
+                "sparse_attention_backend": runtime_cfg["sparse_backend"],
+            }
+            state["_runtime_settings"] = {
+                "attention_backend": requested_attention_backend,
+                "dense_attention_backend": runtime_cfg["dense_backend"],
+                "sparse_attention_backend": runtime_cfg["sparse_backend"],
+                "sampler_type": requested_sampler_type,
             }
             state["preview_manifest_path"] = str(preview_manifest_path)
             state["_multiview"] = True
@@ -4064,17 +4409,33 @@ def image_to_3d(
         state["_run_dir"] = str(run_dir)
         state["_input_image_path"] = str(input_path)
         state["_preprocessed_image_path"] = str(preprocessed_path)
+        state["_preprocessed_view_paths"] = _collect_preprocessed_view_paths(run_dir)
         state["_pipeline_type"] = pipeline_type
         state["seed"] = int(seed)
         state["shape_slat_path"] = str(shape_slat_path)
         state["tex_slat_path"] = str(tex_slat_path) if tex_slat_path is not None else None
+        state["_model_variant"] = requested_model_variant
         state["_gen_tex_params"] = {
             "steps": int(tex_slat_sampling_steps),
             "guidance_strength": float(tex_slat_guidance_strength),
             "guidance_rescale": float(tex_slat_guidance_rescale),
             "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
             "rescale_t": float(tex_slat_rescale_t),
+            "attention_backend": requested_attention_backend,
+            "sampler_type": requested_sampler_type,
+            "dense_attention_backend": runtime_cfg["dense_backend"],
+            "sparse_attention_backend": runtime_cfg["sparse_backend"],
         }
+        state["_runtime_settings"] = {
+            "model_variant": requested_model_variant,
+            "model_repo": model_variant_cfg["model_repo"],
+            "config_file": model_variant_cfg["config_file"],
+            "attention_backend": requested_attention_backend,
+            "dense_attention_backend": runtime_cfg["dense_backend"],
+            "sparse_attention_backend": runtime_cfg["sparse_backend"],
+            "sampler_type": requested_sampler_type,
+        }
+        state["_projection_settings"] = dict(projection_settings)
         state["preview_manifest_path"] = str(preview_manifest_path)
     except Exception:
         pass
@@ -4092,6 +4453,13 @@ def extract_glb(
     simplify_method: str,
     no_texture_gen: bool,
     deferred_texture_after_cleanup: bool,
+    projection_texture_refine: bool,
+    projection_view_azimuths: str,
+    projection_view_elevations: str,
+    projection_blend_exponent: float,
+    projection_ortho_scale: float,
+    projection_fill_holes: bool,
+    projection_max_hole_size: int,
     prune_invisible_faces: bool,
     export_formats: List[str],
     extract_use_chunked_processing: bool,
@@ -4190,7 +4558,71 @@ def extract_glb(
 
         last_ui_update = 0.0
         log_path = Path(logs_dir) / "extract_glb.log"
+        runtime_settings = (state.get("_runtime_settings") if isinstance(state, dict) else None) or {}
+        selected_model_variant = normalize_model_variant(
+            runtime_settings.get("model_variant") or (state.get("_model_variant") if isinstance(state, dict) else None)
+        )
+        model_variant_cfg = resolve_model_variant(selected_model_variant)
+        model_repo = str(runtime_settings.get("model_repo") or model_variant_cfg["model_repo"])
+        config_file = str(runtime_settings.get("config_file") or model_variant_cfg["config_file"])
         reference_image_path = state.get("_preprocessed_image_path") or state.get("_input_image_path")
+        saved_view_paths = state.get("_preprocessed_view_paths") if isinstance(state, dict) else None
+        projection_view_paths = [
+            str(Path(p))
+            for p in (saved_view_paths or _collect_preprocessed_view_paths(run_dir))
+            if p and Path(p).is_file()
+        ]
+        if not projection_view_paths and reference_image_path and Path(str(reference_image_path)).is_file():
+            projection_view_paths = [str(Path(str(reference_image_path)))]
+        saved_projection = (state.get("_projection_settings") if isinstance(state, dict) else None) or {}
+        projection_azimuth_text = str(projection_view_azimuths or "").strip()
+        projection_elevation_text = str(projection_view_elevations or "").strip()
+        if not projection_azimuth_text and saved_projection.get("azimuths"):
+            projection_azimuth_text = ",".join(str(v) for v in saved_projection.get("azimuths", []))
+        if not projection_elevation_text and saved_projection.get("elevations"):
+            projection_elevation_text = ",".join(str(v) for v in saved_projection.get("elevations", []))
+        projection_settings = {
+            "enabled": bool(projection_texture_refine),
+            "image_paths": list(projection_view_paths),
+            "azimuths": [],
+            "elevations": [],
+            "blend_exponent": float(
+                projection_blend_exponent
+                if projection_blend_exponent is not None
+                else saved_projection.get("blend_exponent", 2.0)
+            ),
+            "ortho_scale": float(
+                projection_ortho_scale
+                if projection_ortho_scale is not None
+                else saved_projection.get("ortho_scale", 1.1)
+            ),
+            "fill_holes": bool(
+                projection_fill_holes
+                if projection_fill_holes is not None
+                else saved_projection.get("fill_holes", True)
+            ),
+            "max_hole_size": int(
+                projection_max_hole_size
+                if projection_max_hole_size is not None
+                else saved_projection.get("max_hole_size", 20)
+            ),
+        }
+        if projection_settings["enabled"]:
+            if not projection_settings["image_paths"]:
+                projection_settings["enabled"] = False
+                _log("Projection refinement requested but no saved preprocessed view images were found. Skipping projection.", 0.06)
+                yield None, None, status
+            else:
+                try:
+                    azimuths, elevations = resolve_projection_views(
+                        [Path(p) for p in projection_settings["image_paths"]],
+                        projection_azimuth_text,
+                        projection_elevation_text,
+                    )
+                except Exception as e:
+                    raise gr.Error(f"Invalid projection view angles: {e}")
+                projection_settings["azimuths"] = [float(v) for v in azimuths]
+                projection_settings["elevations"] = [float(v) for v in elevations]
         ultrashape_payload = {
             "enabled": bool(ultrashape_enabled),
             "retexture_after_refine": bool(ultrashape_retexture_after_refine),
@@ -4216,11 +4648,17 @@ def extract_glb(
             "seed": int(state.get("seed", 42) if isinstance(state, dict) else 42),
         }
 
+        if projection_settings["enabled"] and bool(deferred_texture_after_cleanup):
+            _log("Projection texture refinement is enabled, so Deferred Texture Rebuild will be skipped.", 0.06)
+            yield None, None, status
+        if projection_settings["enabled"] and bool(ultrashape_enabled) and bool(ultrashape_retexture_after_refine):
+            _log("Projection texture refinement is enabled, so UltraShape re-texture will be skipped.", 0.06)
+            yield None, None, status
         do_ultrashape_retexture = bool(
-            ultrashape_enabled and ultrashape_retexture_after_refine and (not bool(no_texture_gen))
+            ultrashape_enabled and ultrashape_retexture_after_refine and (not bool(no_texture_gen)) and (not projection_settings["enabled"])
         )
         do_deferred_retexture = bool(
-            deferred_texture_after_cleanup and (not bool(no_texture_gen))
+            deferred_texture_after_cleanup and (not bool(no_texture_gen)) and (not projection_settings["enabled"])
         )
         do_retexture = bool(do_ultrashape_retexture or do_deferred_retexture)
         ref_path_obj = Path(str(reference_image_path)) if reference_image_path else None
@@ -4231,16 +4669,23 @@ def extract_glb(
 
         if do_retexture:
             stage3_glb_prefix = "glb_stage3_shape_only"
+        elif bool(projection_settings["enabled"]) and bool(no_texture_gen):
+            stage3_glb_prefix = "glb_stage3_shape_only_projection"
+        elif bool(projection_settings["enabled"]):
+            stage3_glb_prefix = "glb_stage3_textured_projection_base"
         elif bool(no_texture_gen):
             stage3_glb_prefix = "glb_final_shape_only"
         else:
             stage3_glb_prefix = "glb_final_textured_direct"
         final_retexture_glb_prefix = "glb_final_textured_retexture"
+        final_projection_glb_prefix = "glb_final_textured_projection"
         stage3_glb_path: Optional[str] = None
         stage3_has_textures = bool((not no_texture_gen) and (not do_retexture))
         final_has_textures = bool(stage3_has_textures)
         if bool(no_texture_gen):
             final_texture_source = "none_shape_only"
+        elif bool(projection_settings["enabled"]):
+            final_texture_source = "none_waiting_projection"
         elif bool(do_retexture):
             final_texture_source = "none_waiting_retexture"
         else:
@@ -4273,7 +4718,8 @@ def extract_glb(
         try:
             # Stage 1: decode latent -> mesh blob
             decode_payload = {
-                "model_repo": "microsoft/TRELLIS.2-4B",
+                "model_repo": model_repo,
+                "config_file": config_file,
                 "shape_slat_path": str(shape_slat_path),
                 "tex_slat_path": str(tex_slat_path) if tex_slat_path else None,
                 "res": int(res),
@@ -4310,7 +4756,7 @@ def extract_glb(
                     current_mesh_blob = Path(str(ultra_result["mesh_blob_path"]))
 
             # Stage 3: mesh blob -> GLB
-            to_glb_export_formats = ["glb"] if do_retexture else list(export_formats)
+            to_glb_export_formats = ["glb"] if (do_retexture or projection_settings["enabled"]) else list(export_formats)
             to_glb_result = yield from _run_stage(
                 "extract_to_glb",
                 {
@@ -4356,7 +4802,7 @@ def extract_glb(
                 )
             yield None, None, status
 
-            # Stage 4: optional retexture in separate subprocess stages
+            # Stage 4: optional retexture or projection refinement
             if do_retexture and ref_path_obj is not None and ref_path_obj.is_file():
                 try:
                     if do_ultrashape_retexture:
@@ -4373,6 +4819,17 @@ def extract_glb(
 
                     tex_seed = int(state.get("seed", 42) if isinstance(state, dict) else 42)
                     tex_params = (state.get("_gen_tex_params") if isinstance(state, dict) else None) or {}
+                    runtime_settings = (state.get("_runtime_settings") if isinstance(state, dict) else None) or {}
+                    tex_attention_backend = str(
+                        tex_params.get("attention_backend")
+                        or runtime_settings.get("attention_backend")
+                        or DEFAULT_ATTENTION_BACKEND
+                    ).strip().lower()
+                    tex_sampler_type = normalize_sampler_type(
+                        tex_params.get("sampler_type")
+                        or runtime_settings.get("sampler_type")
+                        or DEFAULT_SAMPLER_TYPE
+                    )
                     tex_res = int(res)
                     if tex_res != 512:
                         tex_res = min(tex_res, 1536)
@@ -4387,6 +4844,8 @@ def extract_glb(
                         "config_file": "texturing_pipeline.json",
                         "seed": tex_seed,
                         "resolution": int(tex_res),
+                        "attention_backend": tex_attention_backend,
+                        "sampler_type": tex_sampler_type,
                     }
 
                     _ = yield from _run_stage(
@@ -4467,19 +4926,61 @@ def extract_glb(
                     except Exception:
                         pass
                     yield None, None, status
-
-                extra_formats = [f for f in export_formats if str(f).lower().strip() != "glb"]
-                if extra_formats:
-                    _ = yield from _run_stage(
-                        "mesh_export_formats",
+            elif projection_settings["enabled"]:
+                try:
+                    _log(
+                        f"Projection texture refinement enabled: projecting {len(projection_settings['image_paths'])} preprocessed views onto the cleaned mesh.",
+                        0.56,
+                    )
+                    yield None, None, status
+                    projection_result = yield from _run_stage(
+                        "project_texture_multiview",
                         {
                             "mesh_path": str(final_glb_path),
+                            "image_paths": list(projection_settings["image_paths"]),
+                            "azimuths": list(projection_settings["azimuths"]),
+                            "elevations": list(projection_settings["elevations"]),
+                            "texture_size": int(texture_size),
+                            "blend_exponent": float(projection_settings["blend_exponent"]),
+                            "ortho_scale": float(projection_settings["ortho_scale"]),
+                            "fill_holes": bool(projection_settings["fill_holes"]),
+                            "max_hole_size": int(projection_settings["max_hole_size"]),
                             "out_dir": str(out_dir),
-                            "export_formats": extra_formats,
+                            "prefix": final_projection_glb_prefix,
                         },
-                        0.90,
-                        "Exporting additional formats…",
+                        0.76,
+                        "Stage 4/4: Projection texture refinement…",
                     )
+                    final_glb_path = str(projection_result["glb_path"])
+                    final_has_textures = True
+                    final_texture_source = "projection_multiview"
+                except Exception as e:
+                    _log(
+                        f"Projection texture refinement failed ({type(e).__name__}: {e}). "
+                        "Keeping the extracted GLB from Stage 3.",
+                        0.86,
+                    )
+                    final_has_textures = bool(stage3_has_textures)
+                    final_texture_source = (
+                        "stage3_fallback_after_projection_failure"
+                        if final_has_textures
+                        else "none_projection_failed"
+                    )
+                    yield None, None, status
+
+            needs_final_export_formats = bool(do_retexture or projection_settings["enabled"])
+            extra_formats = [f for f in export_formats if str(f).lower().strip() != "glb"]
+            if needs_final_export_formats and extra_formats:
+                _ = yield from _run_stage(
+                    "mesh_export_formats",
+                    {
+                        "mesh_path": str(final_glb_path),
+                        "out_dir": str(out_dir),
+                        "export_formats": extra_formats,
+                    },
+                    0.90,
+                    "Exporting additional formats…",
+                )
         except UserCancelled:
             _log("CANCELLED by user.", 0.0)
             yield None, None, status
@@ -4536,7 +5037,7 @@ def extract_glb(
     yield None, None, gr.update(value=_trim_status(status), visible=True)
 
     _log("Loading TRELLIS.2 pipeline…", 0.05)
-    pipe = get_image_pipeline()
+    pipe = get_image_pipeline(state.get("_model_variant") if isinstance(state, dict) else DEFAULT_MODEL_VARIANT)
     yield None, None, status
     
     _log("Decoding latent to mesh…", 0.15)
@@ -4727,6 +5228,20 @@ def extract_glb(
                 mesh_for_tex = mesh_for_tex.to_mesh()
 
             tex_pipe = get_texturing_pipeline()
+            runtime_settings = (state.get("_runtime_settings") if isinstance(state, dict) else None) or {}
+            tex_attention_backend = str(
+                (state.get("_gen_tex_params") or {}).get("attention_backend") if isinstance(state, dict) else ""
+            ).strip().lower() or str(runtime_settings.get("attention_backend") or DEFAULT_ATTENTION_BACKEND).strip().lower()
+            tex_sampler_type = normalize_sampler_type(
+                ((state.get("_gen_tex_params") or {}).get("sampler_type") if isinstance(state, dict) else None)
+                or runtime_settings.get("sampler_type")
+                or DEFAULT_SAMPLER_TYPE
+            )
+            _configure_texturing_pipeline_runtime(
+                tex_pipe,
+                attention_backend=tex_attention_backend,
+                sampler_type=tex_sampler_type,
+            )
             tex_pipe.low_vram = bool(ultrashape_low_vram)
 
             tex_res = int(res)
@@ -4749,12 +5264,13 @@ def extract_glb(
             mesh_for_tex = tex_pipe.preprocess_mesh(mesh_for_tex)
 
             torch.manual_seed(int(state.get("seed", 42) if isinstance(state, dict) else 42))
-            cond = tex_pipe.get_cond([tex_ref], 512 if tex_res == 512 else 1024)
-            shape_slat_tex = tex_pipe.encode_shape_slat(mesh_for_tex, tex_res)
-            tex_model = tex_pipe.models["tex_slat_flow_model_512"] if tex_res == 512 else tex_pipe.models["tex_slat_flow_model_1024"]
-            tex_slat = tex_pipe.sample_tex_slat(cond, tex_model, shape_slat_tex, tex_params)
-            pbr_voxel = tex_pipe.decode_tex_slat(tex_slat)
-            glb = tex_pipe.postprocess_mesh(mesh_for_tex, pbr_voxel, tex_res, int(texture_size))
+            with torch.inference_mode():
+                cond = tex_pipe.get_cond([tex_ref], 512 if tex_res == 512 else 1024)
+                shape_slat_tex = tex_pipe.encode_shape_slat(mesh_for_tex, tex_res)
+                tex_model = tex_pipe.models["tex_slat_flow_model_512"] if tex_res == 512 else tex_pipe.models["tex_slat_flow_model_1024"]
+                tex_slat = tex_pipe.sample_tex_slat(cond, tex_model, shape_slat_tex, tex_params)
+                pbr_voxel = tex_pipe.decode_tex_slat(tex_slat)
+                glb = tex_pipe.postprocess_mesh(mesh_for_tex, pbr_voxel, tex_res, int(texture_size))
             final_has_textures = True
             final_texture_source = "retexture_pass"
 
@@ -4853,6 +5369,8 @@ def shapeimage_to_tex(
     tex_slat_sampling_steps: int,
     tex_slat_rescale_t: float,
     low_vram: bool,
+    attention_backend: str,
+    sampler_type: str,
     subprocess_mode: bool,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
@@ -4875,6 +5393,10 @@ def shapeimage_to_tex(
         raise gr.Error("Please upload a mesh file (or use the example).")
     if image is None:
         raise gr.Error("Please provide a reference image (or use the example).")
+    requested_attention_backend = str(attention_backend or DEFAULT_ATTENTION_BACKEND).strip().lower()
+    requested_sampler_type = normalize_sampler_type(sampler_type)
+    runtime_cfg = apply_runtime_backends(requested_attention_backend)
+    runtime_cfg["sampler_type"] = requested_sampler_type
 
     if subprocess_mode:
         # Unload any global pipelines to free VRAM for subprocess
@@ -4908,17 +5430,31 @@ def shapeimage_to_tex(
                 "seed": int(seed),
                 "resolution": int(resolution),
                 "texture_size": int(texture_size),
+                "attention_backend": requested_attention_backend,
+                "dense_attention_backend": runtime_cfg["dense_backend"],
+                "sparse_attention_backend": runtime_cfg["sparse_backend"],
+                "sampler_type": requested_sampler_type,
                 "tex_params": {
                     "steps": int(tex_slat_sampling_steps),
                     "guidance_strength": float(tex_slat_guidance_strength),
                     "guidance_rescale": float(tex_slat_guidance_rescale),
                     "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
                     "rescale_t": float(tex_slat_rescale_t),
+                    "attention_backend": requested_attention_backend,
+                    "sampler_type": requested_sampler_type,
                 },
             },
         )
 
         _log(f"Subprocess mode ON. Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.02)
+        _log(
+            "Runtime settings: "
+            f"requested_backend={requested_attention_backend}, "
+            f"dense_backend={runtime_cfg['dense_backend']}, "
+            f"sparse_backend={runtime_cfg['sparse_backend']}, "
+            f"sampler={requested_sampler_type}",
+            0.02,
+        )
         yield None, None, status
 
         # Define intermediate paths
@@ -4941,6 +5477,8 @@ def shapeimage_to_tex(
             "config_file": "texturing_pipeline.json",
             "seed": int(seed),
             "resolution": int(resolution),
+            "attention_backend": requested_attention_backend,
+            "sampler_type": requested_sampler_type,
         }
 
         last_ui_update = 0.0
@@ -5082,21 +5620,40 @@ def shapeimage_to_tex(
             "seed": int(seed),
             "resolution": int(resolution),
             "texture_size": int(texture_size),
+            "attention_backend": requested_attention_backend,
+            "dense_attention_backend": runtime_cfg["dense_backend"],
+            "sparse_attention_backend": runtime_cfg["sparse_backend"],
+            "sampler_type": requested_sampler_type,
             "tex_params": {
                 "steps": int(tex_slat_sampling_steps),
                 "guidance_strength": float(tex_slat_guidance_strength),
                 "guidance_rescale": float(tex_slat_guidance_rescale),
                 "guidance_interval": [float(tex_slat_guidance_interval_start), float(tex_slat_guidance_interval_end)],
                 "rescale_t": float(tex_slat_rescale_t),
+                "attention_backend": requested_attention_backend,
+                "sampler_type": requested_sampler_type,
             },
         },
     )
 
     _log(f"Run: {run_id} → {safe_relpath(run_dir, APP_DIR)}", 0.0)
+    _log(
+        "Runtime settings: "
+        f"requested_backend={requested_attention_backend}, "
+        f"dense_backend={runtime_cfg['dense_backend']}, "
+        f"sparse_backend={runtime_cfg['sparse_backend']}, "
+        f"sampler={requested_sampler_type}",
+        0.0,
+    )
     yield None, None, status
 
     _log("Loading texturing pipeline (first run can take a while)…", 0.05)
     pipe = get_texturing_pipeline()
+    runtime_cfg = _configure_texturing_pipeline_runtime(
+        pipe,
+        attention_backend=requested_attention_backend,
+        sampler_type=requested_sampler_type,
+    )
     pipe.low_vram = low_vram  # Respect user's low VRAM setting
     yield None, None, status
 
@@ -5128,26 +5685,31 @@ def shapeimage_to_tex(
     mesh = pipe.preprocess_mesh(mesh)
     yield None, None, status
 
-    torch.manual_seed(seed)
     _log(f"Computing image embeddings ({512 if res_int == 512 else 1024}px)…", 0.3)
-    cond = pipe.get_cond([image], 512) if res_int == 512 else pipe.get_cond([image], 1024)
+    torch.manual_seed(seed)
+    with torch.inference_mode():
+        cond = pipe.get_cond([image], 512) if res_int == 512 else pipe.get_cond([image], 1024)
     yield None, None, status
 
     _log("Encoding mesh to shape latent…", 0.4)
-    shape_slat = pipe.encode_shape_slat(mesh, res_int)
+    with torch.inference_mode():
+        shape_slat = pipe.encode_shape_slat(mesh, res_int)
     yield None, None, status
 
     tex_model = pipe.models["tex_slat_flow_model_512"] if res_int == 512 else pipe.models["tex_slat_flow_model_1024"]
     _log("Sampling texture latent…", 0.55)
-    tex_slat = pipe.sample_tex_slat(cond, tex_model, shape_slat, tex_params)
+    with torch.inference_mode():
+        tex_slat = pipe.sample_tex_slat(cond, tex_model, shape_slat, tex_params)
     yield None, None, status
 
     _log("Decoding texture latent…", 0.72)
-    pbr_voxel = pipe.decode_tex_slat(tex_slat)
+    with torch.inference_mode():
+        pbr_voxel = pipe.decode_tex_slat(tex_slat)
     yield None, None, status
 
     _log("Baking textures onto mesh…", 0.84)
-    output = pipe.postprocess_mesh(mesh, pbr_voxel, res_int, texture_size)
+    with torch.inference_mode():
+        output = pipe.postprocess_mesh(mesh, pbr_voxel, res_int, texture_size)
     yield None, None, status
 
     _log("Saving textured GLB…", 0.9)
@@ -5468,6 +6030,55 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                         value=True,
                         info="Run a separate final TRELLIS texturing pass on the cleaned extracted mesh. Improves texture/mesh alignment after remesh/simplify; slower runtime. Runs as staged subprocesses."
                     )
+                    projection_texture_refine = gr.Checkbox(
+                        label="Projection Texture Refinement (Extract GLB)",
+                        value=False,
+                        info="Project the input view images onto the cleaned extracted mesh using camera angles. Best for 2-6 known views. Overrides Deferred Texture Rebuild when enabled.",
+                    )
+                    with gr.Accordion("Projection Texture Settings", open=False):
+                        projection_view_azimuths = gr.Textbox(
+                            label="Projection View Azimuths",
+                            value="",
+                            placeholder="e.g. 0,180,90,270",
+                            info="Comma-separated azimuth angles in degrees matching uploaded image order. Leave blank to use default view orders for 1, 2, 4, or 6 images.",
+                        )
+                        projection_view_elevations = gr.Textbox(
+                            label="Projection View Elevations",
+                            value="",
+                            placeholder="e.g. 0,0,0,0",
+                            info="Comma-separated elevation angles in degrees matching uploaded image order. Leave blank to use the default preset with front/back/side/top/bottom assumptions.",
+                        )
+                        with gr.Row():
+                            projection_blend_exponent = gr.Slider(
+                                0.5,
+                                8.0,
+                                label="Projection Blend Exponent",
+                                value=2.0,
+                                step=0.5,
+                                info="Higher values favor the most front-facing camera for each texel; lower values blend views more evenly.",
+                            )
+                            projection_ortho_scale = gr.Slider(
+                                0.5,
+                                2.5,
+                                label="Projection Ortho Scale",
+                                value=1.1,
+                                step=0.05,
+                                info="Approximate orthographic camera framing used when mapping views back to the mesh. Increase if projections look cropped.",
+                            )
+                        with gr.Row():
+                            projection_fill_holes = gr.Checkbox(
+                                label="Fill Projection Holes",
+                                value=True,
+                                info="Inpaint uncovered texels and add seam padding after projection.",
+                            )
+                            projection_max_hole_size = gr.Slider(
+                                0,
+                                256,
+                                label="Projection Max Hole Size",
+                                value=20,
+                                step=1,
+                                info="Limit internal-hole filling to patches at or below this size. Set 0 to fill all internal holes.",
+                            )
                     texture_size = gr.Slider(1024, 4096, label="Texture Size (Extract GLB)", value=4096, step=1024, info="Resolution of baked texture maps (albedo, normal, etc). Higher = sharper textures. ⬆Quality ⬆VRAM during baking.")
                     export_formats = gr.CheckboxGroup(
                         choices=["glb", "gltf", "obj", "ply", "stl"],
@@ -5563,6 +6174,25 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                         label="Low VRAM Mode",
                                         value=False,
                                         info="Move models between CPU/GPU during generation. Reduces VRAM usage but slower and may reduce quality. Disable for best results."
+                                    )
+                                with gr.Row():
+                                    model_variant = gr.Dropdown(
+                                        MODEL_VARIANT_CHOICES,
+                                        label="Model Weights",
+                                        value=DEFAULT_MODEL_VARIANT,
+                                        info="standard uses the Microsoft BF16/FP16 checkpoints. fp8 uses the external FP8 checkpoint pack for lower VRAM and faster generation, but outputs are not numerically identical.",
+                                    )
+                                    attention_backend = gr.Dropdown(
+                                        ATTENTION_BACKEND_CHOICES,
+                                        label="Attention Backend",
+                                        value=DEFAULT_ATTENTION_BACKEND,
+                                        info="auto picks the best dense attention backend and a compatible sparse fallback. sdpa is supported for dense attention; sparse attention will safely fall back when needed.",
+                                    )
+                                    sampler_type = gr.Dropdown(
+                                        SAMPLER_TYPE_CHOICES,
+                                        label="Sampler",
+                                        value=DEFAULT_SAMPLER_TYPE,
+                                        info="Heun is the default generate sampler. Euler, RK4, and RK5 are available for speed or higher-order integration tradeoffs.",
                                     )
                                 with gr.Row():
                                     use_chunked_processing = gr.Checkbox(
@@ -5829,8 +6459,11 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     ss_rescale_t,
                     force_high_res_conditional,
                     low_vram,
-                    use_chunked_processing,
-                    use_tiled_extraction,
+                    model_variant,
+                    attention_backend,
+                    sampler_type,
+                    extract_use_chunked_processing,
+                    extract_use_tiled_extraction,
                     shape_slat_guidance_strength,
                     shape_slat_guidance_rescale,
                     shape_slat_guidance_interval_start,
@@ -5844,6 +6477,13 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     tex_slat_sampling_steps,
                     tex_slat_rescale_t,
                     no_texture_gen,
+                    projection_texture_refine,
+                    projection_view_azimuths,
+                    projection_view_elevations,
+                    projection_blend_exponent,
+                    projection_ortho_scale,
+                    projection_fill_holes,
+                    projection_max_hole_size,
                     max_num_tokens,
                     multiview_mode,
                     subprocess_mode,
@@ -5869,6 +6509,13 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     simplify_method,
                     no_texture_gen,
                     deferred_texture_after_cleanup,
+                    projection_texture_refine,
+                    projection_view_azimuths,
+                    projection_view_elevations,
+                    projection_blend_exponent,
+                    projection_ortho_scale,
+                    projection_fill_holes,
+                    projection_max_hole_size,
                     prune_invisible_faces,
                     export_formats,
                     extract_use_chunked_processing,
@@ -6078,6 +6725,9 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     ss_rescale_t,
                     force_high_res_conditional,
                     low_vram,
+                    model_variant,
+                    attention_backend,
+                    sampler_type,
                     use_chunked_processing,
                     use_tiled_extraction,
                     shape_slat_guidance_strength,
@@ -6094,6 +6744,13 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     tex_slat_rescale_t,
                     no_texture_gen,
                     deferred_texture_after_cleanup,
+                    projection_texture_refine,
+                    projection_view_azimuths,
+                    projection_view_elevations,
+                    projection_blend_exponent,
+                    projection_ortho_scale,
+                    projection_fill_holes,
+                    projection_max_hole_size,
                     max_num_tokens,
                     multiview_mode,
                     decimation_target,
@@ -6145,6 +6802,19 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                                 label="Low VRAM Mode",
                                 value=True,
                                 info="Move models between CPU/GPU during generation. Reduces VRAM usage. Recommended enabled for texturing to avoid OOM errors."
+                            )
+                        with gr.Row():
+                            tex_attention_backend = gr.Dropdown(
+                                ATTENTION_BACKEND_CHOICES,
+                                label="Attention Backend",
+                                value=DEFAULT_ATTENTION_BACKEND,
+                                info="auto picks the best dense backend and a compatible sparse fallback for texturing stages.",
+                            )
+                            tex_sampler_type = gr.Dropdown(
+                                SAMPLER_TYPE_CHOICES,
+                                label="Sampler",
+                                value=DEFAULT_SAMPLER_TYPE,
+                                info="Heun is the default texturing sampler. Euler, RK4, and RK5 remain available.",
                             )
                         with gr.Row():
                             t_guidance_strength = gr.Slider(1.0, 10.0, label="Guidance Strength", value=1.0, step=0.1)
@@ -6313,6 +6983,8 @@ Generate a 3D asset from an image, export as GLB, and optionally texture an exis
                     t_sampling_steps,
                     t_rescale_t,
                     tex_low_vram,
+                    tex_attention_backend,
+                    tex_sampler_type,
                     subprocess_mode,
                 ],
                 outputs=[textured_glb_output, textured_download_btn, tex_status_box],
@@ -7022,6 +7694,13 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         ("image_to_3d", "prune_invisible_faces"),
         ("image_to_3d", "no_texture_gen"),
         ("image_to_3d", "deferred_texture_after_cleanup"),
+        ("image_to_3d", "projection_texture_refine"),
+        ("image_to_3d", "projection_view_azimuths"),
+        ("image_to_3d", "projection_view_elevations"),
+        ("image_to_3d", "projection_blend_exponent"),
+        ("image_to_3d", "projection_ortho_scale"),
+        ("image_to_3d", "projection_fill_holes"),
+        ("image_to_3d", "projection_max_hole_size"),
         ("image_to_3d", "texture_size"),
         ("image_to_3d", "export_formats"),
         ("image_to_3d", "ss_guidance_strength"),
@@ -7032,6 +7711,9 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         ("image_to_3d", "ss_rescale_t"),
         ("image_to_3d", "force_high_res_conditional"),
         ("image_to_3d", "low_vram"),
+        ("image_to_3d", "model_variant"),
+        ("image_to_3d", "attention_backend"),
+        ("image_to_3d", "sampler_type"),
         ("image_to_3d", "use_chunked_processing"),
         ("image_to_3d", "use_tiled_extraction"),
         ("image_to_3d", "extract_use_chunked_processing"),
@@ -7080,6 +7762,8 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         ("texturing", "sampling_steps"),
         ("texturing", "rescale_t"),
         ("texturing", "low_vram"),
+        ("texturing", "attention_backend"),
+        ("texturing", "sampler_type"),
         ("ultrashape_refine", "seed"),
         ("ultrashape_refine", "randomize_seed"),
         ("ultrashape_refine", "output_format"),
@@ -7119,6 +7803,13 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         prune_invisible_faces,
         no_texture_gen,
         deferred_texture_after_cleanup,
+        projection_texture_refine,
+        projection_view_azimuths,
+        projection_view_elevations,
+        projection_blend_exponent,
+        projection_ortho_scale,
+        projection_fill_holes,
+        projection_max_hole_size,
         texture_size,
         export_formats,
         ss_guidance_strength,
@@ -7129,6 +7820,9 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         ss_rescale_t,
         force_high_res_conditional,
         low_vram,
+        model_variant,
+        attention_backend,
+        sampler_type,
         use_chunked_processing,
         use_tiled_extraction,
         extract_use_chunked_processing,
@@ -7177,6 +7871,8 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         t_sampling_steps,
         t_rescale_t,
         tex_low_vram,
+        tex_attention_backend,
+        tex_sampler_type,
         us_seed,
         us_randomize_seed,
         us_output_format,
@@ -7241,6 +7937,16 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
             merged["image_to_3d"]["ultrashape_dtype"] = defaults["image_to_3d"]["ultrashape_dtype"]
         if merged["image_to_3d"].get("multiview_mode") not in {"stochastic", "multidiffusion"}:
             merged["image_to_3d"]["multiview_mode"] = defaults["image_to_3d"]["multiview_mode"]
+        if merged["image_to_3d"].get("model_variant") not in MODEL_VARIANT_CHOICES:
+            merged["image_to_3d"]["model_variant"] = defaults["image_to_3d"]["model_variant"]
+        if merged["image_to_3d"].get("attention_backend") not in ATTENTION_BACKEND_CHOICES:
+            merged["image_to_3d"]["attention_backend"] = defaults["image_to_3d"]["attention_backend"]
+        if merged["image_to_3d"].get("sampler_type") not in SAMPLER_TYPE_CHOICES:
+            merged["image_to_3d"]["sampler_type"] = defaults["image_to_3d"]["sampler_type"]
+        if merged["texturing"].get("attention_backend") not in ATTENTION_BACKEND_CHOICES:
+            merged["texturing"]["attention_backend"] = defaults["texturing"]["attention_backend"]
+        if merged["texturing"].get("sampler_type") not in SAMPLER_TYPE_CHOICES:
+            merged["texturing"]["sampler_type"] = defaults["texturing"]["sampler_type"]
 
         # UltraShape tab output format / export formats / dtype
         if merged["ultrashape_refine"].get("output_format") not in {"glb", "obj", "ply", "stl"}:
@@ -7262,6 +7968,24 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
                 v = float(d)
             return max(0.0, min(1.0, v))
 
+        def _coerce_float(v, d, min_value: Optional[float] = None):
+            try:
+                v = float(v)
+            except Exception:
+                v = float(d)
+            if min_value is not None:
+                v = max(min_value, v)
+            return v
+
+        def _coerce_int(v, d, min_value: Optional[int] = None):
+            try:
+                v = int(v)
+            except Exception:
+                v = int(d)
+            if min_value is not None:
+                v = max(min_value, v)
+            return v
+
         def _fix_interval(section: str, start_key: str, end_key: str) -> None:
             s = _clamp01(merged[section].get(start_key), defaults[section][start_key])
             e = _clamp01(merged[section].get(end_key), defaults[section][end_key])
@@ -7274,6 +7998,21 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         _fix_interval("image_to_3d", "shape_slat_guidance_interval_start", "shape_slat_guidance_interval_end")
         _fix_interval("image_to_3d", "tex_slat_guidance_interval_start", "tex_slat_guidance_interval_end")
         _fix_interval("texturing", "guidance_interval_start", "guidance_interval_end")
+        merged["image_to_3d"]["projection_blend_exponent"] = _coerce_float(
+            merged["image_to_3d"].get("projection_blend_exponent"),
+            defaults["image_to_3d"]["projection_blend_exponent"],
+            0.1,
+        )
+        merged["image_to_3d"]["projection_ortho_scale"] = _coerce_float(
+            merged["image_to_3d"].get("projection_ortho_scale"),
+            defaults["image_to_3d"]["projection_ortho_scale"],
+            0.05,
+        )
+        merged["image_to_3d"]["projection_max_hole_size"] = _coerce_int(
+            merged["image_to_3d"].get("projection_max_hole_size"),
+            defaults["image_to_3d"]["projection_max_hole_size"],
+            0,
+        )
 
         return [merged[s][k] for (s, k) in _CONFIG_KEYS]
 

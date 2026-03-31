@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_module
+from ...modules.utils import convert_module_to_f16, convert_module_to_f32, convert_module_to_fp8, zero_module
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
 
@@ -338,13 +338,15 @@ class SparseUnetVaeEncoder(nn.Module):
         down_block_type: List[str],
         block_args: List[Dict[str, Any]],
         use_fp16: bool = False,
+        use_fp8: bool = False,
     ):
         super().__init__()
         self.in_channels = in_channels
         self.model_channels = model_channels
         self.num_blocks = num_blocks
-        self.dtype = torch.float16 if use_fp16 else torch.float32
-        self.dtype = torch.float16 if use_fp16 else torch.float32
+        self.use_fp16 = use_fp16
+        self.use_fp8 = use_fp8
+        self.dtype = torch.bfloat16 if use_fp8 else (torch.float16 if use_fp16 else torch.float32)
 
         self.input_layer = sp.SparseLinear(in_channels, model_channels[0])
         self.to_latent = sp.SparseLinear(model_channels[-1], 2 * latent_channels)
@@ -369,7 +371,9 @@ class SparseUnetVaeEncoder(nn.Module):
                 )
                 
         self.initialize_weights()
-        if use_fp16:
+        if use_fp8:
+            self.convert_to_fp8()
+        elif use_fp16:
             self.convert_to_fp16()
 
     @property
@@ -383,12 +387,24 @@ class SparseUnetVaeEncoder(nn.Module):
         """
         Convert the torso of the model to float16.
         """
+        self.use_fp16 = True
+        self.use_fp8 = False
+        self.dtype = torch.float16
         self.blocks.apply(convert_module_to_f16)
+
+    def convert_to_fp8(self) -> None:
+        self.use_fp16 = False
+        self.use_fp8 = True
+        self.dtype = torch.bfloat16
+        self.blocks.apply(convert_module_to_fp8)
 
     def convert_to_fp32(self) -> None:
         """
         Convert the torso of the model to float32.
         """
+        self.use_fp16 = False
+        self.use_fp8 = False
+        self.dtype = torch.float32
         self.blocks.apply(convert_module_to_f32)
 
     def initialize_weights(self) -> None:
@@ -440,14 +456,16 @@ class SparseUnetVaeDecoder(nn.Module):
         block_args: List[Dict[str, Any]],
         use_fp16: bool = False,
         pred_subdiv: bool = True,
+        use_fp8: bool = False,
     ):
         super().__init__()
         self.out_channels = out_channels
         self.model_channels = model_channels
         self.num_blocks = num_blocks
         self.use_fp16 = use_fp16
+        self.use_fp8 = use_fp8
         self.pred_subdiv = pred_subdiv
-        self.dtype = torch.float16 if use_fp16 else torch.float32
+        self.dtype = torch.bfloat16 if use_fp8 else (torch.float16 if use_fp16 else torch.float32)
         self._low_vram = False
         
         self.output_layer = sp.SparseLinear(model_channels[-1], out_channels)
@@ -474,7 +492,9 @@ class SparseUnetVaeDecoder(nn.Module):
                 )
                     
         self.initialize_weights()
-        if use_fp16:
+        if use_fp8:
+            self.convert_to_fp8()
+        elif use_fp16:
             self.convert_to_fp16()
             
     @property
@@ -504,12 +524,24 @@ class SparseUnetVaeDecoder(nn.Module):
         """
         Convert the torso of the model to float16.
         """
+        self.use_fp16 = True
+        self.use_fp8 = False
+        self.dtype = torch.float16
         self.blocks.apply(convert_module_to_f16)
+
+    def convert_to_fp8(self) -> None:
+        self.use_fp16 = False
+        self.use_fp8 = True
+        self.dtype = torch.bfloat16
+        self.blocks.apply(convert_module_to_fp8)
 
     def convert_to_fp32(self) -> None:
         """
         Convert the torso of the model to float32.
         """
+        self.use_fp16 = False
+        self.use_fp8 = False
+        self.dtype = torch.float32
         self.blocks.apply(convert_module_to_f32)
 
     def initialize_weights(self) -> None:

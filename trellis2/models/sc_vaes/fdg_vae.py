@@ -30,6 +30,7 @@ class FlexiDualGridVaeEncoder(SparseUnetVaeEncoder):
         down_block_type: List[str],
         block_args: List[Dict[str, Any]],
         use_fp16: bool = False,
+        use_fp8: bool = False,
     ):
         super().__init__(
             6,
@@ -40,6 +41,7 @@ class FlexiDualGridVaeEncoder(SparseUnetVaeEncoder):
             down_block_type,
             block_args,
             use_fp16,
+            use_fp8,
         )
         
     def forward(self, vertices: sp.SparseTensor, intersected: sp.SparseTensor, sample_posterior=False, return_raw=False):
@@ -62,6 +64,7 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
         block_args: List[Dict[str, Any]],
         voxel_margin: float = 0.5,
         use_fp16: bool = False,
+        use_fp8: bool = False,
     ):
         self.resolution = resolution
         self.voxel_margin = voxel_margin
@@ -76,7 +79,8 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
             block_type,
             up_block_type,
             block_args,
-            use_fp16,
+            use_fp16=use_fp16,
+            use_fp8=use_fp8,
         )
 
     def set_resolution(self, resolution: int) -> None:
