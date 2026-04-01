@@ -24,6 +24,13 @@ MAX_SEED = np.iinfo(np.int32).max
 TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
 
 
+def _example_image_sort_key(name: str):
+    stem = os.path.splitext(name)[0].lower()
+    if stem.startswith("image") and stem[5:].isdigit():
+        return (0, int(stem[5:]), stem)
+    return (1, 0, stem)
+
+
 def _is_faithful_contouring_available() -> bool:
     """
     `faithful_contouring` remeshing in `o_voxel.postprocess.to_glb()` depends on optional
@@ -870,7 +877,7 @@ with gr.Blocks(delete_cache=(600, 600)) as demo:
             examples = gr.Examples(
                 examples=[
                     f'assets/example_image/{image}'
-                    for image in os.listdir("assets/example_image")
+                    for image in sorted(os.listdir("assets/example_image"), key=_example_image_sort_key)
                 ],
                 inputs=[image_prompt],
                 fn=preprocess_image,

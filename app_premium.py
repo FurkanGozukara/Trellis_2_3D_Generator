@@ -21,6 +21,13 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 _O_VOXEL_SRC_DIR = os.path.join(APP_DIR, "o-voxel")
 
 
+def _example_image_sort_key(name: str) -> tuple[int, int, str]:
+    stem = os.path.splitext(name)[0].lower()
+    if stem.startswith("image") and stem[5:].isdigit():
+        return (0, int(stem[5:]), stem)
+    return (1, 0, stem)
+
+
 def _ensure_o_voxel_available() -> None:
     """
     TRELLIS.2 depends on the CUDA extension package `o_voxel`.
@@ -6210,7 +6217,7 @@ with gr.Blocks(
         # ---------------------------- Tab 1: Image -> 3D ----------------------------
         with gr.Tab("Image → 3D"):
             with gr.Row():
-                with gr.Column(scale=1, min_width=380):
+                with gr.Column(scale=1, min_width=380, elem_id="image_input_panel"):
                     input_images = gr.Files(
                         label="Upload Input Image (Or Multi-Angle)",
                         file_types=["image"],
@@ -6325,6 +6332,24 @@ with gr.Blocks(
                         label="Export Formats (Extract GLB)",
                     )
                     with gr.Accordion("Config Presets (Save / Load)", open=True):
+                        example_image_dir = os.path.join(APP_DIR, "assets", "example_image")
+                        example_image_paths = [
+                            os.path.join(example_image_dir, image)
+                            for image in sorted(os.listdir(example_image_dir), key=_example_image_sort_key)
+                            if os.path.isfile(os.path.join(example_image_dir, image))
+                        ]
+
+                        def _load_image_example(sample: Any):
+                            if not sample:
+                                return None
+                            if isinstance(sample, (list, tuple)):
+                                path = sample[0] if sample else None
+                            else:
+                                path = sample
+                            if not path:
+                                return None
+                            return [str(path)]
+
                         gr.Markdown(
                             "Saves/loads **all settings** from Image->3D, Texturing, UltraShape Refine, and Rigging tabs (uploaded images/files are not included)."
                         )
@@ -6346,6 +6371,25 @@ with gr.Blocks(
                             ui_preset_reset_btn = gr.Button("🔄 Reset Defaults", variant="secondary", scale=1)
                             ui_preset_delete_btn = gr.Button("Delete", variant="stop", scale=1)
                         ui_preset_status = gr.Markdown("")
+                        gr.Markdown(
+                            "### Input Examples\nClick a thumbnail to load it as the current input and jump back to the top input area."
+                        )
+                        image_examples = gr.Dataset(
+                            components=[
+                                gr.Image(
+                                    type="filepath",
+                                    show_label=False,
+                                    container=False,
+                                    height=140,
+                                    interactive=False,
+                                    buttons=[],
+                                )
+                            ],
+                            samples=[[path] for path in example_image_paths],
+                            samples_per_page=24,
+                            show_label=False,
+                            container=False,
+                        )
 
                 with gr.Column(scale=3, min_width=680):
                     with gr.Walkthrough(selected=0) as walkthrough:
@@ -6635,16 +6679,6 @@ with gr.Blocks(
                                 download_btn = gr.DownloadButton(label="Download GLB", variant="primary")
                                 open_outputs_btn = gr.Button("Open outputs folder", variant="secondary")
 
-            gr.Markdown("### Examples")
-            examples = gr.Examples(
-                examples=[
-                    [os.path.join(APP_DIR, "assets", "example_image", image)]
-                    for image in os.listdir(os.path.join(APP_DIR, "assets", "example_image"))
-                ],
-                inputs=[input_images],
-                examples_per_page=18,
-            )
-
             output_buf = gr.State()
             # State to track logs visibility (starts as visible during generation)
             logs_visible_state = gr.State(True)
@@ -6675,6 +6709,28 @@ with gr.Blocks(
                 _update_uploaded_input_preview,
                 inputs=[input_images],
                 outputs=[input_preview_single, input_preview_gallery, input_upload_status],
+            )
+            image_examples.click(
+                None,
+                inputs=[],
+                outputs=[],
+                js="""() => {
+                    const target = document.getElementById("image_input_panel");
+                    if (target) {
+                        window.setTimeout(() => {
+                            target.scrollIntoView({ behavior: "smooth", block: "start" });
+                        }, 0);
+                    }
+                }""",
+                queue=False,
+                api_visibility="private",
+            )
+            image_examples.click(
+                _load_image_example,
+                inputs=[image_examples],
+                outputs=[input_images],
+                show_progress="hidden",
+                queue=False,
             )
             input_images.change(
                 _reset_image_to_3d_ui,
