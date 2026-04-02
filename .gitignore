@@ -93,6 +93,8 @@ cover/
 
 # Django stuff:
 *.log
+presets
+checktre2
 local_settings.py
 db.sqlite3
 db.sqlite3-journal

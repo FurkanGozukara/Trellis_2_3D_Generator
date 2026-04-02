@@ -77,7 +77,7 @@ from datetime import datetime
 import shutil
 import base64
 import io
-from typing import Tuple, Optional, Dict, List, Any, Set
+from typing import Tuple, Optional, Dict, List, Any, Set, Callable
 
 import cv2
 import numpy as np
@@ -119,6 +119,13 @@ def _has_nvdiffrec_render() -> bool:
         return False
 
 
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+
 def _is_faithful_contouring_available() -> bool:
     """
     `faithful_contouring` remeshing in `o_voxel.postprocess.to_glb()` depends on optional
@@ -136,9 +143,111 @@ def _is_faithful_contouring_available() -> bool:
         return False
 
 
+def _is_meshlib_available() -> bool:
+    try:
+        import meshlib.mrmeshpy  # noqa: F401
+        import meshlib.mrmeshnumpy  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _is_pymeshfix_available() -> bool:
+    try:
+        import pymeshfix  # noqa: F401
+        import pyvista  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _has_dual_contouring_vb() -> bool:
+    try:
+        import cumesh
+
+        return hasattr(cumesh.remeshing, "reconstruct_mesh_dc")
+    except Exception:
+        return False
+
+
 REMESH_METHOD_CHOICES = ["dual_contouring"]
+if _has_dual_contouring_vb():
+    REMESH_METHOD_CHOICES.append("dual_contouring_vb")
 if _is_faithful_contouring_available():
     REMESH_METHOD_CHOICES.append("faithful_contouring")
+
+SIMPLIFY_METHOD_CHOICES = ["cumesh"]
+if _is_meshlib_available():
+    SIMPLIFY_METHOD_CHOICES.append("meshlib")
+SIMPLIFY_METHOD_CHOICES.append("none")
+
+REPAIR_METHOD_CHOICES = ["disabled", "cumesh"]
+if _is_meshlib_available():
+    REPAIR_METHOD_CHOICES.append("meshlib")
+if _is_pymeshfix_available():
+    REPAIR_METHOD_CHOICES.append("pymeshfix")
+
+PIPELINE_STRATEGY_CHOICES = ["reference_auto", "direct_1024", "hybrid_512g_1024t"]
+
+
+def _normalize_simplify_method(method: Optional[str]) -> str:
+    method_norm = str(method or "cumesh").strip().lower()
+    if method_norm not in SIMPLIFY_METHOD_CHOICES:
+        return "meshlib" if "meshlib" in SIMPLIFY_METHOD_CHOICES else "cumesh"
+    return method_norm
+
+
+def _normalize_repair_method(method: Optional[str]) -> str:
+    method_norm = str(method or "disabled").strip().lower()
+    if method_norm in {"", "none"}:
+        method_norm = "disabled"
+    if method_norm not in REPAIR_METHOD_CHOICES:
+        return "disabled"
+    return method_norm
+
+
+def _normalize_extract_methods(
+    *,
+    remesh_method: Optional[str],
+    simplify_method: Optional[str],
+    repair_method: Optional[str],
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> tuple[str, str, str]:
+    remesh_norm = str(remesh_method or "dual_contouring").strip().lower()
+    simplify_norm = _normalize_simplify_method(simplify_method)
+    repair_norm = _normalize_repair_method(repair_method)
+
+    if remesh_norm not in REMESH_METHOD_CHOICES:
+        if log_fn is not None:
+            log_fn(
+                f"Requested remesh method '{remesh_norm}' is unavailable in this environment. "
+                "Falling back to 'dual_contouring'."
+            )
+        remesh_norm = "dual_contouring"
+
+    if remesh_norm == "dual_contouring_vb" and not _has_dual_contouring_vb():
+        if log_fn is not None:
+            log_fn(
+                "Requested remesh_method='dual_contouring_vb' but the installed CuMesh build "
+                "does not expose reconstruct_mesh_dc. Falling back to 'dual_contouring'."
+            )
+        remesh_norm = "dual_contouring"
+
+    if simplify_norm == "meshlib" and not _is_meshlib_available():
+        if log_fn is not None:
+            log_fn("MeshLib is not installed. Falling back to simplify_method='cumesh'.")
+        simplify_norm = "cumesh"
+
+    if repair_norm == "meshlib" and not _is_meshlib_available():
+        if log_fn is not None:
+            log_fn("MeshLib is not installed. Disabling Extract GLB hole repair.")
+        repair_norm = "disabled"
+    if repair_norm == "pymeshfix" and not _is_pymeshfix_available():
+        if log_fn is not None:
+            log_fn("PyMeshFix is not installed. Disabling Extract GLB hole repair.")
+        repair_norm = "disabled"
+
+    return remesh_norm, simplify_norm, repair_norm
 
 
 # ------------------------------- Paths / Config ------------------------------
@@ -163,13 +272,15 @@ RIGGING_OUTPUTS_DIR = OUTPUTS_DIR
 os.environ.setdefault("TRELLIS_MODELS_DIR", MODELS_DIR)
 
 DEFAULT_SUBPROCESS_PYTHON = r"G:\Trellis2_v3\Trellis_2_3D_Generator\venv\Scripts\python.exe"
+LOCAL_SUBPROCESS_PYTHON = os.path.join(APP_DIR, "venv", "Scripts", "python.exe")
 
 
 def _resolve_subprocess_python() -> str:
     candidates = [
         os.environ.get("TRELLIS_SUBPROCESS_PYTHON"),
-        DEFAULT_SUBPROCESS_PYTHON,
+        LOCAL_SUBPROCESS_PYTHON,
         sys.executable,
+        DEFAULT_SUBPROCESS_PYTHON,
     ]
     for candidate in candidates:
         if candidate and os.path.isfile(candidate):
@@ -1017,10 +1128,12 @@ def _ui_preset_path(preset_name: str) -> Path:
 
 
 def _list_ui_presets() -> List[str]:
+    builtin = list(_builtin_ui_presets().keys())
     root = Path(PRESETS_DIR)
     if not root.exists():
-        return []
-    return sorted([p.stem for p in root.glob("*.json") if p.is_file()])
+        return builtin
+    saved = sorted([p.stem for p in root.glob("*.json") if p.is_file() and p.stem not in builtin])
+    return builtin + saved
 
 
 def _set_last_used_ui_preset(preset_name: str) -> None:
@@ -1039,7 +1152,9 @@ def _get_last_used_ui_preset() -> Optional[str]:
         return None
     try:
         name = path.read_text(encoding="utf-8").strip()
-        return name or None
+        if not name:
+            return None
+        return name if name in _list_ui_presets() else None
     except Exception:
         return None
 
@@ -1059,13 +1174,21 @@ def _default_ui_config() -> dict:
         },
         "image_to_3d": {
             "resolution": "1024",
+            "pipeline_strategy": "reference_auto",
             # Keep deterministic defaults (users can enable randomize for exploration).
             "seed": 99,
             "randomize_seed": False,
             "decimation_target": 1000000,
-            "remesh_method": "dual_contouring",
+            "remesh_method": ("dual_contouring_vb" if "dual_contouring_vb" in REMESH_METHOD_CHOICES else "dual_contouring"),
+            "fill_holes_max_perimeter": 0.03,
+            "repair_method": "meshlib" if "meshlib" in REPAIR_METHOD_CHOICES else "disabled",
             "simplify_method": "cumesh",
             "prune_invisible_faces": False,
+            "merge_vertices_dist": 0.0,
+            "shade_smooth": False,
+            "shade_smooth_angle": 35.0,
+            "force_double_sided": True,
+            "no_pbr_export": False,
             "no_texture_gen": False,
             "deferred_texture_after_cleanup": True,
             "texture_size": 4096,
@@ -1177,6 +1300,47 @@ def _default_ui_config() -> dict:
     }
 
 
+def _builtin_ui_presets() -> Dict[str, dict]:
+    best_cfg = _default_ui_config()
+    best_cfg["_meta"].update(
+        {
+            "builtin": True,
+            "preset_name": "best",
+            "description": "Best tested default preset.",
+        }
+    )
+
+    low_vram_cfg = _default_ui_config()
+    low_vram_cfg["_meta"].update(
+        {
+            "builtin": True,
+            "preset_name": "low_vram",
+            "description": "Lower-VRAM preset using the tested lower-memory export path plus chunked/tiled memory-saving switches.",
+        }
+    )
+    low_vram_cfg["image_to_3d"].update(
+        {
+            "low_vram": True,
+            "use_chunked_processing": True,
+            "use_tiled_extraction": True,
+            "extract_use_chunked_processing": True,
+            "extract_use_tiled_extraction": True,
+            "texture_size": 2048,
+        }
+    )
+    low_vram_cfg["texturing"].update(
+        {
+            "texture_size": 1024,
+            "low_vram": True,
+        }
+    )
+
+    return {
+        "best": best_cfg,
+        "low_vram": low_vram_cfg,
+    }
+
+
 def _merge_ui_config(cfg: Optional[dict]) -> dict:
     """
     Merge a loaded config with defaults so older presets still work after adding new params.
@@ -1202,6 +1366,8 @@ def _save_ui_preset(preset_name: str, config: dict) -> str:
         raise ValueError("Preset name cannot be empty.")
 
     safe_name = _sanitize_preset_name(str(preset_name).strip())
+    if safe_name in _builtin_ui_presets():
+        raise ValueError(f"Preset name '{safe_name}' is reserved for a built-in preset.")
     root = Path(PRESETS_DIR)
     root.mkdir(parents=True, exist_ok=True)
 
@@ -1225,6 +1391,10 @@ def _save_ui_preset(preset_name: str, config: dict) -> str:
 def _load_ui_preset(preset_name: str) -> Optional[dict]:
     if not preset_name:
         return None
+    builtin = _builtin_ui_presets().get(str(preset_name).strip())
+    if builtin is not None:
+        _set_last_used_ui_preset(str(preset_name).strip())
+        return _merge_ui_config(builtin)
     path = _ui_preset_path(preset_name)
     if not path.exists():
         return None
@@ -1238,6 +1408,8 @@ def _load_ui_preset(preset_name: str) -> Optional[dict]:
 
 def _delete_ui_preset(preset_name: str) -> bool:
     if not preset_name:
+        return False
+    if str(preset_name).strip() in _builtin_ui_presets():
         return False
     path = _ui_preset_path(preset_name)
     if not path.exists():
@@ -2781,6 +2953,7 @@ def batch_process_folder(
     seed: int,
     resolution: str,
     custom_resolution: int,
+    pipeline_strategy: str,
     ss_guidance_strength: float,
     ss_guidance_rescale: float,
     ss_guidance_interval_start: float,
@@ -2820,8 +2993,15 @@ def batch_process_folder(
     decimation_target: int,
     texture_size: int,
     remesh_method: str,
+    fill_holes_max_perimeter: float,
+    repair_method: str,
     simplify_method: str,
     prune_invisible_faces: bool,
+    merge_vertices_dist: float,
+    shade_smooth: bool,
+    shade_smooth_angle: float,
+    force_double_sided: bool,
+    no_pbr_export: bool,
     export_formats: List[str],
     ultrashape_enabled: bool,
     ultrashape_retexture_after_refine: bool,
@@ -2977,6 +3157,7 @@ def batch_process_folder(
                     int(run_seed),
                     resolution,
                     custom_resolution,
+                    pipeline_strategy,
                     ss_guidance_strength,
                     ss_guidance_rescale,
                     ss_guidance_interval_start,
@@ -2988,8 +3169,8 @@ def batch_process_folder(
                     model_variant,
                     attention_backend,
                     sampler_type,
-                    extract_use_chunked_processing,
-                    extract_use_tiled_extraction,
+                    use_chunked_processing,
+                    use_tiled_extraction,
                     shape_slat_guidance_strength,
                     shape_slat_guidance_rescale,
                     shape_slat_guidance_interval_start,
@@ -3037,6 +3218,8 @@ def batch_process_folder(
                     int(decimation_target),
                     int(texture_size),
                     str(remesh_method),
+                    float(fill_holes_max_perimeter),
+                    str(repair_method),
                     str(simplify_method),
                     bool(no_texture_gen),
                     bool(deferred_texture_after_cleanup),
@@ -3048,6 +3231,11 @@ def batch_process_folder(
                     bool(projection_fill_holes),
                     int(projection_max_hole_size),
                     bool(prune_invisible_faces),
+                    float(merge_vertices_dist),
+                    bool(shade_smooth),
+                    float(shade_smooth_angle),
+                    bool(force_double_sided),
+                    bool(no_pbr_export),
                     export_formats,
                     extract_use_chunked_processing,
                     extract_use_tiled_extraction,
@@ -3381,7 +3569,17 @@ def _render_preview_snapshots_incremental(
 
 # ------------------------------- Image -> 3D --------------------------------
 
-def _get_pipeline_type(resolution_str: str) -> tuple[str, int]:
+def _normalize_pipeline_strategy(strategy: Optional[str]) -> str:
+    strategy_norm = str(strategy or "reference_auto").strip().lower()
+    if strategy_norm in PIPELINE_STRATEGY_CHOICES:
+        return strategy_norm
+    return "reference_auto"
+
+
+def _get_pipeline_type(
+    resolution_str: str,
+    pipeline_strategy: Optional[str] = None,
+) -> tuple[str, int]:
     """
     Convert resolution string to pipeline type and target resolution.
     
@@ -3391,7 +3589,7 @@ def _get_pipeline_type(resolution_str: str) -> tuple[str, int]:
     Examples:
         "512" -> ("512", 512)
         "768" -> ("768_cascade", 768)
-        "1024" -> ("1024_cascade", 1024)
+        "1024" -> ("1024_cascade", 1024) by default
         "1280" -> ("1280_cascade", 1280)
         "1536" -> ("1536_cascade", 1536)
         "2048" -> ("2048_cascade", 2048)
@@ -3410,8 +3608,11 @@ def _get_pipeline_type(resolution_str: str) -> tuple[str, int]:
     if res == 512:
         return "512", 512
     elif res == 1024:
-        # IMPORTANT: Use the cascade pipeline at 1024 to match the reference app (trellis_org2),
-        # which generally yields higher-fidelity shapes/textures than the direct 1024 path.
+        strategy_norm = _normalize_pipeline_strategy(pipeline_strategy)
+        if strategy_norm == "direct_1024":
+            return "1024", 1024
+        if strategy_norm == "hybrid_512g_1024t":
+            return "512g_1024t", 1024
         return "1024_cascade", 1024
     else:
         # Any other resolution uses cascade
@@ -3423,6 +3624,7 @@ def image_to_3d(
     seed: int,
     resolution: str,
     custom_resolution: int,
+    pipeline_strategy: str,
     ss_guidance_strength: float,
     ss_guidance_rescale: float,
     ss_guidance_interval_start: float,
@@ -3526,6 +3728,14 @@ def image_to_3d(
         except Exception as e:
             raise gr.Error(f"Could not read multi-view image: {p} ({type(e).__name__}: {e})")
     use_multiview = len(source_images) > 1
+    pipeline_strategy_norm = _normalize_pipeline_strategy(pipeline_strategy)
+    if use_multiview and pipeline_strategy_norm == "hybrid_512g_1024t":
+        _log(
+            "Hybrid 512 geometry + 1024 texture mode is only supported for single-image Generate. "
+            "Falling back to reference_auto for multi-view Generate.",
+            0.0,
+        )
+        pipeline_strategy_norm = "reference_auto"
     projection_settings = {
         "enabled": bool(projection_texture_refine),
         "azimuths": [],
@@ -3554,7 +3764,7 @@ def image_to_3d(
     
     # Validate and get pipeline type
     try:
-        pipeline_type, target_res = _get_pipeline_type(resolution)
+        pipeline_type, target_res = _get_pipeline_type(resolution, pipeline_strategy_norm)
     except ValueError as e:
         raise gr.Error(str(e))
 
@@ -3629,6 +3839,7 @@ def image_to_3d(
                 "subprocess_mode": True,
                 "seed": int(seed),
                 "resolution": resolution,
+                "pipeline_strategy": pipeline_strategy_norm,
                 "pipeline_type": pipeline_type,
                 "multiview": bool(use_multiview),
                 "multiview_mode": mv_mode if use_multiview else None,
@@ -3758,6 +3969,7 @@ def image_to_3d(
                 "config_file": model_variant_cfg["config_file"],
                 "seed": int(seed),
                 "resolution": resolution,
+                "pipeline_strategy": pipeline_strategy_norm,
                 "image_paths": [str(p) for p in preprocessed_view_paths],
                 "shape_slat_path": str(shape_slat_path),
                 "out_res_path": str(shape_res_path),
@@ -3803,6 +4015,7 @@ def image_to_3d(
                 "config_file": model_variant_cfg["config_file"],
                 "image_path": str(preprocessed_path),
                 "resolution": resolution,
+                "pipeline_strategy": pipeline_strategy_norm,
                 "cond_512_path": str(cond_512_path),
                 "cond_1024_path": str(cond_1024_path) if cond_1024_path is not None else None,
                 "force_high_res_conditional": bool(force_high_res_conditional),
@@ -3826,6 +4039,7 @@ def image_to_3d(
                 "config_file": model_variant_cfg["config_file"],
                 "seed": int(seed),
                 "resolution": resolution,
+                "pipeline_strategy": pipeline_strategy_norm,
                 "cond_512_path": str(cond_512_path),
                 "coords_path": str(coords_path),
                 "force_high_res_conditional": bool(force_high_res_conditional),
@@ -3852,6 +4066,7 @@ def image_to_3d(
                 "config_file": model_variant_cfg["config_file"],
                 "seed": int(seed),
                 "resolution": resolution,
+                "pipeline_strategy": pipeline_strategy_norm,
                 "cond_512_path": str(cond_512_path),
                 "cond_1024_path": str(cond_1024_path) if cond_1024_path is not None else None,
                 "coords_path": str(coords_path),
@@ -3885,6 +4100,7 @@ def image_to_3d(
                     "config_file": model_variant_cfg["config_file"],
                     "seed": int(seed),
                     "resolution": resolution,
+                    "pipeline_strategy": pipeline_strategy_norm,
                     "cond_path": tex_cond_path,
                     "shape_slat_path": str(shape_slat_path),
                     "tex_slat_path": str(tex_slat_path),
@@ -4376,6 +4592,7 @@ def image_to_3d(
             state["_input_image_path"] = str(input_path)
             state["_preprocessed_image_path"] = str(preprocessed_path)
             state["_pipeline_type"] = pipeline_type
+            state["_pipeline_strategy"] = pipeline_strategy_norm
             state["seed"] = int(seed)
             state["shape_slat_path"] = str(shape_slat_path)
             state["tex_slat_path"] = str(tex_slat_path) if tex_slat_path is not None else None
@@ -4430,7 +4647,7 @@ def image_to_3d(
                 pass
         yield None, empty_html, status
 
-    # Sparse structure resolution: 32 for most cases, 64 for direct 1024 sampling
+    # Sparse structure resolution: direct 1024 uses 64; cascade and hybrid stay on 32.
     ss_res = 64 if pipeline_type == "1024" else 32
     _log("Stage 1/3: Sampling sparse structure…", 0.18)
     coords = pipe.sample_sparse_structure(cond_512, ss_res, 1, ss_params)
@@ -4440,6 +4657,24 @@ def image_to_3d(
         pass
     yield None, empty_html, status
 
+    if low_vram and coords.shape[0] > 24000 and pipeline_type in {"1024", "1024_cascade", "1536_cascade", "2048_cascade"}:
+        if "shape_slat_flow_model_512" in pipe.models:
+            _log(
+                f"Low VRAM safeguard: token count {coords.shape[0]} is high, "
+                "switching Generate to hybrid 512 geometry + 1024 texture mode.",
+                0.24,
+            )
+            coords = (coords // 2).unique(dim=0)
+            pipeline_type = "512g_1024t"
+            yield None, empty_html, status
+        else:
+            _log(
+                f"Low VRAM safeguard: token count {coords.shape[0]} is high, "
+                "but the 512 shape model is not loaded, so Generate will continue on the original pipeline.",
+                0.24,
+            )
+            yield None, empty_html, status
+
     if pipeline_type == "512":
         _log("Stage 2/3: Sampling shape latent (512)…", 0.35)
         shape_slat = pipe.sample_shape_slat(cond_512, pipe.models["shape_slat_flow_model_512"], coords, shape_params)
@@ -4448,6 +4683,20 @@ def image_to_3d(
         if not no_texture_gen:
             _log("Stage 3/3: Sampling texture latent (512)…", 0.55)
             tex_slat = pipe.sample_tex_slat(cond_512, pipe.models["tex_slat_flow_model_512"], shape_slat, tex_params)
+            yield None, empty_html, status
+        else:
+            _log("Stage 3/3: Skipping texture generation.", 0.55)
+            tex_slat = None
+            yield None, empty_html, status
+        res = 512
+    elif pipeline_type == "512g_1024t":
+        _log("Stage 2/3: Sampling shape latent (hybrid 512g + 1024t)…", 0.35)
+        shape_slat = pipe.sample_shape_slat(cond_512, pipe.models["shape_slat_flow_model_512"], coords, shape_params)
+        yield None, empty_html, status
+
+        if not no_texture_gen:
+            _log("Stage 3/3: Sampling texture latent (1024 hybrid)…", 0.55)
+            tex_slat = pipe.sample_tex_slat(cond_1024, pipe.models["tex_slat_flow_model_1024"], shape_slat, tex_params)
             yield None, empty_html, status
         else:
             _log("Stage 3/3: Skipping texture generation.", 0.55)
@@ -4633,6 +4882,7 @@ def image_to_3d(
         state["_preprocessed_image_path"] = str(preprocessed_path)
         state["_preprocessed_view_paths"] = _collect_preprocessed_view_paths(run_dir)
         state["_pipeline_type"] = pipeline_type
+        state["_pipeline_strategy"] = pipeline_strategy_norm
         state["seed"] = int(seed)
         state["shape_slat_path"] = str(shape_slat_path)
         state["tex_slat_path"] = str(tex_slat_path) if tex_slat_path is not None else None
@@ -4672,6 +4922,8 @@ def extract_glb(
     decimation_target: int,
     texture_size: int,
     remesh_method: str,
+    fill_holes_max_perimeter: float,
+    repair_method: str,
     simplify_method: str,
     no_texture_gen: bool,
     deferred_texture_after_cleanup: bool,
@@ -4683,6 +4935,11 @@ def extract_glb(
     projection_fill_holes: bool,
     projection_max_hole_size: int,
     prune_invisible_faces: bool,
+    merge_vertices_dist: float,
+    shade_smooth: bool,
+    shade_smooth_angle: float,
+    force_double_sided: bool,
+    no_pbr_export: bool,
     export_formats: List[str],
     extract_use_chunked_processing: bool,
     extract_use_tiled_extraction: bool,
@@ -4760,6 +5017,12 @@ def extract_glb(
         if "glb" not in export_formats:
             export_formats = ["glb"] + list(export_formats)
 
+        remesh_method, simplify_method, repair_method = _normalize_extract_methods(
+            remesh_method=remesh_method,
+            simplify_method=simplify_method,
+            repair_method=repair_method,
+            log_fn=_log,
+        )
         requested_remesh_method = str(remesh_method)
         remesh_fallback_reason: Optional[str] = None
         if requested_remesh_method == "faithful_contouring" and not _is_faithful_contouring_available():
@@ -4987,8 +5250,15 @@ def extract_glb(
                     "decimation_target": int(decimation_target),
                     "texture_size": int(texture_size),
                     "remesh_method": remesh_method,
+                    "fill_holes_max_perimeter": float(fill_holes_max_perimeter),
+                    "repair_method": repair_method,
                     "simplify_method": simplify_method,
                     "prune_invisible_faces": bool(prune_invisible_faces),
+                    "merge_vertices_dist": float(merge_vertices_dist),
+                    "shade_smooth": bool(shade_smooth),
+                    "shade_smooth_angle": float(shade_smooth_angle),
+                    "force_double_sided": bool(force_double_sided),
+                    "no_pbr_export": bool(no_pbr_export),
                     "texture_extraction": bool((not no_texture_gen) and (not do_retexture)),
                     "out_dir": str(out_dir),
                     "prefix": stage3_glb_prefix,
@@ -5348,6 +5618,12 @@ def extract_glb(
     else:
         final_texture_source = "direct_attr_bake"
 
+    remesh_method, simplify_method, repair_method = _normalize_extract_methods(
+        remesh_method=remesh_method,
+        simplify_method=simplify_method,
+        repair_method=repair_method,
+        log_fn=_log,
+    )
     requested_remesh_method = str(remesh_method)
     remesh_fallback_reason: Optional[str] = None
     if requested_remesh_method == "faithful_contouring" and not _is_faithful_contouring_available():
@@ -5368,6 +5644,8 @@ def extract_glb(
         "grid_size": res,
         "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         "decimation_target": decimation_target,
+        "fill_holes_max_perimeter": float(fill_holes_max_perimeter),
+        "repair_method": repair_method,
         "simplify_method": simplify_method,
         "texture_extraction": (False if ultrashape_retexture_requested else texture_extraction),
         "texture_size": texture_size,
@@ -5376,6 +5654,11 @@ def extract_glb(
         "remesh_project": 0,
         "remesh_method": remesh_method,
         "prune_invisible": prune_invisible_faces,
+        "merge_vertices_dist": float(merge_vertices_dist),
+        "shade_smooth": bool(shade_smooth),
+        "shade_smooth_angle": float(shade_smooth_angle),
+        "force_double_sided": bool(force_double_sided),
+        "no_pbr": bool(no_pbr_export),
         "use_tqdm": True,
     }
     _log(
@@ -6258,18 +6541,69 @@ with gr.Blocks(
                     with gr.Row():
                         resolution = gr.Radio(["512", "768", "1024", "1280", "1536", "2048"], label="Resolution (Generate)", value="1024", info="Output mesh resolution. Higher = finer detail but more VRAM. 512 uses direct sampling; 768+ use cascade for quality. ⬆Quality ⬆VRAM", scale=3)
                         custom_resolution = gr.Number(label="Custom Resolution", value=0, precision=0, minimum=0, maximum=4096, step=128, info="Set to 0 to use radio selection. Must be ≥512 and divisible by 128. Overrides radio if >0.", scale=1)
+                    pipeline_strategy = gr.Dropdown(
+                        PIPELINE_STRATEGY_CHOICES,
+                        label="Pipeline Strategy (Generate)",
+                        value="reference_auto",
+                        info=(
+                            "reference_auto keeps the current high-quality 1024 cascade path. "
+                            "direct_1024 uses the upstream direct 1024 model. "
+                            "hybrid_512g_1024t uses 512 geometry with 1024 texture and is useful when Generate needs a lower-VRAM fallback."
+                        ),
+                    )
                     with gr.Row():
                         seed = gr.Slider(0, MAX_SEED, label="Seed (Generate)", value=99, step=1, scale=4, info="Random seed for reproducibility. Same seed + settings = same output.")
                         randomize_seed = gr.Checkbox(label="Randomize Seed (Generate)", value=False, scale=1, info="Generate random seed each run for variety.")
                     decimation_target = gr.Slider(100000, 9000000, label="Decimation Target (Extract GLB)", value=1000000, step=10000, info="Target polygon count during mesh simplification. Higher = more geometric detail preserved but larger files. ⬆Quality, minimal VRAM impact.")
-                    remesh_method = gr.Dropdown(REMESH_METHOD_CHOICES, label="Remesh Method (Extract GLB)", value="dual_contouring", info="Mesh reconstruction algorithm. dual_contouring: fast, good quality. faithful_contouring: higher fidelity (requires extra deps).")
+                    remesh_method = gr.Dropdown(
+                        REMESH_METHOD_CHOICES,
+                        label="Remesh Method (Extract GLB)",
+                        value=("dual_contouring_vb" if "dual_contouring_vb" in REMESH_METHOD_CHOICES else "dual_contouring"),
+                        info=(
+                            "Surface reconstruction algorithm used during Extract GLB. "
+                            "dual_contouring_vb is the preferred default when the installed CuMesh build supports it, "
+                            "dual_contouring is the fallback path, "
+                            "and faithful_contouring preserves thin/open geometry best but depends on FaithC."
+                        ),
+                    )
                     if "faithful_contouring" not in REMESH_METHOD_CHOICES:
                         gr.Markdown(
                             "**Note:** `faithful_contouring` remeshing requires optional FaithC dependencies "
                             "(`faithcontour` + `atom3d`). Not detected in this environment, so the option is hidden."
                         )
-                    simplify_method = gr.Dropdown(["cumesh", "meshlib"], label="Simplify Method (Extract GLB)", value="meshlib", info="Polygon reduction method. cumesh: GPU-accelerated, fast. meshlib: CPU-based alternative. cumesh uses some GPU VRAM.")
+                    if "dual_contouring_vb" not in REMESH_METHOD_CHOICES:
+                        gr.Markdown(
+                            "**Note:** `dual_contouring_vb` is hidden because the current CuMesh build does not expose "
+                            "`reconstruct_mesh_dc`. If you build/install a newer wheel, this upstream remesher can be enabled."
+                        )
+                    if "pymeshfix" not in REPAIR_METHOD_CHOICES:
+                        gr.Markdown(
+                            "**Note:** `pymeshfix` repair is hidden because its full runtime stack is unavailable in this venv. "
+                            "That path needs both `pymeshfix` and `pyvista` importable."
+                        )
+                    simplify_method = gr.Dropdown(
+                        SIMPLIFY_METHOD_CHOICES,
+                        label="Simplify Method (Extract GLB)",
+                        value="cumesh",
+                        info="Polygon reduction backend for Extract GLB. cumesh is the tested default, meshlib is the upstream CPU alternative for manual use, and none skips simplification."
+                    )
                     prune_invisible_faces = gr.Checkbox(label="Prune Invisible Faces (Extract GLB)", value=False, info="Remove triangles not visible from outside. Reduces polygon count, may affect internal geometry. Slight ⬇VRAM.")
+                    with gr.Row():
+                        shade_smooth = gr.Checkbox(
+                            label="Enable Shade Smooth (Extract GLB)",
+                            value=False,
+                            info="Apply smooth-shaded normals to the Extract GLB export. Works together with Shade Smooth Angle."
+                        )
+                        force_double_sided = gr.Checkbox(
+                            label="Force Double-Sided Materials (Extract GLB)",
+                            value=True,
+                            info="Keep Extract GLB materials double-sided after remesh. Helpful for thin sheets, leaves, cloth, and open surfaces."
+                        )
+                        no_pbr_export = gr.Checkbox(
+                            label="Basecolor-Only Material (Extract GLB)",
+                            value=False,
+                            info="Export Extract GLB with base color + alpha only and skip metallic/roughness textures. Useful for DCC cleanup or lighter downstream materials."
+                        )
                     no_texture_gen = gr.Checkbox(label="Skip Texture Generation (Generate + Extract GLB)", value=False, info="Output shape-only mesh without PBR textures. Faster processing, significantly ⬇VRAM usage.")
                     deferred_texture_after_cleanup = gr.Checkbox(
                         label="Deferred Texture Rebuild (Extract GLB)",
@@ -6281,115 +6615,29 @@ with gr.Blocks(
                         value=False,
                         info="Project the input view images onto the cleaned extracted mesh using camera angles. Best for 2-6 known views. Overrides Deferred Texture Rebuild when enabled.",
                     )
-                    with gr.Accordion("Projection Texture Settings", open=False):
-                        projection_view_azimuths = gr.Textbox(
-                            label="Projection View Azimuths",
-                            value="",
-                            placeholder="e.g. 0,180,90,270",
-                            info="Comma-separated azimuth angles in degrees matching uploaded image order. Leave blank to use default view orders for 1, 2, 4, or 6 images.",
-                        )
-                        projection_view_elevations = gr.Textbox(
-                            label="Projection View Elevations",
-                            value="",
-                            placeholder="e.g. 0,0,0,0",
-                            info="Comma-separated elevation angles in degrees matching uploaded image order. Leave blank to use the default preset with front/back/side/top/bottom assumptions.",
-                        )
-                        with gr.Row():
-                            projection_blend_exponent = gr.Slider(
-                                0.5,
-                                8.0,
-                                label="Projection Blend Exponent",
-                                value=2.0,
-                                step=0.5,
-                                info="Higher values favor the most front-facing camera for each texel; lower values blend views more evenly.",
-                            )
-                            projection_ortho_scale = gr.Slider(
-                                0.5,
-                                2.5,
-                                label="Projection Ortho Scale",
-                                value=1.1,
-                                step=0.05,
-                                info="Approximate orthographic camera framing used when mapping views back to the mesh. Increase if projections look cropped.",
-                            )
-                        with gr.Row():
-                            projection_fill_holes = gr.Checkbox(
-                                label="Fill Projection Holes",
-                                value=True,
-                                info="Inpaint uncovered texels and add seam padding after projection.",
-                            )
-                            projection_max_hole_size = gr.Slider(
-                                0,
-                                256,
-                                label="Projection Max Hole Size",
-                                value=20,
-                                step=1,
-                                info="Limit internal-hole filling to patches at or below this size. Set 0 to fill all internal holes.",
-                            )
                     texture_size = gr.Slider(1024, 4096, label="Texture Size (Extract GLB)", value=4096, step=1024, info="Resolution of baked texture maps (albedo, normal, etc). Higher = sharper textures. ⬆Quality ⬆VRAM during baking.")
                     export_formats = gr.CheckboxGroup(
                         choices=["glb", "gltf", "obj", "ply", "stl"],
                         value=["glb", "gltf", "obj", "ply", "stl"],
                         label="Export Formats (Extract GLB)",
                     )
-                    with gr.Accordion("Config Presets (Save / Load)", open=True):
-                        example_image_dir = os.path.join(APP_DIR, "assets", "example_image")
-                        example_image_paths = [
-                            os.path.join(example_image_dir, image)
-                            for image in sorted(os.listdir(example_image_dir), key=_example_image_sort_key)
-                            if os.path.isfile(os.path.join(example_image_dir, image))
-                        ]
+                    example_image_dir = os.path.join(APP_DIR, "assets", "example_image")
+                    example_image_paths = [
+                        os.path.join(example_image_dir, image)
+                        for image in sorted(os.listdir(example_image_dir), key=_example_image_sort_key)
+                        if os.path.isfile(os.path.join(example_image_dir, image))
+                    ]
 
-                        def _load_image_example(sample: Any):
-                            if not sample:
-                                return None
-                            if isinstance(sample, (list, tuple)):
-                                path = sample[0] if sample else None
-                            else:
-                                path = sample
-                            if not path:
-                                return None
-                            return [str(path)]
-
-                        gr.Markdown(
-                            "Saves/loads **all settings** from Image->3D, Texturing, UltraShape Refine, and Rigging tabs (uploaded images/files are not included)."
-                        )
-                        ui_preset_dropdown = gr.Dropdown(
-                            label="Select Preset",
-                            choices=_list_ui_presets(),
-                            value=_get_last_used_ui_preset(),
-                            allow_custom_value=False,
-                        )
-                        with gr.Row():
-                            ui_preset_name = gr.Textbox(
-                                label="New Preset Name",
-                                placeholder="my_settings",
-                                scale=3,
-                            )
-                            ui_preset_save_btn = gr.Button("💾 Save", variant="primary", scale=1)
-                        with gr.Row():
-                            ui_preset_load_btn = gr.Button("📂 Load Selected", scale=1)
-                            ui_preset_reset_btn = gr.Button("🔄 Reset Defaults", variant="secondary", scale=1)
-                            ui_preset_delete_btn = gr.Button("Delete", variant="stop", scale=1)
-                        ui_preset_status = gr.Markdown("")
-                        gr.Markdown(
-                            "### Input Examples\nClick a thumbnail to load it as the current input and jump back to the top input area."
-                        )
-                        image_examples = gr.Dataset(
-                            components=[
-                                gr.Image(
-                                    type="filepath",
-                                    show_label=False,
-                                    container=False,
-                                    height=140,
-                                    interactive=False,
-                                    buttons=[],
-                                )
-                            ],
-                            samples=[[path] for path in example_image_paths],
-                            samples_per_page=24,
-                            show_label=False,
-                            container=False,
-                        )
+                    def _load_image_example(sample: Any):
+                        if not sample:
+                            return None
+                        if isinstance(sample, (list, tuple)):
+                            path = sample[0] if sample else None
+                        else:
+                            path = sample
+                        if not path:
+                            return None
+                        return [str(path)]
 
                 with gr.Column(scale=3, min_width=680):
                     with gr.Walkthrough(selected=0) as walkthrough:
@@ -6427,6 +6675,48 @@ with gr.Blocks(
                                 open_outputs_top_btn = gr.Button("📂 Open outputs folder", variant="secondary")
                                 view_logs_btn = gr.Button("📄 View Logs", variant="secondary")
                                 cancel_processing_btn = gr.Button("🛑 Cancel processing", variant="stop")
+                            with gr.Accordion("Config Presets (Save / Load)", open=True):
+                                gr.Markdown(
+                                    "Saves/loads **all settings** from Image->3D, Texturing, UltraShape Refine, and Rigging tabs (uploaded images/files are not included)."
+                                )
+                                with gr.Row():
+                                    ui_preset_dropdown = gr.Dropdown(
+                                        label="Select Preset",
+                                        choices=_list_ui_presets(),
+                                        value=(_get_last_used_ui_preset() or "best"),
+                                        allow_custom_value=False,
+                                        scale=2,
+                                    )
+                                    ui_preset_name = gr.Textbox(
+                                        label="New Preset Name",
+                                        placeholder="my_settings",
+                                        scale=2,
+                                    )
+                                    ui_preset_save_btn = gr.Button("💾 Save", variant="primary", scale=1)
+                                with gr.Row():
+                                    ui_preset_load_btn = gr.Button("📂 Load Selected", scale=1)
+                                    ui_preset_reset_btn = gr.Button("🔄 Reset Defaults", variant="secondary", scale=1)
+                                    ui_preset_delete_btn = gr.Button("Delete", variant="stop", scale=1)
+                                ui_preset_status = gr.Markdown("")
+                                gr.Markdown(
+                                    "### Input Examples\nClick a thumbnail to load it as the current input and jump back to the top input area."
+                                )
+                                image_examples = gr.Dataset(
+                                    components=[
+                                        gr.Image(
+                                            type="filepath",
+                                            show_label=False,
+                                            container=False,
+                                            height=140,
+                                            interactive=False,
+                                            buttons=[],
+                                        )
+                                    ],
+                                    samples=[[path] for path in example_image_paths],
+                                    samples_per_page=24,
+                                    show_label=False,
+                                    container=False,
+                                )
                             with gr.Accordion(label="📦 Batch Processing", open=False):
                                 batch_enabled = gr.Checkbox(label="Enable batch processing", value=False)
                                 batch_input_folder = gr.Textbox(
@@ -6444,6 +6734,82 @@ with gr.Blocks(
                                     value="",
                                     lines=12,
                                     interactive=False,
+                                )
+                            with gr.Accordion("Projection Texture Settings", open=True):
+                                with gr.Row():
+                                    projection_view_azimuths = gr.Textbox(
+                                        label="Projection View Azimuths",
+                                        value="",
+                                        placeholder="e.g. 0,180,90,270",
+                                        info="Comma-separated azimuth angles in degrees matching uploaded image order. Leave blank to use default view orders for 1, 2, 4, or 6 images.",
+                                    )
+                                    projection_view_elevations = gr.Textbox(
+                                        label="Projection View Elevations",
+                                        value="",
+                                        placeholder="e.g. 0,0,0,0",
+                                        info="Comma-separated elevation angles in degrees matching uploaded image order. Leave blank to use the default preset with front/back/side/top/bottom assumptions.",
+                                    )
+                                with gr.Row():
+                                    projection_blend_exponent = gr.Slider(
+                                        0.5,
+                                        8.0,
+                                        label="Projection Blend Exponent",
+                                        value=2.0,
+                                        step=0.5,
+                                        info="Higher values favor the most front-facing camera for each texel; lower values blend views more evenly.",
+                                    )
+                                    projection_ortho_scale = gr.Slider(
+                                        0.5,
+                                        2.5,
+                                        label="Projection Ortho Scale",
+                                        value=1.1,
+                                        step=0.05,
+                                        info="Approximate orthographic camera framing used when mapping views back to the mesh. Increase if projections look cropped.",
+                                    )
+                                    projection_fill_holes = gr.Checkbox(
+                                        label="Fill Projection Holes",
+                                        value=True,
+                                        info="Inpaint uncovered texels and add seam padding after projection.",
+                                    )
+                                    projection_max_hole_size = gr.Slider(
+                                        0,
+                                        256,
+                                        label="Projection Max Hole Size",
+                                        value=20,
+                                        step=1,
+                                        info="Limit internal-hole filling to patches at or below this size. Set 0 to fill all internal holes.",
+                                    )
+                            with gr.Row():
+                                fill_holes_max_perimeter = gr.Slider(
+                                    0.0,
+                                    0.2,
+                                    label="Fill Holes Max Perimeter (Extract GLB)",
+                                    value=0.03,
+                                    step=0.005,
+                                    info="Hole-filling threshold for Extract GLB cleanup. Higher values close larger gaps but can over-seal intended openings."
+                                )
+                                repair_method = gr.Dropdown(
+                                    REPAIR_METHOD_CHOICES,
+                                    label="Repair Method (Extract GLB)",
+                                    value=("meshlib" if "meshlib" in REPAIR_METHOD_CHOICES else "disabled"),
+                                    info="Final repair backend for Extract GLB. meshlib is the tested default when available because it closes the extracted shell more reliably on the current pipeline; cumesh is the lighter fallback; pymeshfix is a slow manual last-resort option on large meshes; disabled skips the final repair pass."
+                                )
+                            with gr.Row():
+                                merge_vertices_dist = gr.Slider(
+                                    0.0,
+                                    0.05,
+                                    label="Merge Vertices Distance (Extract GLB)",
+                                    value=0.0,
+                                    step=0.001,
+                                    info="Optional post-remesh vertex welding distance for Extract GLB. Useful for tiny cracks or duplicate seams; keep near zero unless you need cleanup."
+                                )
+                                shade_smooth_angle = gr.Slider(
+                                    0,
+                                    80,
+                                    label="Shade Smooth Angle (Extract GLB)",
+                                    value=35,
+                                    step=1,
+                                    info="Normal-smoothing split angle for Extract GLB exports. 0 keeps the existing normals; 30-45 often improves visual smoothness without removing sharp edges."
                                 )
                             with gr.Accordion(label="Advanced Settings Trellis2 (Generate)", open=True):
                                 gr.Markdown("**Stage 1: Sparse Structure Generation (Generate)**")
@@ -6755,6 +7121,7 @@ with gr.Blocks(
                     seed,
                     resolution,
                     custom_resolution,
+                    pipeline_strategy,
                     ss_guidance_strength,
                     ss_guidance_rescale,
                     ss_guidance_interval_start,
@@ -6766,8 +7133,8 @@ with gr.Blocks(
                     model_variant,
                     attention_backend,
                     sampler_type,
-                    extract_use_chunked_processing,
-                    extract_use_tiled_extraction,
+                    use_chunked_processing,
+                    use_tiled_extraction,
                     shape_slat_guidance_strength,
                     shape_slat_guidance_rescale,
                     shape_slat_guidance_interval_start,
@@ -6810,6 +7177,8 @@ with gr.Blocks(
                     decimation_target,
                     texture_size,
                     remesh_method,
+                    fill_holes_max_perimeter,
+                    repair_method,
                     simplify_method,
                     no_texture_gen,
                     deferred_texture_after_cleanup,
@@ -6821,6 +7190,11 @@ with gr.Blocks(
                     projection_fill_holes,
                     projection_max_hole_size,
                     prune_invisible_faces,
+                    merge_vertices_dist,
+                    shade_smooth,
+                    shade_smooth_angle,
+                    force_double_sided,
+                    no_pbr_export,
                     export_formats,
                     extract_use_chunked_processing,
                     extract_use_tiled_extraction,
@@ -7021,6 +7395,7 @@ with gr.Blocks(
                     seed,
                     resolution,
                     custom_resolution,
+                    pipeline_strategy,
                     ss_guidance_strength,
                     ss_guidance_rescale,
                     ss_guidance_interval_start,
@@ -7060,8 +7435,15 @@ with gr.Blocks(
                     decimation_target,
                     texture_size,
                     remesh_method,
+                    fill_holes_max_perimeter,
+                    repair_method,
                     simplify_method,
                     prune_invisible_faces,
+                    merge_vertices_dist,
+                    shade_smooth,
+                    shade_smooth_angle,
+                    force_double_sided,
+                    no_pbr_export,
                     export_formats,
                     ultrashape_enabled,
                     ultrashape_retexture_after_refine,
@@ -7945,6 +8327,10 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
 
 **Where presets are stored**: `./presets/<name>.json`
 
+**Built-in presets**:
+- `best`: the tested default path
+- `low_vram`: lower-memory variant with chunked/tiled memory-saving options enabled
+
 **Typical workflow**:
 - Dial in settings you like → Save preset as `my_high_quality`
 - Later → Load preset to restore all sliders/checkboxes instantly
@@ -7992,12 +8378,20 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
     _CONFIG_KEYS = [
         ("global", "subprocess_mode"),
         ("image_to_3d", "resolution"),
+        ("image_to_3d", "pipeline_strategy"),
         ("image_to_3d", "seed"),
         ("image_to_3d", "randomize_seed"),
         ("image_to_3d", "decimation_target"),
         ("image_to_3d", "remesh_method"),
+        ("image_to_3d", "fill_holes_max_perimeter"),
+        ("image_to_3d", "repair_method"),
         ("image_to_3d", "simplify_method"),
         ("image_to_3d", "prune_invisible_faces"),
+        ("image_to_3d", "merge_vertices_dist"),
+        ("image_to_3d", "shade_smooth"),
+        ("image_to_3d", "shade_smooth_angle"),
+        ("image_to_3d", "force_double_sided"),
+        ("image_to_3d", "no_pbr_export"),
         ("image_to_3d", "no_texture_gen"),
         ("image_to_3d", "deferred_texture_after_cleanup"),
         ("image_to_3d", "projection_texture_refine"),
@@ -8101,12 +8495,20 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
     _CONFIG_COMPONENTS = [
         subprocess_mode,
         resolution,
+        pipeline_strategy,
         seed,
         randomize_seed,
         decimation_target,
         remesh_method,
+        fill_holes_max_perimeter,
+        repair_method,
         simplify_method,
         prune_invisible_faces,
+        merge_vertices_dist,
+        shade_smooth,
+        shade_smooth_angle,
+        force_double_sided,
+        no_pbr_export,
         no_texture_gen,
         deferred_texture_after_cleanup,
         projection_texture_refine,
@@ -8223,6 +8625,8 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         # Image→3D resolution
         if merged["image_to_3d"]["resolution"] not in ["512", "768", "1024", "1280", "1536", "2048"]:
             merged["image_to_3d"]["resolution"] = defaults["image_to_3d"]["resolution"]
+        if merged["image_to_3d"].get("pipeline_strategy") not in PIPELINE_STRATEGY_CHOICES:
+            merged["image_to_3d"]["pipeline_strategy"] = defaults["image_to_3d"]["pipeline_strategy"]
         # Texturing resolution
         if merged["texturing"]["resolution"] not in ["512", "1024", "1536"]:
             merged["texturing"]["resolution"] = defaults["texturing"]["resolution"]
@@ -8230,8 +8634,10 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
         if merged["image_to_3d"]["remesh_method"] not in REMESH_METHOD_CHOICES:
             merged["image_to_3d"]["remesh_method"] = defaults["image_to_3d"]["remesh_method"]
         # Simplify method
-        if merged["image_to_3d"]["simplify_method"] not in ["cumesh", "meshlib"]:
+        if merged["image_to_3d"]["simplify_method"] not in SIMPLIFY_METHOD_CHOICES:
             merged["image_to_3d"]["simplify_method"] = defaults["image_to_3d"]["simplify_method"]
+        if merged["image_to_3d"].get("repair_method") not in REPAIR_METHOD_CHOICES:
+            merged["image_to_3d"]["repair_method"] = defaults["image_to_3d"]["repair_method"]
         # Export formats
         ef = merged["image_to_3d"].get("export_formats")
         if not isinstance(ef, list):
@@ -8357,6 +8763,8 @@ Presets save **all settings** from Image->3D, Texturing, UltraShape Refine, and 
     def _delete_preset_ui(preset_name: str):
         if not preset_name:
             return gr.update(), "WARNING: No preset selected"
+        if str(preset_name).strip() in _builtin_ui_presets():
+            return gr.update(choices=_list_ui_presets(), value=preset_name), f"INFO: Built-in preset **{preset_name}** cannot be deleted"
         ok = _delete_ui_preset(preset_name)
         presets = _list_ui_presets()
         if ok:

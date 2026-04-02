@@ -7,7 +7,7 @@ import sys
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # Windows can default to a non-UTF8 stdout encoding (e.g. cp1252), which can crash
 # on printing certain unicode characters. Force UTF-8 so subprocess stages never
@@ -84,6 +84,119 @@ def _log_vram_usage(label: str) -> None:
             print(f"[VRAM] {label}: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved", flush=True)
     except Exception:
         pass  # Silently ignore if torch not imported yet
+
+
+def _module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except Exception:
+        return False
+
+
+def _is_meshlib_available() -> bool:
+    try:
+        import meshlib.mrmeshpy  # noqa: F401
+        import meshlib.mrmeshnumpy  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _is_pymeshfix_available() -> bool:
+    try:
+        import pymeshfix  # noqa: F401
+        import pyvista  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _has_dual_contouring_vb() -> bool:
+    try:
+        import cumesh
+
+        return hasattr(cumesh.remeshing, "reconstruct_mesh_dc")
+    except Exception:
+        return False
+
+
+def _normalize_pipeline_strategy(strategy: Optional[str]) -> str:
+    strategy_norm = str(strategy or "reference_auto").strip().lower()
+    if strategy_norm in {"reference_auto", "direct_1024", "hybrid_512g_1024t"}:
+        return strategy_norm
+    return "reference_auto"
+
+
+def _normalize_simplify_method(method: Optional[str]) -> str:
+    method_norm = str(method or "cumesh").strip().lower()
+    if method_norm not in {"cumesh", "meshlib", "none"}:
+        return "meshlib" if _is_meshlib_available() else "cumesh"
+    if method_norm == "meshlib" and not _is_meshlib_available():
+        return "cumesh"
+    return method_norm
+
+
+def _normalize_repair_method(method: Optional[str]) -> str:
+    method_norm = str(method or "disabled").strip().lower()
+    if method_norm in {"", "none"}:
+        method_norm = "disabled"
+    if method_norm == "meshlib" and not _is_meshlib_available():
+        return "disabled"
+    if method_norm == "pymeshfix" and not _is_pymeshfix_available():
+        return "disabled"
+    if method_norm not in {"disabled", "cumesh", "meshlib", "pymeshfix"}:
+        return "disabled"
+    return method_norm
+
+
+def _normalize_extract_methods(
+    *,
+    remesh_method: Optional[str],
+    simplify_method: Optional[str],
+    repair_method: Optional[str],
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> tuple[str, str, str]:
+    remesh_norm = str(remesh_method or "dual_contouring").strip().lower()
+    simplify_norm = _normalize_simplify_method(simplify_method)
+    repair_norm = _normalize_repair_method(repair_method)
+
+    available_remesh_methods = {"dual_contouring"}
+    if _has_dual_contouring_vb():
+        available_remesh_methods.add("dual_contouring_vb")
+    if _can_use_faithful_contouring():
+        available_remesh_methods.add("faithful_contouring")
+
+    if remesh_norm not in available_remesh_methods:
+        if log_fn is not None:
+            log_fn(
+                f"Requested remesh method '{remesh_norm}' is unavailable in this environment. "
+                "Falling back to 'dual_contouring'."
+            )
+        remesh_norm = "dual_contouring"
+
+    if remesh_norm == "dual_contouring_vb" and not _has_dual_contouring_vb():
+        if log_fn is not None:
+            log_fn(
+                "Requested remesh_method='dual_contouring_vb' but the installed CuMesh build "
+                "does not expose reconstruct_mesh_dc. Falling back to 'dual_contouring'."
+            )
+        remesh_norm = "dual_contouring"
+
+    if simplify_norm == "meshlib" and not _is_meshlib_available():
+        if log_fn is not None:
+            log_fn("MeshLib is not installed. Falling back to simplify_method='cumesh'.")
+        simplify_norm = "cumesh"
+
+    if repair_norm == "meshlib" and not _is_meshlib_available():
+        if log_fn is not None:
+            log_fn("MeshLib is not installed. Disabling Extract GLB hole repair.")
+        repair_norm = "disabled"
+    if repair_norm == "pymeshfix" and not _is_pymeshfix_available():
+        if log_fn is not None:
+            log_fn("PyMeshFix is not installed. Disabling Extract GLB hole repair.")
+        repair_norm = "disabled"
+
+    return remesh_norm, simplify_norm, repair_norm
 
 
 def _ensure_o_voxel_available() -> None:
@@ -289,7 +402,10 @@ def _save_cond(path: Path, cond: Dict[str, "torch.Tensor"]) -> None:
     torch.save({k: v.detach().cpu() for k, v in cond.items()}, str(path))
 
 
-def _pipeline_type_from_resolution(resolution: str) -> tuple[str, int]:
+def _pipeline_type_from_resolution(
+    resolution: str,
+    pipeline_strategy: Optional[str] = None,
+) -> tuple[str, int]:
     """
     Convert resolution string to pipeline type and target resolution.
     
@@ -312,7 +428,11 @@ def _pipeline_type_from_resolution(resolution: str) -> tuple[str, int]:
     if res == 512:
         return "512", 512
     elif res == 1024:
-        # Match reference pipeline: 1024 uses the cascade path.
+        strategy_norm = _normalize_pipeline_strategy(pipeline_strategy)
+        if strategy_norm == "direct_1024":
+            return "1024", 1024
+        if strategy_norm == "hybrid_512g_1024t":
+            return "512g_1024t", 1024
         return "1024_cascade", 1024
     else:
         # Any other resolution uses cascade
@@ -580,7 +700,8 @@ def stage_encode_cond(payload: Dict[str, Any]) -> Dict[str, Any]:
     low_vram = payload.get("low_vram", False)
     image_path = Path(payload["image_path"])
     resolution = str(payload["resolution"])
-    pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
+    pipeline_strategy = payload.get("pipeline_strategy")
+    pipeline_type, target_res = _pipeline_type_from_resolution(resolution, pipeline_strategy)
     force_high_res_conditional = payload.get("force_high_res_conditional", False)
 
     cond_512_path = Path(payload["cond_512_path"])
@@ -633,7 +754,8 @@ def stage_sample_sparse_structure(payload: Dict[str, Any]) -> Dict[str, Any]:
     config_file = payload.get("config_file", "pipeline.json")
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
-    pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
+    pipeline_strategy = payload.get("pipeline_strategy")
+    pipeline_type, target_res = _pipeline_type_from_resolution(resolution, pipeline_strategy)
     ss_res = _ss_res_from_pipeline_type(pipeline_type)
     low_vram = payload.get("low_vram", False)
 
@@ -709,7 +831,8 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     config_file = payload.get("config_file", "pipeline.json")
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
-    pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
+    pipeline_strategy = payload.get("pipeline_strategy")
+    pipeline_type, target_res = _pipeline_type_from_resolution(resolution, pipeline_strategy)
     shape_params = payload["shape_params"]
     max_num_tokens = int(payload.get("max_num_tokens", 49152))
     low_vram = payload.get("low_vram", False)
@@ -744,6 +867,15 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     print("[shape] loading coords…", flush=True)
     coords = torch.load(str(coords_path), map_location="cpu").to(device)
 
+    if low_vram and coords.shape[0] > 24000 and pipeline_type in {"1024", "1024_cascade", "1536_cascade", "2048_cascade"}:
+        print(
+            f"[shape] token count {coords.shape[0]} is high. "
+            "Switching to hybrid 512 geometry + 1024 texture mode.",
+            flush=True,
+        )
+        pipeline_type = "512g_1024t"
+        coords = (coords // 2).unique(dim=0)
+
     if pipeline_type == "512":
         keep = ["shape_slat_flow_model_512"]
         pipe = Trellis2ImageTo3DPipeline.from_pretrained(
@@ -755,6 +887,7 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
             load_rembg_model=False,
         )
         _configure_image_pipeline_runtime(pipe, payload, "sample_shape_slat_512")
+        pipe.low_vram = low_vram
         pipe.cuda()
 
         cond = _load_cond(cond_512_path, device=device)
@@ -776,6 +909,7 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
             load_rembg_model=False,
         )
         _configure_image_pipeline_runtime(pipe, payload, "sample_shape_slat_1024")
+        pipe.low_vram = low_vram
         pipe.cuda()
 
         cond = _load_cond(cond_1024_path, device=device)
@@ -783,6 +917,28 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
         with torch.inference_mode():
             slat = pipe.sample_shape_slat(cond, pipe.models["shape_slat_flow_model_1024"], coords, shape_params)
         res = 1024
+
+    elif pipeline_type == "512g_1024t":
+        if cond_1024_path is None:
+            raise ValueError("cond_1024_path is required for 512g_1024t pipeline type.")
+        keep = ["shape_slat_flow_model_512"]
+        pipe = Trellis2ImageTo3DPipeline.from_pretrained(
+            model_repo,
+            config_file=config_file,
+            ignore_models=_ignore_except_image_models(keep),
+            load_texture_models=False,
+            load_image_cond_model=False,
+            load_rembg_model=False,
+        )
+        _configure_image_pipeline_runtime(pipe, payload, "sample_shape_slat_512g_1024t")
+        pipe.low_vram = low_vram
+        pipe.cuda()
+
+        cond = _load_cond(cond_512_path, device=device)
+        print("[shape] sampling shape SLat (hybrid 512g + 1024t)…", flush=True)
+        with torch.inference_mode():
+            slat = pipe.sample_shape_slat(cond, pipe.models["shape_slat_flow_model_512"], coords, shape_params)
+        res = 512
 
     elif "_cascade" in pipeline_type:
         # Any cascade resolution (768, 1024, 1280, 1536, 2048, custom)
@@ -799,6 +955,7 @@ def stage_sample_shape_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
             load_rembg_model=False,
         )
         _configure_image_pipeline_runtime(pipe, payload, "sample_shape_slat_cascade")
+        pipe.low_vram = low_vram
         pipe.cuda()
 
         lr_cond = _load_cond(cond_512_path, device=device)
@@ -858,7 +1015,8 @@ def stage_sample_tex_slat(payload: Dict[str, Any]) -> Dict[str, Any]:
     config_file = payload.get("config_file", "pipeline.json")
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
-    pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
+    pipeline_strategy = payload.get("pipeline_strategy")
+    pipeline_type, target_res = _pipeline_type_from_resolution(resolution, pipeline_strategy)
     low_vram = payload.get("low_vram", False)
 
     cond_path = Path(payload["cond_path"])
@@ -938,7 +1096,8 @@ def stage_sample_multiview_latents(payload: Dict[str, Any]) -> Dict[str, Any]:
     config_file = payload.get("config_file", "pipeline.json")
     seed = int(payload.get("seed", 42))
     resolution = str(payload["resolution"])
-    pipeline_type, target_res = _pipeline_type_from_resolution(resolution)
+    pipeline_strategy = payload.get("pipeline_strategy")
+    pipeline_type, target_res = _pipeline_type_from_resolution(resolution, pipeline_strategy)
     mode = str(payload.get("multiview_mode", "stochastic")).strip().lower()
     if mode not in {"stochastic", "multidiffusion"}:
         mode = "stochastic"
@@ -949,6 +1108,15 @@ def stage_sample_multiview_latents(payload: Dict[str, Any]) -> Dict[str, Any]:
     image_paths = [Path(p) for p in payload.get("image_paths", [])]
     if len(image_paths) < 2:
         raise ValueError("sample_multiview_latents requires at least 2 preprocessed views.")
+
+    if pipeline_type == "512g_1024t":
+        print(
+            "[multiview] hybrid_512g_1024t is only supported for single-image Generate. "
+            "Falling back to 1024_cascade for multiview.",
+            flush=True,
+        )
+        pipeline_type = "1024_cascade"
+        target_res = 1024
 
     shape_slat_path = Path(payload["shape_slat_path"])
     out_res_path = Path(payload["out_res_path"])
@@ -1624,11 +1792,22 @@ def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     decimation_target = int(payload["decimation_target"])
     texture_size = int(payload["texture_size"])
     requested_remesh_method = str(payload["remesh_method"])
-    remesh_method = requested_remesh_method
+    requested_repair_method = str(payload.get("repair_method", "disabled"))
+    remesh_method, simplify_method, repair_method = _normalize_extract_methods(
+        remesh_method=requested_remesh_method,
+        simplify_method=payload.get("simplify_method"),
+        repair_method=requested_repair_method,
+        log_fn=lambda msg: print(f"[extract_to_glb] {msg}", flush=True),
+    )
     remesh_fallback_reason: Optional[str] = None
-    simplify_method = str(payload["simplify_method"])
     prune_invisible_faces = bool(payload["prune_invisible_faces"])
     texture_extraction = bool(payload.get("texture_extraction", True))
+    fill_holes_max_perimeter = float(payload.get("fill_holes_max_perimeter", 3e-2))
+    merge_vertices_dist = float(payload.get("merge_vertices_dist", 0.0))
+    shade_smooth = bool(payload.get("shade_smooth", False))
+    shade_smooth_angle = float(payload.get("shade_smooth_angle", 0.0))
+    force_double_sided = bool(payload.get("force_double_sided", True))
+    no_pbr_export = bool(payload.get("no_pbr_export", False))
     out_dir = Path(payload["out_dir"])
     prefix = str(payload.get("prefix", "glb"))
     export_formats = payload.get("export_formats") or ["glb"]
@@ -1677,12 +1856,19 @@ def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
         "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         "decimation_target": decimation_target,
         "simplify_method": simplify_method,
+        "fill_holes_max_perimeter": fill_holes_max_perimeter,
+        "repair_method": repair_method,
         "texture_extraction": texture_extraction,
         "texture_size": texture_size,
+        "merge_vertices_dist": merge_vertices_dist,
+        "shade_smooth": shade_smooth,
+        "shade_smooth_angle": shade_smooth_angle,
         "remesh": True,
         "remesh_band": 1,
         "remesh_project": 0,
         "remesh_method": remesh_method,
+        "force_double_sided": force_double_sided,
+        "no_pbr": no_pbr_export,
         "prune_invisible": prune_invisible_faces,
         "use_tqdm": True,
     }
@@ -1866,11 +2052,22 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     decimation_target = int(payload["decimation_target"])
     texture_size = int(payload["texture_size"])
     requested_remesh_method = str(payload["remesh_method"])
-    remesh_method = requested_remesh_method
+    requested_repair_method = str(payload.get("repair_method", "disabled"))
+    remesh_method, simplify_method, repair_method = _normalize_extract_methods(
+        remesh_method=requested_remesh_method,
+        simplify_method=payload.get("simplify_method"),
+        repair_method=requested_repair_method,
+        log_fn=lambda msg: print(f"[extract] {msg}", flush=True),
+    )
     remesh_fallback_reason: Optional[str] = None
-    simplify_method = str(payload["simplify_method"])
     prune_invisible_faces = bool(payload["prune_invisible_faces"])
     no_texture_gen = bool(payload["no_texture_gen"])
+    fill_holes_max_perimeter = float(payload.get("fill_holes_max_perimeter", 3e-2))
+    merge_vertices_dist = float(payload.get("merge_vertices_dist", 0.0))
+    shade_smooth = bool(payload.get("shade_smooth", False))
+    shade_smooth_angle = float(payload.get("shade_smooth_angle", 0.0))
+    force_double_sided = bool(payload.get("force_double_sided", True))
+    no_pbr_export = bool(payload.get("no_pbr_export", False))
     ultrashape_cfg = payload.get("ultrashape") or {}
     ultrashape_retexture_after_refine = bool(ultrashape_cfg.get("retexture_after_refine", True))
     ultrashape_retexture_params = _normalize_tex_params_for_retexture(ultrashape_cfg.get("retexture_params") or {})
@@ -2038,12 +2235,19 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
         "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
         "decimation_target": decimation_target,
         "simplify_method": simplify_method,
+        "fill_holes_max_perimeter": fill_holes_max_perimeter,
+        "repair_method": repair_method,
         "texture_extraction": (False if do_ultrashape_retexture else (not no_texture_gen)),
         "texture_size": texture_size,
+        "merge_vertices_dist": merge_vertices_dist,
+        "shade_smooth": shade_smooth,
+        "shade_smooth_angle": shade_smooth_angle,
         "remesh": True,
         "remesh_band": 1,
         "remesh_project": 0,
         "remesh_method": remesh_method,
+        "force_double_sided": force_double_sided,
+        "no_pbr": no_pbr_export,
         "prune_invisible": prune_invisible_faces,
         "use_tqdm": True,
     }

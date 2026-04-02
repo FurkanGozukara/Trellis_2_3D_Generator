@@ -84,8 +84,10 @@ def from_pretrained(path: str, **kwargs):
               NOTE: config file and model file should take the name f'{path}.json' and f'{path}.safetensors' respectively.
         **kwargs: Additional arguments for the model constructor.
     """
-    import os
+    import contextlib
     import json
+    import os
+    import torch
     from safetensors.torch import load_file
 
     path = _resolve_local_model_path(path)
@@ -102,9 +104,37 @@ def from_pretrained(path: str, **kwargs):
         config_file = hf_hub_download(repo_id, f"{model_name}.json")
         model_file = hf_hub_download(repo_id, f"{model_name}.safetensors")
 
+    @contextlib.contextmanager
+    def skip_torch_init():
+        initializers = [
+            'kaiming_uniform_', 'kaiming_normal_',
+            'xavier_uniform_', 'xavier_normal_',
+            'normal_', 'uniform_',
+            'constant_', 'ones_', 'zeros_', 'eye_', 'dirac_',
+            'orthogonal_', 'sparse_',
+        ]
+
+        def no_op(*args, **kwargs):
+            return
+
+        saved_init = {}
+        for name in initializers:
+            if hasattr(torch.nn.init, name):
+                saved_init[name] = getattr(torch.nn.init, name)
+                setattr(torch.nn.init, name, no_op)
+
+        try:
+            yield
+        finally:
+            for name, func in saved_init.items():
+                setattr(torch.nn.init, name, func)
+
     with open(config_file, 'r') as f:
         config = json.load(f)
-    model = __getattr__(config['name'])(**config['args'], **kwargs)
+
+    with skip_torch_init():
+        model = __getattr__(config['name'])(**config['args'], **kwargs)
+
     model.load_state_dict(load_file(model_file), strict=False)
 
     return model
