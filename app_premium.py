@@ -6627,14 +6627,32 @@ with gr.Blocks(
                         for image in sorted(os.listdir(example_image_dir), key=_example_image_sort_key)
                         if os.path.isfile(os.path.join(example_image_dir, image))
                     ]
+                    gr.Markdown(
+                        "### Input Examples\nClick a thumbnail to load it as the current input and jump back to the top input area."
+                    )
+                    image_examples = gr.Gallery(
+                        value=example_image_paths,
+                        label=None,
+                        show_label=False,
+                        container=False,
+                        columns=5,
+                        object_fit="contain",
+                        allow_preview=False,
+                        interactive=False,
+                        type="filepath",
+                    )
 
-                    def _load_image_example(sample: Any):
-                        if not sample:
+                    def _load_image_example(evt: gr.SelectData):
+                        if evt is None:
                             return None
-                        if isinstance(sample, (list, tuple)):
-                            path = sample[0] if sample else None
-                        else:
-                            path = sample
+                        index = evt.index
+                        if isinstance(index, (list, tuple)):
+                            index = index[0] if index else None
+                        if not isinstance(index, int):
+                            return None
+                        if index < 0 or index >= len(example_image_paths):
+                            return None
+                        path = example_image_paths[index]
                         if not path:
                             return None
                         return [str(path)]
@@ -6698,25 +6716,6 @@ with gr.Blocks(
                                     ui_preset_reset_btn = gr.Button("🔄 Reset Defaults", variant="secondary", scale=1)
                                     ui_preset_delete_btn = gr.Button("Delete", variant="stop", scale=1)
                                 ui_preset_status = gr.Markdown("")
-                                gr.Markdown(
-                                    "### Input Examples\nClick a thumbnail to load it as the current input and jump back to the top input area."
-                                )
-                                image_examples = gr.Dataset(
-                                    components=[
-                                        gr.Image(
-                                            type="filepath",
-                                            show_label=False,
-                                            container=False,
-                                            height=140,
-                                            interactive=False,
-                                            buttons=[],
-                                        )
-                                    ],
-                                    samples=[[path] for path in example_image_paths],
-                                    samples_per_page=24,
-                                    show_label=False,
-                                    container=False,
-                                )
                             with gr.Accordion(label="📦 Batch Processing", open=False):
                                 batch_enabled = gr.Checkbox(label="Enable batch processing", value=False)
                                 batch_input_folder = gr.Textbox(
@@ -6735,16 +6734,16 @@ with gr.Blocks(
                                     lines=12,
                                     interactive=False,
                                 )
-                            with gr.Accordion("Projection Texture Settings", open=True):
+                            with gr.Accordion("Projection Texture Settings (Extract GLB)", open=True):
                                 with gr.Row():
                                     projection_view_azimuths = gr.Textbox(
-                                        label="Projection View Azimuths",
+                                        label="Projection View Azimuths (Extract GLB)",
                                         value="",
                                         placeholder="e.g. 0,180,90,270",
                                         info="Comma-separated azimuth angles in degrees matching uploaded image order. Leave blank to use default view orders for 1, 2, 4, or 6 images.",
                                     )
                                     projection_view_elevations = gr.Textbox(
-                                        label="Projection View Elevations",
+                                        label="Projection View Elevations (Extract GLB)",
                                         value="",
                                         placeholder="e.g. 0,0,0,0",
                                         info="Comma-separated elevation angles in degrees matching uploaded image order. Leave blank to use the default preset with front/back/side/top/bottom assumptions.",
@@ -6753,7 +6752,7 @@ with gr.Blocks(
                                     projection_blend_exponent = gr.Slider(
                                         0.5,
                                         8.0,
-                                        label="Projection Blend Exponent",
+                                        label="Projection Blend Exponent (Extract GLB)",
                                         value=2.0,
                                         step=0.5,
                                         info="Higher values favor the most front-facing camera for each texel; lower values blend views more evenly.",
@@ -6761,20 +6760,20 @@ with gr.Blocks(
                                     projection_ortho_scale = gr.Slider(
                                         0.5,
                                         2.5,
-                                        label="Projection Ortho Scale",
+                                        label="Projection Ortho Scale (Extract GLB)",
                                         value=1.1,
                                         step=0.05,
                                         info="Approximate orthographic camera framing used when mapping views back to the mesh. Increase if projections look cropped.",
                                     )
                                     projection_fill_holes = gr.Checkbox(
-                                        label="Fill Projection Holes",
+                                        label="Fill Projection Holes (Extract GLB)",
                                         value=True,
                                         info="Inpaint uncovered texels and add seam padding after projection.",
                                     )
                                     projection_max_hole_size = gr.Slider(
                                         0,
                                         256,
-                                        label="Projection Max Hole Size",
+                                        label="Projection Max Hole Size (Extract GLB)",
                                         value=20,
                                         step=1,
                                         info="Limit internal-hole filling to patches at or below this size. Set 0 to fill all internal holes.",
@@ -7076,7 +7075,7 @@ with gr.Blocks(
                 inputs=[input_images],
                 outputs=[input_preview_single, input_preview_gallery, input_upload_status],
             )
-            image_examples.click(
+            image_examples.select(
                 None,
                 inputs=[],
                 outputs=[],
@@ -7091,9 +7090,9 @@ with gr.Blocks(
                 queue=False,
                 api_visibility="private",
             )
-            image_examples.click(
+            image_examples.select(
                 _load_image_example,
-                inputs=[image_examples],
+                inputs=[],
                 outputs=[input_images],
                 show_progress="hidden",
                 queue=False,
