@@ -18,6 +18,7 @@ dist/
 downloads/
 eggs/
 .eggs/
+TRELLIS.2/
 lib/
 lib64/
 .claude

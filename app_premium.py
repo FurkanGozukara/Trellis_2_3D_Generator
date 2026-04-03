@@ -6477,7 +6477,7 @@ with gr.Blocks(
         """
 <div style="display:flex; flex-wrap:wrap; align-items:baseline; gap:10px 16px;">
   <div style="font-size:1.35rem; font-weight:700;">
-    Trellis 2 Ultimate SECourses Premium App V5 :
+    Trellis 2 Ultimate SECourses Premium App V6 :
     <a href="https://www.patreon.com/posts/147686623" target="_blank">https://www.patreon.com/posts/147686623</a>
   </div>
   <div style="color:var(--body-text-color-subdued);">
