@@ -21,7 +21,9 @@ import o_voxel
 
 
 MAX_SEED = np.iinfo(np.int32).max
-TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+TMP_DIR = os.path.join(APP_DIR, 'tmp')
+FAVICON_PATH = os.path.join(APP_DIR, "assets", "app", "trellis2-favicon.svg")
 
 
 def _example_image_sort_key(name: str):
@@ -954,4 +956,10 @@ if __name__ == "__main__":
         )),
     }
 
-    demo.launch(css=css, head=head, server_name="0.0.0.0", server_port=7860)
+    demo.launch(
+        css=css,
+        head=head,
+        server_name="0.0.0.0",
+        server_port=7860,
+        favicon_path=FAVICON_PATH,
+    )

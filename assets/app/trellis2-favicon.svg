@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="10" y1="8" x2="54" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#120f2d"/>
+      <stop offset="0.52" stop-color="#35206f"/>
+      <stop offset="1" stop-color="#6d28d9"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(45 17) rotate(134.567) scale(28.7921)">
+      <stop stop-color="#7dd3fc" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#7dd3fc" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="edge" x1="18" y1="16" x2="47" y2="47" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#a5f3fc"/>
+      <stop offset="1" stop-color="#f5d0fe"/>
+    </linearGradient>
+    <linearGradient id="faceTop" x1="18" y1="15" x2="43" y2="29" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#c4b5fd" stop-opacity="0.04"/>
+    </linearGradient>
+    <linearGradient id="faceLeft" x1="15" y1="22" x2="33" y2="47" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#22d3ee" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0.08"/>
+    </linearGradient>
+    <linearGradient id="faceRight" x1="32" y1="23" x2="49" y2="46" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f472b6" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#f472b6" stop-opacity="0.06"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="18" fill="url(#bg)"/>
+  <rect width="64" height="64" rx="18" fill="url(#glow)"/>
+  <path d="M32 11.5 49 21.5 32 31.5 15 21.5 32 11.5Z" fill="url(#faceTop)"/>
+  <path d="M15 21.5 32 31.5V51L15 41V21.5Z" fill="url(#faceLeft)"/>
+  <path d="M49 21.5 32 31.5V51L49 41V21.5Z" fill="url(#faceRight)"/>
+  <path d="M32 11.5 49 21.5 32 31.5 15 21.5 32 11.5Z" stroke="url(#edge)" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M15 21.5V41L32 51 49 41V21.5" stroke="url(#edge)" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M32 11.5V31.5M15 21.5 32 31.5 49 21.5" stroke="url(#edge)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M23.5 34.5 32 39.5 40.5 34.5" stroke="#E2E8F0" stroke-opacity="0.92" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M23.5 34.5V28.5M40.5 34.5V28.5M32 39.5V46" stroke="#E2E8F0" stroke-opacity="0.72" stroke-width="2" stroke-linecap="round"/>
+  <circle cx="15" cy="21.5" r="2.6" fill="#FDE68A"/>
+  <circle cx="32" cy="11.5" r="2.6" fill="#FDE68A"/>
+  <circle cx="49" cy="21.5" r="2.6" fill="#FDE68A"/>
+  <path d="M48.5 12.5 49.9 15.6 53 17 49.9 18.4 48.5 21.5 47.1 18.4 44 17 47.1 15.6 48.5 12.5Z" fill="#F9FAFB" fill-opacity="0.94"/>
+</svg>

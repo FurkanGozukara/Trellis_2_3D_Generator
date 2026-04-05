@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import inspect
+import os
 import sys
 import threading
 import time
@@ -110,11 +112,37 @@ def _conservative_surface_snap_blend(
 
 
 def _candidate_ultrashape_roots(app_dir: Path) -> list[Path]:
-    return [
+    candidates: list[Path] = []
+
+    def _add(path_like: str | Path | None) -> None:
+        if not path_like:
+            return
+        path = Path(path_like).expanduser()
+        if not path.is_absolute():
+            path = app_dir / path
+        path = path.resolve()
+        if path not in candidates:
+            candidates.append(path)
+
+    for env_name in ("ULTRASHAPE_ROOT", "ULTRASHAPE_SOURCE_DIR"):
+        _add(os.environ.get(env_name))
+
+    for path in (
         app_dir / "UltraShape-1.0",
         app_dir / "ComfyUI-UltraShape1" / "UltraShape-1.0",
         app_dir / "UltraShape_v2",
-    ]
+        app_dir / "models" / "UltraShape-1.0",
+    ):
+        _add(path)
+
+    spec = importlib.util.find_spec("ultrashape")
+    if spec is not None:
+        if spec.origin:
+            _add(Path(spec.origin).resolve().parent.parent)
+        for search_loc in spec.submodule_search_locations or ():
+            _add(Path(search_loc).resolve().parent)
+
+    return candidates
 
 
 def resolve_ultrashape_root(app_dir: Path) -> Path:
@@ -122,7 +150,8 @@ def resolve_ultrashape_root(app_dir: Path) -> Path:
         if (root / "ultrashape").is_dir() and (root / "configs").is_dir():
             return root
     raise FileNotFoundError(
-        "UltraShape source not found. Expected one of: "
+        "UltraShape source not found. Set ULTRASHAPE_ROOT to the UltraShape source checkout, "
+        "or place it in one of: "
         + ", ".join(str(p) for p in _candidate_ultrashape_roots(app_dir))
     )
 

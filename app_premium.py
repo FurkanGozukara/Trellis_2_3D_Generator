@@ -18,6 +18,7 @@ import string
 from pathlib import Path
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+FAVICON_PATH = os.path.join(APP_DIR, "assets", "app", "trellis2-favicon.svg")
 _O_VOXEL_SRC_DIR = os.path.join(APP_DIR, "o-voxel")
 
 
@@ -6477,7 +6478,7 @@ with gr.Blocks(
         """
 <div style="display:flex; flex-wrap:wrap; align-items:baseline; gap:10px 16px;">
   <div style="font-size:1.35rem; font-weight:700;">
-    Trellis 2 Ultimate SECourses Premium App V6 :
+    Trellis 2 Ultimate SECourses Premium App V6.1 :
     <a href="https://www.patreon.com/posts/147686623" target="_blank">https://www.patreon.com/posts/147686623</a>
   </div>
   <div style="color:var(--body-text-color-subdued);">
@@ -8848,7 +8849,7 @@ if __name__ == "__main__":
         launch_kwargs["server_port"] = args.port
     try:
         launch_sig = inspect.signature(demo.launch)
-        for k, v in (("theme", APP_THEME), ("css", css), ("head", head)):
+        for k, v in (("theme", APP_THEME), ("css", css), ("head", head), ("favicon_path", FAVICON_PATH)):
             if k in launch_sig.parameters:
                 launch_kwargs[k] = v
         if "allowed_paths" in launch_sig.parameters:

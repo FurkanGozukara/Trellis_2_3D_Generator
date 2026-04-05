@@ -13,7 +13,9 @@ from trellis2.pipelines import Trellis2TexturingPipeline
 
 
 MAX_SEED = np.iinfo(np.int32).max
-TMP_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tmp')
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+TMP_DIR = os.path.join(APP_DIR, 'tmp')
+FAVICON_PATH = os.path.join(APP_DIR, "assets", "app", "trellis2-favicon.svg")
 
 
 def start_session(req: gr.Request):
@@ -148,4 +150,4 @@ if __name__ == "__main__":
     pipeline = Trellis2TexturingPipeline.from_pretrained('microsoft/TRELLIS.2-4B', config_file="texturing_pipeline.json")
     pipeline.cuda()
     
-    demo.launch()
+    demo.launch(favicon_path=FAVICON_PATH)
