@@ -145,9 +145,21 @@ def pymeshfix_repair(vertices: torch.Tensor, faces: torch.Tensor, device=None):
     except TypeError:
         mf.repair(joincomp=True, remove_smallest_components=False)
 
+    repaired_v = getattr(mf, "v", None)
+    repaired_f = getattr(mf, "f", None)
+    if repaired_v is None:
+        repaired_v = getattr(mf, "points", None)
+    if repaired_f is None:
+        repaired_f = getattr(mf, "faces", None)
+    if (repaired_v is None or repaired_f is None) and getattr(mf, "mesh", None) is not None:
+        repaired_v = repaired_v if repaired_v is not None else getattr(mf.mesh, "points", None)
+        repaired_f = repaired_f if repaired_f is not None else getattr(mf.mesh, "faces", None)
+    if repaired_v is None or repaired_f is None:
+        raise AttributeError("Unable to read repaired arrays from pymeshfix.MeshFix")
+
     return (
-        torch.from_numpy(np.asarray(mf.v)).to(device=device, dtype=torch.float32).contiguous(),
-        torch.from_numpy(np.asarray(mf.f)).to(device=device, dtype=torch.int64).contiguous(),
+        torch.from_numpy(np.asarray(repaired_v)).to(device=device, dtype=torch.float32).contiguous(),
+        torch.from_numpy(np.asarray(repaired_f)).to(device=device, dtype=torch.int64).contiguous(),
     )
 
 
@@ -354,10 +366,10 @@ def to_glb(
     voxel_size: Union[float, list, tuple, np.ndarray, torch.Tensor] = None,
     grid_size: Union[int, list, tuple, np.ndarray, torch.Tensor] = None,
     decimation_target: int = 1000000,
-    merge_vertices_dist: float = 0.0,
-    fill_holes_max_perimeter: float = 3e-2,
+    merge_vertices_dist: float = 1e-3,
+    fill_holes_max_perimeter: float = 1e-1,
     shade_smooth: bool = False,
-    shade_smooth_angle: float = 0.0,
+    shade_smooth_angle: float = 35.0,
     repair_method: str = "",
     simplify_method: str = 'cumesh',
     texture_extraction: bool = True,

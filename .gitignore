@@ -26,6 +26,7 @@ parts/
 sdist/
 var/
 PixelArtistry_Trellis2BetterTexture.json
+img1.png
 PixelArtistry_Trellis2_HighQuality.json
 PixelArtistry_Trellis2_MergeViews.json
 Trellis2_HighQuality.json

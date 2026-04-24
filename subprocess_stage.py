@@ -1802,10 +1802,10 @@ def stage_extract_to_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     remesh_fallback_reason: Optional[str] = None
     prune_invisible_faces = bool(payload["prune_invisible_faces"])
     texture_extraction = bool(payload.get("texture_extraction", True))
-    fill_holes_max_perimeter = float(payload.get("fill_holes_max_perimeter", 3e-2))
-    merge_vertices_dist = float(payload.get("merge_vertices_dist", 0.0))
+    fill_holes_max_perimeter = float(payload.get("fill_holes_max_perimeter", 1e-1))
+    merge_vertices_dist = float(payload.get("merge_vertices_dist", 1e-3))
     shade_smooth = bool(payload.get("shade_smooth", False))
-    shade_smooth_angle = float(payload.get("shade_smooth_angle", 0.0))
+    shade_smooth_angle = float(payload.get("shade_smooth_angle", 35.0))
     force_double_sided = bool(payload.get("force_double_sided", True))
     no_pbr_export = bool(payload.get("no_pbr_export", False))
     out_dir = Path(payload["out_dir"])
@@ -2062,10 +2062,10 @@ def stage_extract_glb(payload: Dict[str, Any]) -> Dict[str, Any]:
     remesh_fallback_reason: Optional[str] = None
     prune_invisible_faces = bool(payload["prune_invisible_faces"])
     no_texture_gen = bool(payload["no_texture_gen"])
-    fill_holes_max_perimeter = float(payload.get("fill_holes_max_perimeter", 3e-2))
-    merge_vertices_dist = float(payload.get("merge_vertices_dist", 0.0))
+    fill_holes_max_perimeter = float(payload.get("fill_holes_max_perimeter", 1e-1))
+    merge_vertices_dist = float(payload.get("merge_vertices_dist", 1e-3))
     shade_smooth = bool(payload.get("shade_smooth", False))
-    shade_smooth_angle = float(payload.get("shade_smooth_angle", 0.0))
+    shade_smooth_angle = float(payload.get("shade_smooth_angle", 35.0))
     force_double_sided = bool(payload.get("force_double_sided", True))
     no_pbr_export = bool(payload.get("no_pbr_export", False))
     ultrashape_cfg = payload.get("ultrashape") or {}

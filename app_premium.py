@@ -1181,11 +1181,11 @@ def _default_ui_config() -> dict:
             "randomize_seed": False,
             "decimation_target": 1000000,
             "remesh_method": ("dual_contouring_vb" if "dual_contouring_vb" in REMESH_METHOD_CHOICES else "dual_contouring"),
-            "fill_holes_max_perimeter": 0.03,
+            "fill_holes_max_perimeter": 0.10,
             "repair_method": "meshlib" if "meshlib" in REPAIR_METHOD_CHOICES else "disabled",
             "simplify_method": "cumesh",
             "prune_invisible_faces": False,
-            "merge_vertices_dist": 0.0,
+            "merge_vertices_dist": 0.001,
             "shade_smooth": False,
             "shade_smooth_angle": 35.0,
             "force_double_sided": True,
@@ -6784,7 +6784,7 @@ with gr.Blocks(
                                     0.0,
                                     0.2,
                                     label="Fill Holes Max Perimeter (Extract GLB)",
-                                    value=0.03,
+                                    value=0.10,
                                     step=0.005,
                                     info="Hole-filling threshold for Extract GLB cleanup. Higher values close larger gaps but can over-seal intended openings."
                                 )
@@ -6799,7 +6799,7 @@ with gr.Blocks(
                                     0.0,
                                     0.05,
                                     label="Merge Vertices Distance (Extract GLB)",
-                                    value=0.0,
+                                    value=0.001,
                                     step=0.001,
                                     info="Optional post-remesh vertex welding distance for Extract GLB. Useful for tiny cracks or duplicate seams; keep near zero unless you need cleanup."
                                 )
