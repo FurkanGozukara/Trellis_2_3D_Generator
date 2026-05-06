@@ -419,6 +419,13 @@ Ultimate exposes:
 - normalization scale
 - sharp-point and uniform-point sampling controls
 
+UltraShape requires two local pieces:
+
+- model weights under `models/UltraShape/`
+- the UltraShape source checkout under `UltraShape-1.0/` (or `ULTRASHAPE_ROOT`)
+
+The installers and model-resume script now run `ensure_ultrashape_source.py` automatically. If an older install has the weights but reports "UltraShape source not found", run `python ensure_ultrashape_source.py` from the `Trellis_2_3D_Generator` folder.
+
 ### Two Ultimate workflows using UltraShape
 
 Ultimate supports both:
